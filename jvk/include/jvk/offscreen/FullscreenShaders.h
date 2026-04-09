@@ -1,19 +1,22 @@
 /*
-  ==============================================================================
-    FullscreenShaders.h — Embedded SPIR-V for procedural fullscreen triangle
-
-    Vertex shader generates a fullscreen triangle from gl_VertexIndex (no vertex buffer).
-    Outputs fragUV as normalized [0,1] coordinates.
-
-    Source:
-      #version 450
-      layout(location = 0) out vec2 fragUV;
-      void main() {
-          vec2 pos = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
-          fragUV = pos;
-          gl_Position = vec4(pos * 2.0 - 1.0, 0.0, 1.0);
-      }
-  ==============================================================================
+ ----------------------------------------------------------------------------
+ Copyright (c) 2026 Discreet Signals LLC
+ 
+ ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
+ ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
+ ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
+ ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
+ ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
+ ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
+ 
+ Licensed under the MIT License. See LICENSE file in the project root
+ for full license text.
+ 
+ For questions, contact gavin@discreetsignals.com
+ ------------------------------------------------------------------------------
+ File: FullscreenShaders.h
+ Author: Gavin Payne
+ ------------------------------------------------------------------------------
 */
 
 #pragma once

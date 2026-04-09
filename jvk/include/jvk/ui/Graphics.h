@@ -1,25 +1,22 @@
 /*
-  ==============================================================================
-
-    Graphics.h
-    jvk::Graphics — GPU-accelerated graphics with post-processing.
-
-    Wraps juce::Graphics when backed by VulkanGraphicsContext.
-    Provides all juce::Graphics methods PLUS GPU-only features:
-    post-processing shaders, color grading, blur, and direct GPU access.
-
-    Usage:
-        void paint(juce::Graphics& g) override {
-            g.fillAll(juce::Colours::black);
-            g.drawText("Hello", getLocalBounds(), juce::Justification::centred);
-
-            if (auto vk = jvk::Graphics::create(g)) {
-                vk->blur({0, 0, 200, 100}, 8.0f);
-                vk->multiplyHSV(0, 0.5f, 1.0f);  // desaturate
-            }
-        }
-
-  ==============================================================================
+ ----------------------------------------------------------------------------
+ Copyright (c) 2026 Discreet Signals LLC
+ 
+ ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
+ ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
+ ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
+ ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
+ ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
+ ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
+ 
+ Licensed under the MIT License. See LICENSE file in the project root
+ for full license text.
+ 
+ For questions, contact gavin@discreetsignals.com
+ ------------------------------------------------------------------------------
+ File: Graphics.h
+ Author: Gavin Payne
+ ------------------------------------------------------------------------------
 */
 
 #pragma once

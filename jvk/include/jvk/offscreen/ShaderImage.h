@@ -1,26 +1,22 @@
 /*
-  ==============================================================================
-
-    ShaderImage.h
-    Offscreen Vulkan shader rendering to juce::Image.
-
-    No window or surface required. Multiple instances share a single
-    Vulkan device via a reference-counted singleton context.
-
-    Usage:
-        jvk::ShaderImage shader(fragSpv, fragSpvSize, 512, 256);
-        shader.setFrameRate(60);
-
-        // In paint():
-        g.drawImageAt(shader.getImage(), 0, 0);
-
-    Fragment shader interface:
-        layout(location = 0) in vec2 fragUV;           // [0,1] normalized coords
-        layout(set = 0, binding = 0) readonly buffer StorageBuffer { float data[]; };
-        layout(push_constant) uniform PC { vec2 resolution; float time; };
-        layout(location = 0) out vec4 outColor;
-
-  ==============================================================================
+ ----------------------------------------------------------------------------
+ Copyright (c) 2026 Discreet Signals LLC
+ 
+ ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
+ ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
+ ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
+ ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
+ ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
+ ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
+ 
+ Licensed under the MIT License. See LICENSE file in the project root
+ for full license text.
+ 
+ For questions, contact gavin@discreetsignals.com
+ ------------------------------------------------------------------------------
+ File: ShaderImage.h
+ Author: Gavin Payne
+ ------------------------------------------------------------------------------
 */
 
 #pragma once

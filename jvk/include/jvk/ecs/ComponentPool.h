@@ -1,17 +1,22 @@
 /*
-  ==============================================================================
-
-    ComponentPool.h
-
-    UpdaterVector<T>  — contiguous storage of Updater<T> pointers for
-                         vectorized per-frame batch processing.
-    UpdaterVectorRegistry — holds one UpdaterVector per type, auto-created
-                             on first access. Scene-scoped.
-
-    Updater<T>        — component base that self-registers into its scene's
-                         UpdaterVector when added to an entity.
-
-  ==============================================================================
+ ----------------------------------------------------------------------------
+ Copyright (c) 2026 Discreet Signals LLC
+ 
+ ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
+ ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
+ ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
+ ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
+ ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
+ ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
+ 
+ Licensed under the MIT License. See LICENSE file in the project root
+ for full license text.
+ 
+ For questions, contact gavin@discreetsignals.com
+ ------------------------------------------------------------------------------
+ File: ComponentPool.h
+ Author: Gavin Payne
+ ------------------------------------------------------------------------------
 */
 
 #pragma once
