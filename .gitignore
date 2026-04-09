@@ -1,2 +1,7 @@
 Builds/
+build/
 .DS_Store
+JuceLibraryCode/
+.cache/
+.clangd/
+compile_commands.json
