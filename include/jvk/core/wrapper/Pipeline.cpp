@@ -110,7 +110,23 @@ void Pipeline::create()
     stencilOp.writeMask = config.stencilWriteMask;
     stencilOp.reference = config.stencilReference;
     depthStencil.front = stencilOp;
-    depthStencil.back = stencilOp;
+
+    if (config.separateBackStencil)
+    {
+        VkStencilOpState backOp = {};
+        backOp.failOp = config.stencilBackFailOp;
+        backOp.passOp = config.stencilBackPassOp;
+        backOp.depthFailOp = config.stencilBackDepthFailOp;
+        backOp.compareOp = config.stencilBackCompareOp;
+        backOp.compareMask = config.stencilCompareMask;
+        backOp.writeMask = config.stencilWriteMask;
+        backOp.reference = config.stencilReference;
+        depthStencil.back = backOp;
+    }
+    else
+    {
+        depthStencil.back = stencilOp;
+    }
 
     // 9. Color blending
     VkPipelineColorBlendAttachmentState colorBlendAttachment = {};

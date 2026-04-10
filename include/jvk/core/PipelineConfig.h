@@ -45,7 +45,7 @@ struct PipelineConfig
     BlendMode blendMode = BlendMode::AlphaBlend;
     std::vector<VkPushConstantRange> pushConstantRanges;
 
-    // Stencil
+    // Stencil (front face)
     bool stencilTestEnable = false;
     VkStencilOp stencilFailOp = VK_STENCIL_OP_KEEP;
     VkStencilOp stencilPassOp = VK_STENCIL_OP_KEEP;
@@ -54,6 +54,13 @@ struct PipelineConfig
     uint32_t stencilWriteMask = 0xFF;
     uint32_t stencilCompareMask = 0xFF;
     uint32_t stencilReference = 0;
+
+    // Stencil (back face) — if not set, mirrors front face
+    bool separateBackStencil = false;
+    VkStencilOp stencilBackFailOp = VK_STENCIL_OP_KEEP;
+    VkStencilOp stencilBackPassOp = VK_STENCIL_OP_KEEP;
+    VkStencilOp stencilBackDepthFailOp = VK_STENCIL_OP_KEEP;
+    VkCompareOp stencilBackCompareOp = VK_COMPARE_OP_ALWAYS;
 
     // Color write
     bool colorWriteEnable = true;

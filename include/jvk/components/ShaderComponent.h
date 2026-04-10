@@ -62,11 +62,9 @@ private:
         buffer.pop_num(size);
         buffer.read(storageData.data(), static_cast<int>(storageData.size()));
 
-        void* sData;
-        size_t memSize = sizeof(float) * storageData.size();
-        vkMapMemory(device, storageBufferMemory, 0, memSize, 0, &sData);
-        memcpy(sData, storageData.data(), memSize);
-        vkUnmapMemory(device, storageBufferMemory);
+        // Persistent mapping — no map/unmap per frame
+        if (storageMappedPtr)
+            memcpy(storageMappedPtr, storageData.data(), sizeof(float) * storageData.size());
     }
 
     shaders::ShaderGroup shaderGroup;
@@ -168,11 +166,10 @@ private:
 
         vkBindBufferMemory(renderer.getDevice(), storageBuffer, storageBufferMemory, 0);
 
-        void* sData;
+        // Persistently map storage buffer — no per-frame map/unmap
         size_t memSize = sizeof(float) * storageData.size();
-        vkMapMemory(renderer.getDevice(), storageBufferMemory, 0, memSize, 0, &sData);
-        memcpy(sData, storageData.data(), memSize);
-        vkUnmapMemory(renderer.getDevice(), storageBufferMemory);
+        vkMapMemory(renderer.getDevice(), storageBufferMemory, 0, memSize, 0, &storageMappedPtr);
+        memcpy(storageMappedPtr, storageData.data(), memSize);
 
         VkDescriptorSetLayoutBinding storageBufferBinding = {};
         storageBufferBinding.binding = 0;
@@ -240,6 +237,11 @@ private:
         vkDestroyBuffer(renderer.getDevice(), indexBuffer, nullptr);
         vkFreeMemory(renderer.getDevice(), indexBufferMemory, nullptr);
 
+        if (storageMappedPtr)
+        {
+            vkUnmapMemory(renderer.getDevice(), storageBufferMemory);
+            storageMappedPtr = nullptr;
+        }
         vkDestroyBuffer(renderer.getDevice(), storageBuffer, nullptr);
         vkFreeMemory(renderer.getDevice(), storageBufferMemory, nullptr);
 
@@ -285,6 +287,7 @@ private:
     VkDeviceMemory indexBufferMemory;
     VkBuffer storageBuffer;
     VkDeviceMemory storageBufferMemory;
+    void* storageMappedPtr = nullptr;
     VkDescriptorSet descriptorSet;
     VkDescriptorSetLayout descriptorSetLayout;
     VkDescriptorPool descriptorPool;

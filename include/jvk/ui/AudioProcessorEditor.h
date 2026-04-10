@@ -116,7 +116,7 @@ private:
             descriptorHelper->addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                           VK_SHADER_STAGE_FRAGMENT_BIT);
             auto dsLayout = descriptorHelper->buildLayout();
-            descriptorHelper->createPool(16); // 16 descriptor sets per frame
+            descriptorHelper->createPool(128); // descriptor sets for textures + effects
 
             // --- Main SDF+textured pipeline ---
             {
@@ -166,12 +166,53 @@ private:
                 stencilConfig.stencilTestEnable = true;
                 stencilConfig.stencilPassOp = VK_STENCIL_OP_INCREMENT_AND_WRAP;
                 stencilConfig.stencilCompareOp = VK_COMPARE_OP_ALWAYS;
+                // Back faces decrement for correct non-zero winding rule
+                stencilConfig.separateBackStencil = true;
+                stencilConfig.stencilBackPassOp = VK_STENCIL_OP_DECREMENT_AND_WRAP;
+                stencilConfig.stencilBackCompareOp = VK_COMPARE_OP_ALWAYS;
                 stencilConfig.pushConstantRanges = pushRanges;
 
                 stencilPipeline = std::make_unique<Pipeline>(
                     device, renderer.getRenderPass(),
                     std::move(stencilSg), renderer.getMSAASamples(),
                     std::move(stencilVertLayout), std::move(stencilConfig));
+            }
+
+            // --- Stencil cover pipeline (reads stencil, draws color where non-zero) ---
+            {
+                shaders::ShaderGroup coverSg;
+                coverSg.addShader(VK_SHADER_STAGE_VERTEX_BIT,
+                                   shaders::ui2d::vert_spv, shaders::ui2d::vert_spvSize);
+                coverSg.addShader(VK_SHADER_STAGE_FRAGMENT_BIT,
+                                   shaders::ui2d::frag_spv, shaders::ui2d::frag_spvSize);
+                coverSg.addDescriptorSetLayout(dsLayout);
+
+                VertexLayout coverVertLayout;
+                coverVertLayout.binding = { 0, sizeof(UIVertex), VK_VERTEX_INPUT_RATE_VERTEX };
+                coverVertLayout.attributes = {
+                    { 0, 0, VK_FORMAT_R32G32_SFLOAT,       offsetof(UIVertex, position) },
+                    { 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, color) },
+                    { 2, 0, VK_FORMAT_R32G32_SFLOAT,        offsetof(UIVertex, uv) },
+                    { 3, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, shapeInfo) }
+                };
+
+                PipelineConfig coverConfig;
+                coverConfig.cullMode = VK_CULL_MODE_NONE;
+                coverConfig.depthTestEnable = false;
+                coverConfig.depthWriteEnable = false;
+                coverConfig.blendMode = BlendMode::AlphaBlend;
+                coverConfig.colorWriteEnable = true;
+                coverConfig.stencilTestEnable = true;
+                coverConfig.stencilCompareOp = VK_COMPARE_OP_NOT_EQUAL;
+                coverConfig.stencilReference = 0;
+                coverConfig.stencilPassOp = VK_STENCIL_OP_ZERO;
+                coverConfig.stencilFailOp = VK_STENCIL_OP_KEEP;
+                coverConfig.pushConstantRanges = pushRanges;
+
+                stencilCoverPipeline = std::make_unique<Pipeline>(
+                    device, renderer.getRenderPass(),
+                    std::move(coverSg), renderer.getMSAASamples(),
+                    std::move(coverVertLayout), std::move(coverConfig));
             }
 
             // --- Multiply blend pipeline (for color grading effects) ---
@@ -292,6 +333,24 @@ private:
             core::DescriptorHelper::writeImage(device, defaultDescriptorSet, 0,
                 defaultTexture.getView(), defaultTexture.getSampler());
 
+            // --- Glyph atlas for GPU text rendering ---
+            glyphAtlas.init(physDevice, device, renderer.getCommandPool(),
+                            renderer.getGraphicsQueue(), descriptorHelper.get());
+
+            // --- Gradient LUT cache for GPU gradient evaluation ---
+            gradCache.descriptorHelper = descriptorHelper.get();
+            gradCache.physDevice = physDevice;
+            gradCache.device = device;
+            gradCache.commandPool = renderer.getCommandPool();
+            gradCache.graphicsQueue = renderer.getGraphicsQueue();
+
+            // --- Texture cache for GPU image rendering ---
+            texCache.descriptorHelper = descriptorHelper.get();
+            texCache.physDevice = physDevice;
+            texCache.device = device;
+            texCache.commandPool = renderer.getCommandPool();
+            texCache.graphicsQueue = renderer.getGraphicsQueue();
+
             setPipeline(mainPipeline->getInternal());
         }
 
@@ -299,8 +358,17 @@ private:
         {
             mainPipeline.reset();
             stencilPipeline.reset();
+            stencilCoverPipeline.reset();
+            multiplyPipeline.reset();
+            hsvPipeline.reset();
+            blurPipeline.reset();
             descriptorHelper.reset();
+            hsvDescriptorHelper.reset();
             defaultTexture.destroy();
+            blurTempImage.destroy();
+            texCache.clear();
+            gradCache.clear();
+            glyphAtlas.clear();
         }
 
         void render(VkCommandBuffer& commandBuffer) override
@@ -336,13 +404,29 @@ private:
             // Note: these are set by VulkanInstance before calling render
             rpInfo.extent = { fw, fh };
 
+            // Upload any dirty glyph atlas pages before rendering
+            glyphAtlas.uploadDirtyPages();
+
+            // Update cache frame counters and evict stale entries
+            texCache.currentFrame++;
+            gradCache.currentFrame++;
+            if (texCache.currentFrame % 60 == 0)
+            {
+                texCache.evict();
+                gradCache.evict();
+            }
+
+            int frameIdx = static_cast<int>(getRenderer()->getCurrentFrame() % MAX_FRAMES);
+
             VulkanGraphicsContext ctx(
                 commandBuffer, mainPipeline->getInternal(), mainPipeline->getLayout(),
-                w, h, physDevice, device, 2.0f, &persistentBuffer, &mappedPtr,
-                stencilPipeline.get(), defaultDescriptorSet,
+                w, h, physDevice, device, 2.0f,
+                &persistentBuffers[frameIdx], &mappedPtrs[frameIdx],
+                stencilPipeline.get(), stencilCoverPipeline.get(),
+                defaultDescriptorSet,
                 editor.srgbPipelineMode, multiplyPipeline.get(),
                 hsvPipeline.get(), blurPipeline.get(), rpInfo,
-                &blurTempImage, blurDescriptorSet);
+                &blurTempImage, blurDescriptorSet, &texCache, &glyphAtlas, &gradCache);
 
             juce::Graphics g(ctx);
             editor.paintEntireComponent(g, false);
@@ -352,6 +436,7 @@ private:
         AudioProcessorEditor& editor;
         std::unique_ptr<Pipeline> mainPipeline;
         std::unique_ptr<Pipeline> stencilPipeline;
+        std::unique_ptr<Pipeline> stencilCoverPipeline;
         std::unique_ptr<Pipeline> multiplyPipeline;
         std::unique_ptr<Pipeline> hsvPipeline;
         std::unique_ptr<Pipeline> blurPipeline;
@@ -361,10 +446,14 @@ private:
         VkDescriptorSet defaultDescriptorSet = VK_NULL_HANDLE;
         VkPhysicalDevice physDevice = VK_NULL_HANDLE;
         VkDevice device = VK_NULL_HANDLE;
-        core::Buffer persistentBuffer;
-        void* mappedPtr = nullptr;
+        static constexpr int MAX_FRAMES = 2;
+        core::Buffer persistentBuffers[MAX_FRAMES];
+        void* mappedPtrs[MAX_FRAMES] = {};
         core::Image blurTempImage;      // lazy persistent — allocated on first blur, reused
         VkDescriptorSet blurDescriptorSet = VK_NULL_HANDLE;
+        TextureCache texCache;          // GPU texture cache for drawImage
+        GradientCache gradCache;        // GPU gradient LUT cache
+        GlyphAtlas glyphAtlas;          // GPU glyph atlas for text rendering
     };
 
     VulkanRenderer vulkanRenderer;

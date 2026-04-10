@@ -42,6 +42,145 @@ struct UIVertex
     glm::vec4 shapeInfo;   // x=type(0=flat,1=roundedRect,2=ellipse), y=halfW, z=halfH, w=param
 };
 
+// GPU gradient LUT cache — creates 256x1 textures from ColourGradient color stops
+struct GradientCache
+{
+    static constexpr int LUT_WIDTH = 256;
+
+    struct Entry
+    {
+        core::Image texture;
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+        uint64_t lastUsedFrame = 0;
+    };
+
+    std::unordered_map<uint64_t, Entry> entries;
+    core::DescriptorHelper* descriptorHelper = nullptr;
+    VkPhysicalDevice physDevice = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VkQueue graphicsQueue = VK_NULL_HANDLE;
+    uint64_t currentFrame = 0;
+
+    static uint64_t hashGradient(const juce::ColourGradient& g)
+    {
+        uint64_t h = g.isRadial ? 1ULL : 0ULL;
+        h ^= static_cast<uint64_t>(g.getNumColours()) * 0x9e3779b97f4a7c15ULL;
+        for (int i = 0; i < g.getNumColours(); i++)
+        {
+            auto c = g.getColour(i).getARGB();
+            h ^= (static_cast<uint64_t>(c) + 0x517cc1b727220a95ULL) + (h << 6) + (h >> 2);
+            double pos = g.getColourPosition(i);
+            uint64_t posBytes;
+            memcpy(&posBytes, &pos, sizeof(posBytes));
+            h ^= posBytes * 0x6c62272e07bb0142ULL;
+        }
+        return h;
+    }
+
+    VkDescriptorSet getOrCreate(const juce::ColourGradient& gradient)
+    {
+        uint64_t key = hashGradient(gradient);
+        auto it = entries.find(key);
+        if (it != entries.end())
+        {
+            it->second.lastUsedFrame = currentFrame;
+            return it->second.descriptorSet;
+        }
+
+        // Rasterize gradient to a 256x1 RGBA texture
+        std::vector<uint32_t> pixels(LUT_WIDTH);
+        for (int i = 0; i < LUT_WIDTH; i++)
+        {
+            double t = static_cast<double>(i) / static_cast<double>(LUT_WIDTH - 1);
+            auto c = gradient.getColourAtPosition(t);
+            pixels[static_cast<size_t>(i)] =
+                static_cast<uint32_t>(c.getRed())
+              | (static_cast<uint32_t>(c.getGreen()) << 8)
+              | (static_cast<uint32_t>(c.getBlue()) << 16)
+              | (static_cast<uint32_t>(c.getAlpha()) << 24);
+        }
+
+        Entry entry;
+        entry.texture.create({ physDevice, device,
+            static_cast<uint32_t>(LUT_WIDTH), 1,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT });
+        entry.texture.upload(physDevice, commandPool, graphicsQueue,
+            pixels.data(), static_cast<uint32_t>(LUT_WIDTH), 1, VK_FORMAT_R8G8B8A8_UNORM);
+        entry.texture.createSampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+
+        entry.descriptorSet = descriptorHelper->allocateSet();
+        core::DescriptorHelper::writeImage(device, entry.descriptorSet, 0,
+            entry.texture.getView(), entry.texture.getSampler());
+
+        entry.lastUsedFrame = currentFrame;
+        auto [insertIt, _] = entries.emplace(key, std::move(entry));
+        return insertIt->second.descriptorSet;
+    }
+
+    void evict(uint64_t maxAge = 120)
+    {
+        for (auto it = entries.begin(); it != entries.end();)
+        {
+            if (currentFrame - it->second.lastUsedFrame > maxAge)
+            {
+                it->second.texture.destroy();
+                it = entries.erase(it);
+            }
+            else
+                ++it;
+        }
+    }
+
+    void clear()
+    {
+        for (auto& [k, e] : entries)
+            e.texture.destroy();
+        entries.clear();
+    }
+};
+
+// GPU texture cache for drawImage() — persists across frames, owned by PaintBridge
+struct TextureCache
+{
+    struct Entry
+    {
+        core::Image texture;
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+        uint64_t lastUsedFrame = 0;
+    };
+
+    std::unordered_map<uint64_t, Entry> entries;
+    core::DescriptorHelper* descriptorHelper = nullptr;
+    VkPhysicalDevice physDevice = VK_NULL_HANDLE;
+    VkDevice device = VK_NULL_HANDLE;
+    VkCommandPool commandPool = VK_NULL_HANDLE;
+    VkQueue graphicsQueue = VK_NULL_HANDLE;
+    uint64_t currentFrame = 0;
+
+    void evict(uint64_t maxAge = 120)
+    {
+        for (auto it = entries.begin(); it != entries.end();)
+        {
+            if (currentFrame - it->second.lastUsedFrame > maxAge)
+            {
+                it->second.texture.destroy();
+                it = entries.erase(it);
+            }
+            else
+                ++it;
+        }
+    }
+
+    void clear()
+    {
+        for (auto& [k, e] : entries)
+            e.texture.destroy();
+        entries.clear();
+    }
+};
+
 class VulkanGraphicsContext : public juce::LowLevelGraphicsContext
 {
 public:
@@ -55,6 +194,7 @@ public:
                           core::Buffer* externalBuffer = nullptr,
                           void** externalMappedPtr = nullptr,
                           Pipeline* stencilPipeline = nullptr,
+                          Pipeline* stencilCoverPipeline = nullptr,
                           VkDescriptorSet defaultDescSet = VK_NULL_HANDLE,
                           bool srgb = false,
                           Pipeline* multiplyPipeline = nullptr,
@@ -62,14 +202,19 @@ public:
                           Pipeline* blurPipeline = nullptr,
                           RenderPassInfo rpInfo = {},
                           core::Image* blurTempImage = nullptr,
-                          VkDescriptorSet blurDescSet = VK_NULL_HANDLE)
+                          VkDescriptorSet blurDescSet = VK_NULL_HANDLE,
+                          TextureCache* textureCache = nullptr,
+                          GlyphAtlas* glyphAtlas = nullptr,
+                          GradientCache* gradientCache = nullptr)
         : cmd(cmd), colorPipeline(colorPipeline), pipelineLayout(pipelineLayout),
           vpWidth(vpWidth), vpHeight(vpHeight), scale(scale), srgbMode(srgb),
           physDevice(physDevice), device(device),
           extBuffer(externalBuffer), extMappedPtr(externalMappedPtr),
-          stencilPipeline(stencilPipeline), multiplyPipeline(multiplyPipeline), hsvPipeline(hsvPipeline),
+          stencilPipeline(stencilPipeline), stencilCoverPipeline(stencilCoverPipeline),
+          multiplyPipeline(multiplyPipeline), hsvPipeline(hsvPipeline),
           blurPipeline(blurPipeline), rpInfo(rpInfo), blurTempImage(blurTempImage), blurDescSet(blurDescSet),
-          defaultDescriptorSet(defaultDescSet)
+          defaultDescriptorSet(defaultDescSet), textureCache(textureCache),
+          glyphAtlas(glyphAtlas), gradientCache(gradientCache)
     {
         stateStack.push_back({});
         // Clip bounds in physical pixels
@@ -113,6 +258,8 @@ public:
         return !s.clipBounds.isEmpty();
     }
 
+    // Clips to bounding box of the rectangle list.
+    // This is the standard GPU approach (matches JUCE's OpenGL renderer).
     bool clipToRectangleList(const juce::RectangleList<int>& r) override
     {
         return clipToRectangle(r.getBounds());
@@ -143,7 +290,16 @@ public:
         s.clipBounds = s.clipBounds.getIntersection(pathBounds);
     }
 
-    void clipToImageAlpha(const juce::Image&, const juce::AffineTransform&) override {}
+    // Image-based alpha clipping is not supported in the GPU pipeline.
+    // Falls back to bounding-box clip (matches JUCE's OpenGL renderer behavior).
+    void clipToImageAlpha(const juce::Image& img, const juce::AffineTransform& t) override
+    {
+        if (img.isValid())
+        {
+            auto bounds = img.getBounds().toFloat().transformedBy(t).getSmallestIntegerContainer();
+            clipToRectangle(bounds);
+        }
+    }
 
     bool clipRegionIntersects(const juce::Rectangle<int>& r) override
     {
@@ -226,20 +382,8 @@ public:
 
         if (s.fillType.isGradient())
         {
-            // GPU gradient: compute colors at 4 corners, hardware interpolates
-            float x = translated.getX(), y = translated.getY();
-            float w = translated.getWidth(), h = translated.getHeight();
-            auto c00 = getColorAt(x,     y);
-            auto c10 = getColorAt(x + w, y);
-            auto c11 = getColorAt(x + w, y + h);
-            auto c01 = getColorAt(x,     y + h);
-            glm::vec4 flat(0);
-            addVertex(x,     y,     c00, 0, 0, flat);
-            addVertex(x + w, y,     c10, 0, 0, flat);
-            addVertex(x + w, y + h, c11, 0, 0, flat);
-            addVertex(x,     y,     c00, 0, 0, flat);
-            addVertex(x + w, y + h, c11, 0, 0, flat);
-            addVertex(x,     y + h, c01, 0, 0, flat);
+            emitGradientQuad(translated.getX(), translated.getY(),
+                             translated.getWidth(), translated.getHeight());
         }
         else
         {
@@ -261,10 +405,14 @@ public:
         auto combined = t.scaled(scale).translated(
             static_cast<float>(s.origin.x), static_cast<float>(s.origin.y));
 
-        // TODO: GPU stencil path rendering (requires D32_SFLOAT_S8_UINT format)
-        // if (stencilPipeline != nullptr) { fillPathStencil(path, combined); return; }
+        // GPU stencil path rendering (triangle fan + cover quad)
+        if (stencilPipeline != nullptr && stencilCoverPipeline != nullptr)
+        {
+            fillPathStencil(path, combined);
+            return;
+        }
 
-        // EdgeTable path rendering
+        // Fallback: EdgeTable path rendering (CPU per-pixel)
         juce::EdgeTable et(s.clipBounds, path, combined);
 
         if (s.fillType.isGradient())
@@ -344,59 +492,97 @@ public:
             vkCmdDraw(cmd, static_cast<uint32_t>(fanVerts.size()), 1, 0, 0);
         }
 
-        // Step 4: Bind main pipeline with stencil test (NOT_EQUAL to 0)
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipeline);
-        vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
+        // Step 4: Bind stencil cover pipeline (stencil test NOT_EQUAL 0, zeros on pass)
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, stencilCoverPipeline->getInternal());
+        vkCmdPushConstants(cmd, stencilCoverPipeline->getLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
 
-        // Bind descriptor set for main pipeline
         if (defaultDescriptorSet != VK_NULL_HANDLE)
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, stencilCoverPipeline->getLayout(),
                                      0, 1, &defaultDescriptorSet, 0, nullptr);
 
         // Step 5: Draw cover quad over path bounding box
         auto bounds = path.getBoundsTransformed(combined);
-        auto fillColor = getColorForFill();
-
-        // For gradients, compute per-vertex colors at the 4 corners
-        auto& s = state();
-        glm::vec4 c00 = s.fillType.isGradient() ? getColorAt(bounds.getX(), bounds.getY()) : fillColor;
-        glm::vec4 c10 = s.fillType.isGradient() ? getColorAt(bounds.getRight(), bounds.getY()) : fillColor;
-        glm::vec4 c11 = s.fillType.isGradient() ? getColorAt(bounds.getRight(), bounds.getBottom()) : fillColor;
-        glm::vec4 c01 = s.fillType.isGradient() ? getColorAt(bounds.getX(), bounds.getBottom()) : fillColor;
-
         float bx = bounds.getX(), by = bounds.getY();
         float bw = bounds.getWidth(), bh = bounds.getHeight();
-        glm::vec4 flat(0);
 
-        // Emit cover quad vertices directly (these go through stencil test)
+        auto& s = state();
         vertices.clear();
-        addVertex(bx,      by,      c00, 0, 0, flat);
-        addVertex(bx + bw, by,      c10, 0, 0, flat);
-        addVertex(bx + bw, by + bh, c11, 0, 0, flat);
-        addVertex(bx,      by,      c00, 0, 0, flat);
-        addVertex(bx + bw, by + bh, c11, 0, 0, flat);
-        addVertex(bx,      by + bh, c01, 0, 0, flat);
 
-        // Flush the cover quad (will be stencil-tested by hardware)
-        // Note: stencil test is part of the pipeline state, need dynamic stencil
-        // For now, use vkCmdSetStencilReference + vkCmdSetStencilCompareMask
-        // Actually — stencil state is baked into the pipeline. We need the main
-        // pipeline to NOT have stencil test. The stencil fill works because the
-        // stencil buffer has non-zero values where the path is.
-        // TODO: This requires a third pipeline variant (main+stencilTest) or dynamic stencil state.
-        // For now, flush as regular draw (stencil test not active on main pipeline).
-        flush();
+        if (s.fillType.isGradient() && s.fillType.gradient && gradientCache)
+        {
+            // GPU gradient: bind LUT and emit cover quad with gradient-space UVs
+            auto& g = *s.fillType.gradient;
+            VkDescriptorSet gradDescSet = gradientCache->getOrCreate(g);
+            if (gradDescSet != VK_NULL_HANDLE)
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    stencilCoverPipeline->getLayout(), 0, 1, &gradDescSet, 0, nullptr);
 
-        // Step 6: Clear stencil for next path
-        VkClearAttachment clearAtt = {};
-        clearAtt.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
-        clearAtt.clearValue.depthStencil = { 1.0f, 0 };
-        VkClearRect clearRect = {};
-        clearRect.rect = { { static_cast<int32_t>(bx), static_cast<int32_t>(by) },
-                           { static_cast<uint32_t>(bw + 1), static_cast<uint32_t>(bh + 1) } };
-        clearRect.baseArrayLayer = 0;
-        clearRect.layerCount = 1;
-        vkCmdClearAttachments(cmd, 1, &clearAtt, 1, &clearRect);
+            glm::vec4 color(1.0f, 1.0f, 1.0f, s.opacity);
+            float shapeType = g.isRadial ? 6.0f : 5.0f;
+            glm::vec4 shape(shapeType, 0, 0, 0);
+
+            if (g.isRadial)
+            {
+                float cx = g.point1.x * scale + static_cast<float>(s.origin.x);
+                float cy = g.point1.y * scale + static_cast<float>(s.origin.y);
+                float radius = g.point1.getDistanceFrom(g.point2) * scale;
+                float invR = (radius > 0) ? 1.0f / radius : 0.0f;
+
+                auto uv = [&](float px, float py) { return std::pair{ (px-cx)*invR, (py-cy)*invR }; };
+                auto [u00,v00] = uv(bx, by);       auto [u10,v10] = uv(bx+bw, by);
+                auto [u11,v11] = uv(bx+bw, by+bh); auto [u01,v01] = uv(bx, by+bh);
+
+                addVertex(bx,      by,      color, u00, v00, shape);
+                addVertex(bx+bw,   by,      color, u10, v10, shape);
+                addVertex(bx+bw,   by+bh,   color, u11, v11, shape);
+                addVertex(bx,      by,      color, u00, v00, shape);
+                addVertex(bx+bw,   by+bh,   color, u11, v11, shape);
+                addVertex(bx,      by+bh,   color, u01, v01, shape);
+            }
+            else
+            {
+                float gx1 = g.point1.x * scale + static_cast<float>(s.origin.x);
+                float gy1 = g.point1.y * scale + static_cast<float>(s.origin.y);
+                float gx2 = g.point2.x * scale + static_cast<float>(s.origin.x);
+                float gy2 = g.point2.y * scale + static_cast<float>(s.origin.y);
+                float dx = gx2-gx1, dy = gy2-gy1;
+                float len2 = dx*dx + dy*dy;
+                float invLen2 = (len2 > 0) ? 1.0f / len2 : 0.0f;
+                auto tAt = [&](float px, float py) { return ((px-gx1)*dx + (py-gy1)*dy) * invLen2; };
+
+                float t00 = tAt(bx,by), t10 = tAt(bx+bw,by), t11 = tAt(bx+bw,by+bh), t01 = tAt(bx,by+bh);
+                addVertex(bx,    by,    color, t00, 0, shape);
+                addVertex(bx+bw, by,    color, t10, 0, shape);
+                addVertex(bx+bw, by+bh, color, t11, 0, shape);
+                addVertex(bx,    by,    color, t00, 0, shape);
+                addVertex(bx+bw, by+bh, color, t11, 0, shape);
+                addVertex(bx,    by+bh, color, t01, 0, shape);
+            }
+        }
+        else
+        {
+            // Solid color or fallback gradient (4-corner CPU-sampled interpolation)
+            auto fillColor = getColorForFill();
+            glm::vec4 c00 = s.fillType.isGradient() ? getColorAt(bx, by) : fillColor;
+            glm::vec4 c10 = s.fillType.isGradient() ? getColorAt(bx+bw, by) : fillColor;
+            glm::vec4 c11 = s.fillType.isGradient() ? getColorAt(bx+bw, by+bh) : fillColor;
+            glm::vec4 c01 = s.fillType.isGradient() ? getColorAt(bx, by+bh) : fillColor;
+            glm::vec4 flat(0);
+            addVertex(bx,      by,      c00, 0, 0, flat);
+            addVertex(bx + bw, by,      c10, 0, 0, flat);
+            addVertex(bx + bw, by + bh, c11, 0, 0, flat);
+            addVertex(bx,      by,      c00, 0, 0, flat);
+            addVertex(bx + bw, by + bh, c11, 0, 0, flat);
+            addVertex(bx,      by + bh, c01, 0, 0, flat);
+        }
+        flushWithPipeline(stencilCoverPipeline);
+
+        // Step 6: Restore main pipeline for subsequent draws
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipeline);
+        vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
+        if (defaultDescriptorSet != VK_NULL_HANDLE)
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                                     0, 1, &defaultDescriptorSet, 0, nullptr);
     }
 
     // ==== Drawing: drawImage ====
@@ -408,8 +594,98 @@ public:
             static_cast<float>(s.origin.x), static_cast<float>(s.origin.y));
 
         int w = image.getWidth(), h = image.getHeight();
-        juce::Image::BitmapData bmp(image, juce::Image::BitmapData::readOnly);
 
+        // GPU textured quad path: upload image to GPU once, draw as single quad
+        if (textureCache && textureCache->descriptorHelper)
+        {
+            // Content-based hash: sample pixels at corners + center for fast fingerprint
+            juce::Image::BitmapData bmp(image, juce::Image::BitmapData::readOnly);
+            uint64_t key = static_cast<uint64_t>(w) | (static_cast<uint64_t>(h) << 16);
+            auto hashPixel = [&](int x, int y) {
+                auto c = bmp.getPixelColour(x, y);
+                return static_cast<uint64_t>(c.getARGB());
+            };
+            key ^= hashPixel(0, 0) * 0x9e3779b97f4a7c15ULL;
+            key ^= hashPixel(w - 1, 0) * 0x517cc1b727220a95ULL;
+            key ^= hashPixel(0, h - 1) * 0x6c62272e07bb0142ULL;
+            key ^= hashPixel(w - 1, h - 1) * 0x62b821756295c58dULL;
+            key ^= hashPixel(w / 2, h / 2) * 0x9e3779b97f4a7c15ULL;
+            // Include data pointer for disambiguation of images with identical sampled pixels
+            key ^= reinterpret_cast<uint64_t>(bmp.data);
+
+            auto it = textureCache->entries.find(key);
+            if (it == textureCache->entries.end())
+            {
+                // Upload image to GPU texture
+                TextureCache::Entry entry;
+                entry.texture.create({ textureCache->physDevice, textureCache->device,
+                    static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+                    VK_FORMAT_R8G8B8A8_UNORM,
+                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT });
+
+                // Convert JUCE image to RGBA8 for upload
+                std::vector<uint32_t> pixels(static_cast<size_t>(w * h));
+                for (int iy = 0; iy < h; iy++)
+                    for (int ix = 0; ix < w; ix++)
+                    {
+                        auto c = bmp.getPixelColour(ix, iy);
+                        pixels[static_cast<size_t>(iy * w + ix)] =
+                            (static_cast<uint32_t>(c.getRed()))
+                          | (static_cast<uint32_t>(c.getGreen()) << 8)
+                          | (static_cast<uint32_t>(c.getBlue()) << 16)
+                          | (static_cast<uint32_t>(c.getAlpha()) << 24);
+                    }
+
+                entry.texture.upload(textureCache->physDevice, textureCache->commandPool,
+                    textureCache->graphicsQueue, pixels.data(),
+                    static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+                    VK_FORMAT_R8G8B8A8_UNORM);
+                entry.texture.createSampler(VK_FILTER_LINEAR);
+
+                entry.descriptorSet = textureCache->descriptorHelper->allocateSet();
+                core::DescriptorHelper::writeImage(textureCache->device, entry.descriptorSet, 0,
+                    entry.texture.getView(), entry.texture.getSampler());
+
+                entry.lastUsedFrame = textureCache->currentFrame;
+                auto [insertIt, _] = textureCache->entries.emplace(key, std::move(entry));
+                it = insertIt;
+            }
+            else
+            {
+                it->second.lastUsedFrame = textureCache->currentFrame;
+            }
+
+            // Flush pending vertices, bind image texture, draw textured quad, restore default
+            flush();
+
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                                     0, 1, &it->second.descriptorSet, 0, nullptr);
+
+            // Compute transformed corners
+            auto p00 = juce::Point<float>(0, 0).transformedBy(combined);
+            auto p10 = juce::Point<float>(static_cast<float>(w), 0).transformedBy(combined);
+            auto p11 = juce::Point<float>(static_cast<float>(w), static_cast<float>(h)).transformedBy(combined);
+            auto p01 = juce::Point<float>(0, static_cast<float>(h)).transformedBy(combined);
+
+            glm::vec4 white(1.0f, 1.0f, 1.0f, s.opacity);
+            glm::vec4 flat(0);
+            addVertex(p00.x, p00.y, white, 0, 0, flat);
+            addVertex(p10.x, p10.y, white, 1, 0, flat);
+            addVertex(p11.x, p11.y, white, 1, 1, flat);
+            addVertex(p00.x, p00.y, white, 0, 0, flat);
+            addVertex(p11.x, p11.y, white, 1, 1, flat);
+            addVertex(p01.x, p01.y, white, 0, 1, flat);
+            flush();
+
+            // Restore default texture
+            if (defaultDescriptorSet != VK_NULL_HANDLE)
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                                         0, 1, &defaultDescriptorSet, 0, nullptr);
+            return;
+        }
+
+        // Fallback: per-pixel software path (no texture cache available)
+        juce::Image::BitmapData bmp(image, juce::Image::BitmapData::readOnly);
         for (int iy = 0; iy < h; iy++)
         {
             for (int ix = 0; ix < w; ix++)
@@ -454,9 +730,68 @@ public:
         if (isClipEmpty() || glyphs.empty()) return;
         auto& s = state();
 
+        // GPU SDF atlas path: each glyph = 1 textured quad, resolution-independent
+        if (glyphAtlas)
+        {
+            auto* typeface = s.font.getTypefacePtr().get();
+            auto fontHeight = juce::detail::FontRendering::getEffectiveHeight(s.font);
+            auto baseColor = getColorForFill();
+
+            // Scale factor: how big to render relative to the SDF generation size
+            float sdfScale = (fontHeight * scale) / static_cast<float>(GlyphAtlas::SDF_GLYPH_SIZE);
+            float hScale = s.font.getHorizontalScale();
+
+            VkDescriptorSet currentAtlasDescSet = VK_NULL_HANDLE;
+
+            for (size_t idx = 0; idx < glyphs.size(); ++idx)
+            {
+                GlyphAtlas::GlyphKey key { typeface, glyphs[idx] };
+                auto* entry = glyphAtlas->getGlyph(key, s.font);
+                if (!entry) continue;
+
+                auto descSet = glyphAtlas->getDescriptorSet(entry->atlasIndex);
+                if (descSet == VK_NULL_HANDLE) continue;
+
+                // Switch atlas texture if needed
+                if (descSet != currentAtlasDescSet)
+                {
+                    flush();
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                                             0, 1, &descSet, 0, nullptr);
+                    currentAtlasDescSet = descSet;
+                }
+
+                // Position: glyph origin in physical pixels, scaled from SDF space
+                auto glyphPos = positions[idx].transformedBy(t);
+                float ox = static_cast<float>(s.origin.x);
+                float oy = static_cast<float>(s.origin.y);
+                // Offset by the path bounds origin (where the glyph actually starts)
+                float px = glyphPos.x * scale + ox + (entry->offsetX - GlyphAtlas::SDF_PADDING) * sdfScale * hScale;
+                float py = glyphPos.y * scale + oy + (entry->offsetY - GlyphAtlas::SDF_PADDING) * sdfScale;
+                float gw = static_cast<float>(entry->w) * sdfScale * hScale;
+                float gh = static_cast<float>(entry->h) * sdfScale;
+
+                // shapeInfo.x = 4.0 tells the fragment shader to use SDF text evaluation
+                glm::vec4 sdfType(4.0f, 0, 0, 0);
+                addVertex(px,      py,      baseColor, entry->u0, entry->v0, sdfType);
+                addVertex(px + gw, py,      baseColor, entry->u1, entry->v0, sdfType);
+                addVertex(px + gw, py + gh, baseColor, entry->u1, entry->v1, sdfType);
+                addVertex(px,      py,      baseColor, entry->u0, entry->v0, sdfType);
+                addVertex(px + gw, py + gh, baseColor, entry->u1, entry->v1, sdfType);
+                addVertex(px,      py + gh, baseColor, entry->u0, entry->v1, sdfType);
+            }
+
+            // Flush remaining glyphs and restore default texture
+            flush();
+            if (defaultDescriptorSet != VK_NULL_HANDLE)
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                                         0, 1, &defaultDescriptorSet, 0, nullptr);
+            return;
+        }
+
+        // Fallback: EdgeTable per-pixel path
         for (size_t idx = 0; idx < glyphs.size(); ++idx)
         {
-            // Scale the glyph transform to physical pixels
             auto glyphTransform = juce::AffineTransform::translation(positions[idx])
                                     .followedBy(t)
                                     .scaled(scale)
@@ -536,28 +871,75 @@ public:
             mapped = &tempMapped;
         }
 
-        // Grow the buffer if needed (rare — only first few frames)
-        if (!buf->isValid() || buf->getSize() < needed)
+        // Grow the buffer if needed
+        VkDeviceSize totalNeeded = bufferWriteOffset + needed;
+        if (!buf->isValid() || buf->getSize() < totalNeeded)
         {
             buf->destroy();
-            VkDeviceSize allocSize = std::max(needed, static_cast<VkDeviceSize>(sizeof(UIVertex) * 65536));
+            VkDeviceSize allocSize = std::max(totalNeeded, static_cast<VkDeviceSize>(sizeof(UIVertex) * 65536));
             buf->create({ physDevice, device, allocSize,
                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT });
             *mapped = buf->map();
+            bufferWriteOffset = 0; // buffer was reallocated, reset offset
         }
 
-        // Fast memcpy — no allocation, no GPU memory calls
-        memcpy(*mapped, vertices.data(), static_cast<size_t>(needed));
+        // Write at current offset
+        memcpy(static_cast<char*>(*mapped) + bufferWriteOffset, vertices.data(), static_cast<size_t>(needed));
 
         VkBuffer buffers[] = { buf->getBuffer() };
-        VkDeviceSize offsets[] = { 0 };
+        VkDeviceSize offsets[] = { bufferWriteOffset };
         vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
         vkCmdDraw(cmd, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
 
+        bufferWriteOffset += needed;
         vertices.clear();
     }
 
+    // Flush vertices using a specific pipeline (for stencil cover draws)
+    void flushWithPipeline(Pipeline* pip)
+    {
+        if (vertices.empty() || !pip) return;
+
+        auto& s = state();
+        VkRect2D scissor;
+        scissor.offset = { s.clipBounds.getX(), s.clipBounds.getY() };
+        scissor.extent = {
+            static_cast<uint32_t>(std::max(0, s.clipBounds.getWidth())),
+            static_cast<uint32_t>(std::max(0, s.clipBounds.getHeight()))
+        };
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        VkDeviceSize needed = sizeof(UIVertex) * vertices.size();
+
+        core::Buffer* buf = extBuffer;
+        void** mapped = extMappedPtr;
+        core::Buffer tempBuffer;
+        void* tempMapped = nullptr;
+        if (!buf) { buf = &tempBuffer; mapped = &tempMapped; }
+
+        VkDeviceSize totalNeeded = bufferWriteOffset + needed;
+        if (!buf->isValid() || buf->getSize() < totalNeeded)
+        {
+            buf->destroy();
+            VkDeviceSize allocSize = std::max(totalNeeded, static_cast<VkDeviceSize>(sizeof(UIVertex) * 65536));
+            buf->create({ physDevice, device, allocSize,
+                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT });
+            *mapped = buf->map();
+            bufferWriteOffset = 0;
+        }
+
+        memcpy(static_cast<char*>(*mapped) + bufferWriteOffset, vertices.data(), static_cast<size_t>(needed));
+
+        VkBuffer buffers[] = { buf->getBuffer() };
+        VkDeviceSize offsets[] = { bufferWriteOffset };
+        vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
+        vkCmdDraw(cmd, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+
+        bufferWriteOffset += needed;
+        vertices.clear();
+    }
 
 private:
     // ==== Helpers ====
@@ -624,6 +1006,104 @@ private:
         addVertex(ex,      ey,      color, u0, v0, shape);
         addVertex(ex + ew, ey + eh, color, u1, v1, shape);
         addVertex(ex,      ey + eh, color, u0, v1, shape);
+    }
+
+    // Emit a gradient-filled quad using the GPU gradient LUT pipeline
+    // Falls back to 4-corner CPU-sampled interpolation if no gradient cache
+    void emitGradientQuad(float x, float y, float w, float h)
+    {
+        auto& s = state();
+        if (!s.fillType.isGradient() || !s.fillType.gradient) return;
+
+        auto& g = *s.fillType.gradient;
+
+        // GPU path: bind 1D gradient LUT texture, emit quad with gradient-space UVs
+        if (gradientCache)
+        {
+            VkDescriptorSet gradDescSet = gradientCache->getOrCreate(g);
+            if (gradDescSet != VK_NULL_HANDLE)
+            {
+                flush();
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                                         0, 1, &gradDescSet, 0, nullptr);
+
+                // Compute UV coordinates in gradient space for each corner
+                glm::vec4 color(1.0f, 1.0f, 1.0f, s.opacity);
+                float shapeType = g.isRadial ? 6.0f : 5.0f;
+                glm::vec4 shape(shapeType, 0, 0, 0);
+
+                if (g.isRadial)
+                {
+                    // Radial: UV = normalized offset from center, length(UV)=1 at radius edge
+                    float cx = g.point1.x * scale + static_cast<float>(s.origin.x);
+                    float cy = g.point1.y * scale + static_cast<float>(s.origin.y);
+                    float radius = g.point1.getDistanceFrom(g.point2) * scale;
+                    float invR = (radius > 0) ? 1.0f / radius : 0.0f;
+
+                    auto uv = [&](float px, float py) -> std::pair<float, float> {
+                        return { (px - cx) * invR, (py - cy) * invR };
+                    };
+
+                    auto [u00, v00] = uv(x, y);
+                    auto [u10, v10] = uv(x + w, y);
+                    auto [u11, v11] = uv(x + w, y + h);
+                    auto [u01, v01] = uv(x, y + h);
+
+                    addVertex(x,     y,     color, u00, v00, shape);
+                    addVertex(x + w, y,     color, u10, v10, shape);
+                    addVertex(x + w, y + h, color, u11, v11, shape);
+                    addVertex(x,     y,     color, u00, v00, shape);
+                    addVertex(x + w, y + h, color, u11, v11, shape);
+                    addVertex(x,     y + h, color, u01, v01, shape);
+                }
+                else
+                {
+                    // Linear: UV.x = t along gradient axis
+                    float gx1 = g.point1.x * scale + static_cast<float>(s.origin.x);
+                    float gy1 = g.point1.y * scale + static_cast<float>(s.origin.y);
+                    float gx2 = g.point2.x * scale + static_cast<float>(s.origin.x);
+                    float gy2 = g.point2.y * scale + static_cast<float>(s.origin.y);
+                    float dx = gx2 - gx1, dy = gy2 - gy1;
+                    float len2 = dx * dx + dy * dy;
+                    float invLen2 = (len2 > 0) ? 1.0f / len2 : 0.0f;
+
+                    auto tAt = [&](float px, float py) -> float {
+                        return ((px - gx1) * dx + (py - gy1) * dy) * invLen2;
+                    };
+
+                    float t00 = tAt(x, y),     t10 = tAt(x + w, y);
+                    float t11 = tAt(x + w, y + h), t01 = tAt(x, y + h);
+
+                    addVertex(x,     y,     color, t00, 0, shape);
+                    addVertex(x + w, y,     color, t10, 0, shape);
+                    addVertex(x + w, y + h, color, t11, 0, shape);
+                    addVertex(x,     y,     color, t00, 0, shape);
+                    addVertex(x + w, y + h, color, t11, 0, shape);
+                    addVertex(x,     y + h, color, t01, 0, shape);
+                }
+
+                flush();
+
+                // Restore default texture
+                if (defaultDescriptorSet != VK_NULL_HANDLE)
+                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                                             0, 1, &defaultDescriptorSet, 0, nullptr);
+                return;
+            }
+        }
+
+        // Fallback: CPU-sampled 4-corner interpolation
+        auto c00 = getColorAt(x,     y);
+        auto c10 = getColorAt(x + w, y);
+        auto c11 = getColorAt(x + w, y + h);
+        auto c01 = getColorAt(x,     y + h);
+        glm::vec4 flat(0);
+        addVertex(x,     y,     c00, 0, 0, flat);
+        addVertex(x + w, y,     c10, 0, 0, flat);
+        addVertex(x + w, y + h, c11, 0, 0, flat);
+        addVertex(x,     y,     c00, 0, 0, flat);
+        addVertex(x + w, y + h, c11, 0, 0, flat);
+        addVertex(x,     y + h, c01, 0, 0, flat);
     }
 
     glm::vec4 getColorForFill() const
@@ -757,10 +1237,37 @@ private:
         }
 
         void handleEdgeTableLineFull(int x, int width) const
-        { for (int i = 0; i < width; ++i) handleEdgeTablePixelFull(x + i); }
+        {
+            // GPU gradient: emit single quad with corner colors, hardware interpolates
+            float fx = static_cast<float>(x), fy = static_cast<float>(currentY);
+            float fw = static_cast<float>(width);
+            auto c0 = ctx.getColorAt(fx + 0.5f, fy + 0.5f);
+            auto c1 = ctx.getColorAt(fx + fw - 0.5f, fy + 0.5f);
+            glm::vec4 flat(0);
+            ctx.addVertex(fx,      fy,       c0, 0, 0, flat);
+            ctx.addVertex(fx + fw, fy,       c1, 0, 0, flat);
+            ctx.addVertex(fx + fw, fy + 1.f, c1, 0, 0, flat);
+            ctx.addVertex(fx,      fy,       c0, 0, 0, flat);
+            ctx.addVertex(fx + fw, fy + 1.f, c1, 0, 0, flat);
+            ctx.addVertex(fx,      fy + 1.f, c0, 0, 0, flat);
+        }
 
         void handleEdgeTableLine(int x, int width, int level) const
-        { for (int i = 0; i < width; ++i) handleEdgeTablePixel(x + i, level); }
+        {
+            float fx = static_cast<float>(x), fy = static_cast<float>(currentY);
+            float fw = static_cast<float>(width);
+            auto c0 = ctx.getColorAt(fx + 0.5f, fy + 0.5f);
+            auto c1 = ctx.getColorAt(fx + fw - 0.5f, fy + 0.5f);
+            c0.a *= ctx.correctAlpha(level);
+            c1.a *= ctx.correctAlpha(level);
+            glm::vec4 flat(0);
+            ctx.addVertex(fx,      fy,       c0, 0, 0, flat);
+            ctx.addVertex(fx + fw, fy,       c1, 0, 0, flat);
+            ctx.addVertex(fx + fw, fy + 1.f, c1, 0, 0, flat);
+            ctx.addVertex(fx,      fy,       c0, 0, 0, flat);
+            ctx.addVertex(fx + fw, fy + 1.f, c1, 0, 0, flat);
+            ctx.addVertex(fx,      fy + 1.f, c0, 0, 0, flat);
+        }
     };
 
     friend class Graphics;
@@ -779,7 +1286,12 @@ private:
     std::vector<UIVertex> vertices;
     core::Buffer* extBuffer = nullptr;   // external persistent buffer (owned by caller)
     void** extMappedPtr = nullptr;
+    VkDeviceSize bufferWriteOffset = 0; // sub-allocation offset within persistent buffer
     Pipeline* stencilPipeline = nullptr;
+    Pipeline* stencilCoverPipeline = nullptr;
+    TextureCache* textureCache = nullptr;
+    GlyphAtlas* glyphAtlas = nullptr;
+    GradientCache* gradientCache = nullptr;
     Pipeline* multiplyPipeline = nullptr;
     Pipeline* hsvPipeline = nullptr;
     Pipeline* blurPipeline = nullptr;
