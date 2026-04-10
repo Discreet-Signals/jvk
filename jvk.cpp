@@ -34,5 +34,10 @@
 // Components
 #include "include/jvk/components/VulkanComponent.cpp"
 
+// Reflect (SPIRV-Reflect, C source)
+extern "C" {
+#include "include/jvk/reflect/spirv_reflect.c"
+}
+
 // Offscreen
 #include "include/jvk/offscreen/ShaderImage.cpp"
