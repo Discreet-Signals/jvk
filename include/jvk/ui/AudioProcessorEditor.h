@@ -95,6 +95,9 @@ private:
 
         void addedToRenderer(const VulkanRenderer& renderer) override
         {
+            if (renderer.getStatus() != core::VulkanStatus::Ready)
+                return;
+
             physDevice = renderer.getPhysicalDevice();
             device = renderer.getDevice();
 
@@ -297,6 +300,7 @@ private:
 
         void removedFromRenderer(const VulkanRenderer&) override
         {
+            if (!device) return;
             mainPipeline.reset();
             stencilPipeline.reset();
             descriptorHelper.reset();
@@ -305,6 +309,7 @@ private:
 
         void render(VkCommandBuffer& commandBuffer) override
         {
+            if (!device) return;
             auto bounds = getBounds();
             float w = bounds.getWidth();
             float h = bounds.getHeight();

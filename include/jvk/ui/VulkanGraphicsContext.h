@@ -84,7 +84,7 @@ public:
     uint64_t getFrameId() const override { return frameId++; }
     float getPhysicalPixelScaleFactor() const override { return scale; }
 
-    std::unique_ptr<juce::ImageType> getPreferredImageTypeForTemporaryImages() const override
+    std::unique_ptr<juce::ImageType> getPreferredImageTypeForTemporaryImages() const
     {
         return std::make_unique<juce::NativeImageType>();
     }
@@ -463,13 +463,13 @@ public:
                                     .translated(static_cast<float>(s.origin.x),
                                                 static_cast<float>(s.origin.y));
 
-            auto fontHeight = juce::detail::FontRendering::getEffectiveHeight(s.font);
+            auto fontHeight = s.font.getHeight();
             auto fontTransform = juce::AffineTransform::scale(
                 fontHeight * s.font.getHorizontalScale(), fontHeight)
                 .followedBy(glyphTransform);
 
             auto layers = s.font.getTypefacePtr()->getLayersForGlyph(
-                s.font.getMetricsKind(), glyphs[idx], fontTransform);
+                s.font.getMetricsKind(), glyphs[idx], fontTransform, fontHeight);
 
             auto baseColor = getColorForFill();
 

@@ -1,17 +1,17 @@
 /*
  ----------------------------------------------------------------------------
  Copyright (c) 2026 Discreet Signals LLC
- 
+
  ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
  ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
  ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
  ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
  ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
  ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
- 
+
  Licensed under the MIT License. See LICENSE file in the project root
  for full license text.
- 
+
  For questions, contact gavin@discreetsignals.com
  ------------------------------------------------------------------------------
  File: ShaderImage.cpp
@@ -20,6 +20,7 @@
 */
 
 #include "ShaderImage.h"
+#include "../reflect/spirv_reflect.h"
 
 namespace jvk
 {
@@ -36,14 +37,12 @@ struct ShaderImage::Context
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     uint32_t graphicsQueueFamilyIndex = UINT32_MAX;
     VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkDebugUtilsMessengerEXT debugMessenger = VK_NULL_HANDLE;
     std::atomic<int> refCount { 0 };
 
     bool init()
     {
         core::ensureICDDiscoverable();
 
-        // --- Instance ---
         VkApplicationInfo appInfo = {};
         appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
         appInfo.pApplicationName = "jvk ShaderImage";
@@ -52,9 +51,6 @@ struct ShaderImage::Context
         std::vector<const char*> extensions;
 #if JUCE_MAC
         extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-#endif
-#if JUCE_DEBUG
-        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 #endif
 
         VkInstanceCreateInfo instInfo = {};
@@ -66,26 +62,9 @@ struct ShaderImage::Context
         instInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
         instInfo.ppEnabledExtensionNames = extensions.data();
 
-#if JUCE_DEBUG
-        const char* validationLayer = "VK_LAYER_KHRONOS_validation";
-        uint32_t layerCount = 0;
-        vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
-        std::vector<VkLayerProperties> layers(layerCount);
-        vkEnumerateInstanceLayerProperties(&layerCount, layers.data());
-        bool hasValidation = false;
-        for (const auto& l : layers)
-            if (strcmp(l.layerName, validationLayer) == 0) { hasValidation = true; break; }
-        if (hasValidation)
-        {
-            instInfo.enabledLayerCount = 1;
-            instInfo.ppEnabledLayerNames = &validationLayer;
-        }
-#endif
-
         if (vkCreateInstance(&instInfo, nullptr, &instance) != VK_SUCCESS)
             return false;
 
-        // --- Physical device ---
         uint32_t devCount = 0;
         vkEnumeratePhysicalDevices(instance, &devCount, nullptr);
         if (devCount == 0) return false;
@@ -93,7 +72,6 @@ struct ShaderImage::Context
         std::vector<VkPhysicalDevice> devices(devCount);
         vkEnumeratePhysicalDevices(instance, &devCount, devices.data());
 
-        // Pick first device with a graphics queue
         for (auto dev : devices)
         {
             uint32_t qfCount = 0;
@@ -114,7 +92,6 @@ struct ShaderImage::Context
         }
         if (physicalDevice == VK_NULL_HANDLE) return false;
 
-        // --- Logical device ---
         float priority = 1.0f;
         VkDeviceQueueCreateInfo qci = {};
         qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -143,7 +120,6 @@ struct ShaderImage::Context
 
         vkGetDeviceQueue(device, graphicsQueueFamilyIndex, 0, &graphicsQueue);
 
-        // --- Command pool ---
         VkCommandPoolCreateInfo cpci = {};
         cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         cpci.queueFamilyIndex = graphicsQueueFamilyIndex;
@@ -176,6 +152,62 @@ ShaderImage::Context& ShaderImage::getContext()
 }
 
 // =============================================================================
+// SPIR-V Reflection
+// =============================================================================
+
+void ShaderImage::reflectShader()
+{
+    SpvReflectShaderModule module;
+    SpvReflectResult result = spvReflectCreateShaderModule(
+        fragShaderCode.size(), fragShaderCode.data(), &module);
+
+    if (result != SPV_REFLECT_RESULT_SUCCESS)
+    {
+        DBG("ShaderImage: SPIR-V reflection failed");
+        return;
+    }
+
+    uint32_t bindingCount = 0;
+    spvReflectEnumerateDescriptorBindings(&module, &bindingCount, nullptr);
+    std::vector<SpvReflectDescriptorBinding*> bindings(bindingCount);
+    spvReflectEnumerateDescriptorBindings(&module, &bindingCount, bindings.data());
+
+    // Group bindings by descriptor set
+    std::map<uint32_t, std::vector<SpvReflectDescriptorBinding*>> setBindings;
+    for (auto* b : bindings)
+        setBindings[b->set].push_back(b);
+
+    for (auto& [setIndex, setBinds] : setBindings)
+    {
+        DescriptorSetInfo dsi;
+        dsi.set = setIndex;
+
+        for (auto* b : setBinds)
+        {
+            if (b->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+            {
+                dsi.hasStorageBuffer = true;
+                dsi.storageBinding = b->binding;
+            }
+            else if (b->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+            {
+                TextureSlot slot;
+                slot.binding = b->binding;
+                dsi.textures.push_back(slot);
+            }
+        }
+
+        descriptorSets.push_back(std::move(dsi));
+    }
+
+    // Sort by set index
+    std::sort(descriptorSets.begin(), descriptorSets.end(),
+              [](const DescriptorSetInfo& a, const DescriptorSetInfo& b) { return a.set < b.set; });
+
+    spvReflectDestroyShaderModule(&module);
+}
+
+// =============================================================================
 // Constructor / Destructor
 // =============================================================================
 
@@ -203,11 +235,11 @@ ShaderImage::ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
 
     displayImage = juce::Image(juce::Image::ARGB, w, h, true);
 
+    reflectShader();
     createRenderTarget();
-    createStorageBuffer();
+    createDescriptors();
     createPipeline();
 
-    // Allocate double-buffered command buffers
     VkCommandBufferAllocateInfo cbai = {};
     cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     cbai.commandPool = ctx.commandPool;
@@ -215,7 +247,6 @@ ShaderImage::ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
     cbai.commandBufferCount = 2;
     vkAllocateCommandBuffers(ctx.device, &cbai, commandBuffer);
 
-    // Double-buffered fences (start signaled so first wait is a no-op)
     VkFenceCreateInfo fci = {};
     fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
@@ -240,7 +271,7 @@ ShaderImage::~ShaderImage()
         vkFreeCommandBuffers(ctx.device, ctx.commandPool, 2, commandBuffer);
 
     destroyPipeline();
-    destroyStorageBuffer();
+    destroyDescriptors();
     destroyRenderTarget();
 
     if (ctx.refCount.fetch_sub(1) == 1)
@@ -256,7 +287,6 @@ void ShaderImage::createRenderTarget()
     auto& ctx = getContext();
     VkDevice dev = ctx.device;
 
-    // --- Color image ---
     VkImageCreateInfo ici = {};
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     ici.imageType = VK_IMAGE_TYPE_2D;
@@ -280,7 +310,6 @@ void ShaderImage::createRenderTarget()
     vkAllocateMemory(dev, &mai, nullptr, &colorImageMemory);
     vkBindImageMemory(dev, colorImage, colorImageMemory, 0);
 
-    // --- Image view ---
     VkImageViewCreateInfo ivci = {};
     ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     ivci.image = colorImage;
@@ -289,7 +318,6 @@ void ShaderImage::createRenderTarget()
     ivci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     vkCreateImageView(dev, &ivci, nullptr, &colorImageView);
 
-    // --- Render pass (single color attachment, no MSAA) ---
     VkAttachmentDescription att = {};
     att.format = VK_FORMAT_B8G8R8A8_UNORM;
     att.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -314,7 +342,6 @@ void ShaderImage::createRenderTarget()
     rpci.pSubpasses = &sub;
     vkCreateRenderPass(dev, &rpci, nullptr, &renderPass);
 
-    // --- Framebuffer ---
     VkFramebufferCreateInfo fbci = {};
     fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fbci.renderPass = renderPass;
@@ -325,7 +352,6 @@ void ShaderImage::createRenderTarget()
     fbci.layers = 1;
     vkCreateFramebuffer(dev, &fbci, nullptr, &framebuffer);
 
-    // --- Double-buffered staging buffers (persistently mapped) ---
     VkDeviceSize stagingSize = (VkDeviceSize)w * h * 4;
     for (int i = 0; i < 2; i++)
     {
@@ -369,87 +395,307 @@ void ShaderImage::destroyRenderTarget()
 }
 
 // =============================================================================
-// Storage buffer
+// Descriptors (auto-created from SPIR-V reflection)
 // =============================================================================
 
-void ShaderImage::createStorageBuffer()
+void ShaderImage::createDescriptors()
 {
-    if (storageSize <= 0) return;
     auto& ctx = getContext();
     VkDevice dev = ctx.device;
 
-    VkDeviceSize bufSize = sizeof(float) * storageSize;
+    for (auto& dsi : descriptorSets)
+    {
+        // Build layout bindings
+        std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
+        std::vector<VkDescriptorPoolSize> poolSizes;
 
-    VkBufferCreateInfo bci = {};
-    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bci.size = bufSize;
-    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    vkCreateBuffer(dev, &bci, nullptr, &storageBuffer);
+        if (dsi.hasStorageBuffer)
+        {
+            VkDescriptorSetLayoutBinding b = {};
+            b.binding = dsi.storageBinding;
+            b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b.descriptorCount = 1;
+            b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            layoutBindings.push_back(b);
+            poolSizes.push_back({ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 });
 
-    VkMemoryRequirements req;
-    vkGetBufferMemoryRequirements(dev, storageBuffer, &req);
-    VkMemoryAllocateInfo mai = {};
-    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    mai.allocationSize = req.size;
-    mai.memoryTypeIndex = core::findMemoryType(ctx.physicalDevice, req.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    vkAllocateMemory(dev, &mai, nullptr, &storageBufferMemory);
-    vkBindBufferMemory(dev, storageBuffer, storageBufferMemory, 0);
-    vkMapMemory(dev, storageBufferMemory, 0, bufSize, 0, &mappedStoragePtr);
+            // Create storage buffer
+            VkDeviceSize bufSize = sizeof(float) * storageSize;
+            VkBufferCreateInfo bci = {};
+            bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            bci.size = bufSize;
+            bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+            vkCreateBuffer(dev, &bci, nullptr, &dsi.storageBuffer);
 
-    // Descriptor set layout
-    VkDescriptorSetLayoutBinding binding = {};
-    binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    binding.descriptorCount = 1;
-    binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkMemoryRequirements req;
+            vkGetBufferMemoryRequirements(dev, dsi.storageBuffer, &req);
+            VkMemoryAllocateInfo mai = {};
+            mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            mai.allocationSize = req.size;
+            mai.memoryTypeIndex = core::findMemoryType(ctx.physicalDevice, req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            vkAllocateMemory(dev, &mai, nullptr, &dsi.storageBufferMemory);
+            vkBindBufferMemory(dev, dsi.storageBuffer, dsi.storageBufferMemory, 0);
+            vkMapMemory(dev, dsi.storageBufferMemory, 0, bufSize, 0, &dsi.mappedStoragePtr);
+        }
 
-    VkDescriptorSetLayoutCreateInfo dslci = {};
-    dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    dslci.bindingCount = 1;
-    dslci.pBindings = &binding;
-    vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &descriptorSetLayout);
+        for (auto& tex : dsi.textures)
+        {
+            VkDescriptorSetLayoutBinding b = {};
+            b.binding = tex.binding;
+            b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            b.descriptorCount = 1;
+            b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+            layoutBindings.push_back(b);
+            poolSizes.push_back({ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 });
+        }
 
-    // Descriptor pool
-    VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
-    VkDescriptorPoolCreateInfo dpci = {};
-    dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    dpci.maxSets = 1;
-    dpci.poolSizeCount = 1;
-    dpci.pPoolSizes = &poolSize;
-    vkCreateDescriptorPool(dev, &dpci, nullptr, &descriptorPool);
+        // Create layout
+        VkDescriptorSetLayoutCreateInfo dslci = {};
+        dslci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dslci.bindingCount = static_cast<uint32_t>(layoutBindings.size());
+        dslci.pBindings = layoutBindings.data();
+        vkCreateDescriptorSetLayout(dev, &dslci, nullptr, &dsi.layout);
 
-    // Allocate + write descriptor set
-    VkDescriptorSetAllocateInfo dsai = {};
-    dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    dsai.descriptorPool = descriptorPool;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &descriptorSetLayout;
-    vkAllocateDescriptorSets(dev, &dsai, &descriptorSet);
+        // Create pool
+        VkDescriptorPoolCreateInfo dpci = {};
+        dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpci.maxSets = 1;
+        dpci.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        dpci.pPoolSizes = poolSizes.data();
+        vkCreateDescriptorPool(dev, &dpci, nullptr, &dsi.pool);
 
-    VkDescriptorBufferInfo dbi = { storageBuffer, 0, VK_WHOLE_SIZE };
-    VkWriteDescriptorSet wds = {};
-    wds.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    wds.dstSet = descriptorSet;
-    wds.dstBinding = 0;
-    wds.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    wds.descriptorCount = 1;
-    wds.pBufferInfo = &dbi;
-    vkUpdateDescriptorSets(dev, 1, &wds, 0, nullptr);
+        // Allocate descriptor set
+        VkDescriptorSetAllocateInfo dsai = {};
+        dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        dsai.descriptorPool = dsi.pool;
+        dsai.descriptorSetCount = 1;
+        dsai.pSetLayouts = &dsi.layout;
+        vkAllocateDescriptorSets(dev, &dsai, &dsi.descriptorSet);
+
+        // Write storage buffer descriptor
+        if (dsi.hasStorageBuffer && dsi.storageBuffer)
+        {
+            VkDescriptorBufferInfo dbi = { dsi.storageBuffer, 0, VK_WHOLE_SIZE };
+            VkWriteDescriptorSet wds = {};
+            wds.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            wds.dstSet = dsi.descriptorSet;
+            wds.dstBinding = dsi.storageBinding;
+            wds.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            wds.descriptorCount = 1;
+            wds.pBufferInfo = &dbi;
+            vkUpdateDescriptorSets(dev, 1, &wds, 0, nullptr);
+        }
+
+        // Texture descriptors are written when loadTexture() is called
+    }
 }
 
-void ShaderImage::destroyStorageBuffer()
+void ShaderImage::destroyDescriptors()
 {
     auto& ctx = getContext();
     VkDevice dev = ctx.device;
     if (!dev) return;
 
-    if (mappedStoragePtr)     { vkUnmapMemory(dev, storageBufferMemory); mappedStoragePtr = nullptr; }
-    if (descriptorPool)       { vkDestroyDescriptorPool(dev, descriptorPool, nullptr); descriptorPool = VK_NULL_HANDLE; }
-    if (descriptorSetLayout)  { vkDestroyDescriptorSetLayout(dev, descriptorSetLayout, nullptr); descriptorSetLayout = VK_NULL_HANDLE; }
-    if (storageBuffer)        { vkDestroyBuffer(dev, storageBuffer, nullptr); storageBuffer = VK_NULL_HANDLE; }
-    if (storageBufferMemory)  { vkFreeMemory(dev, storageBufferMemory, nullptr); storageBufferMemory = VK_NULL_HANDLE; }
-    descriptorSet = VK_NULL_HANDLE;
+    for (auto& dsi : descriptorSets)
+    {
+        // Destroy storage buffer
+        if (dsi.mappedStoragePtr)    { vkUnmapMemory(dev, dsi.storageBufferMemory); dsi.mappedStoragePtr = nullptr; }
+        if (dsi.storageBuffer)      { vkDestroyBuffer(dev, dsi.storageBuffer, nullptr); dsi.storageBuffer = VK_NULL_HANDLE; }
+        if (dsi.storageBufferMemory){ vkFreeMemory(dev, dsi.storageBufferMemory, nullptr); dsi.storageBufferMemory = VK_NULL_HANDLE; }
+
+        // Destroy textures
+        for (auto& tex : dsi.textures)
+        {
+            if (tex.sampler) { vkDestroySampler(dev, tex.sampler, nullptr); tex.sampler = VK_NULL_HANDLE; }
+            if (tex.view)    { vkDestroyImageView(dev, tex.view, nullptr); tex.view = VK_NULL_HANDLE; }
+            if (tex.image)   { vkDestroyImage(dev, tex.image, nullptr); tex.image = VK_NULL_HANDLE; }
+            if (tex.memory)  { vkFreeMemory(dev, tex.memory, nullptr); tex.memory = VK_NULL_HANDLE; }
+            tex.loaded = false;
+        }
+
+        if (dsi.pool)   { vkDestroyDescriptorPool(dev, dsi.pool, nullptr); dsi.pool = VK_NULL_HANDLE; }
+        if (dsi.layout)  { vkDestroyDescriptorSetLayout(dev, dsi.layout, nullptr); dsi.layout = VK_NULL_HANDLE; }
+        dsi.descriptorSet = VK_NULL_HANDLE;
+    }
+}
+
+// =============================================================================
+// Texture loading
+// =============================================================================
+
+void ShaderImage::loadTexture(int binding, const juce::Image& image)
+{
+    auto& ctx = getContext();
+    VkDevice dev = ctx.device;
+    if (!dev) return;
+
+    // Find the texture slot matching this binding
+    TextureSlot* slot = nullptr;
+    DescriptorSetInfo* ownerSet = nullptr;
+    for (auto& dsi : descriptorSets)
+        for (auto& tex : dsi.textures)
+            if (tex.binding == binding)
+            { slot = &tex; ownerSet = &dsi; break; }
+
+    if (!slot || !ownerSet)
+    {
+        DBG("ShaderImage: No sampler binding " << binding << " found in shader");
+        return;
+    }
+
+    vkDeviceWaitIdle(dev);
+
+    // Clean up previous texture in this slot
+    if (slot->sampler) { vkDestroySampler(dev, slot->sampler, nullptr); slot->sampler = VK_NULL_HANDLE; }
+    if (slot->view)    { vkDestroyImageView(dev, slot->view, nullptr); slot->view = VK_NULL_HANDLE; }
+    if (slot->image)   { vkDestroyImage(dev, slot->image, nullptr); slot->image = VK_NULL_HANDLE; }
+    if (slot->memory)  { vkFreeMemory(dev, slot->memory, nullptr); slot->memory = VK_NULL_HANDLE; }
+
+    int tw = image.getWidth();
+    int th = image.getHeight();
+    VkDeviceSize imageSize = (VkDeviceSize)tw * th * 4;
+
+    // --- Staging buffer ---
+    VkBuffer stagBuf = VK_NULL_HANDLE;
+    VkDeviceMemory stagMem = VK_NULL_HANDLE;
+
+    VkBufferCreateInfo bci = {};
+    bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bci.size = imageSize;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    vkCreateBuffer(dev, &bci, nullptr, &stagBuf);
+
+    VkMemoryRequirements bufReq;
+    vkGetBufferMemoryRequirements(dev, stagBuf, &bufReq);
+    VkMemoryAllocateInfo bmai = {};
+    bmai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    bmai.allocationSize = bufReq.size;
+    bmai.memoryTypeIndex = core::findMemoryType(ctx.physicalDevice, bufReq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    vkAllocateMemory(dev, &bmai, nullptr, &stagMem);
+    vkBindBufferMemory(dev, stagBuf, stagMem, 0);
+
+    void* mapped = nullptr;
+    vkMapMemory(dev, stagMem, 0, imageSize, 0, &mapped);
+    {
+        juce::Image argb = image.convertedToFormat(juce::Image::ARGB);
+        juce::Image::BitmapData bd(argb, juce::Image::BitmapData::readOnly);
+        for (int y = 0; y < th; y++)
+            memcpy(static_cast<uint8_t*>(mapped) + y * tw * 4, bd.getLinePointer(y), tw * 4);
+    }
+    vkUnmapMemory(dev, stagMem);
+
+    // --- VkImage ---
+    VkImageCreateInfo ici = {};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_B8G8R8A8_UNORM;
+    ici.extent = { (uint32_t)tw, (uint32_t)th, 1 };
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    vkCreateImage(dev, &ici, nullptr, &slot->image);
+
+    VkMemoryRequirements imgReq;
+    vkGetImageMemoryRequirements(dev, slot->image, &imgReq);
+    VkMemoryAllocateInfo imai = {};
+    imai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    imai.allocationSize = imgReq.size;
+    imai.memoryTypeIndex = core::findMemoryType(ctx.physicalDevice, imgReq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    vkAllocateMemory(dev, &imai, nullptr, &slot->memory);
+    vkBindImageMemory(dev, slot->image, slot->memory, 0);
+
+    // --- Upload via one-shot command buffer ---
+    VkCommandBufferAllocateInfo cbai = {};
+    cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cbai.commandPool = ctx.commandPool;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    vkAllocateCommandBuffers(dev, &cbai, &cmd);
+
+    VkCommandBufferBeginInfo cbbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &cbbi);
+
+    VkImageMemoryBarrier barrier = {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = slot->image;
+    barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkBufferImageCopy region = {};
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent = { (uint32_t)tw, (uint32_t)th, 1 };
+    vkCmdCopyBufferToImage(cmd, stagBuf, slot->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(ctx.graphicsQueue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(ctx.graphicsQueue);
+    vkFreeCommandBuffers(dev, ctx.commandPool, 1, &cmd);
+
+    vkDestroyBuffer(dev, stagBuf, nullptr);
+    vkFreeMemory(dev, stagMem, nullptr);
+
+    // --- Image view ---
+    VkImageViewCreateInfo ivci = {};
+    ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    ivci.image = slot->image;
+    ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    ivci.format = VK_FORMAT_B8G8R8A8_UNORM;
+    ivci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCreateImageView(dev, &ivci, nullptr, &slot->view);
+
+    // --- Sampler ---
+    VkSamplerCreateInfo sci = {};
+    sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sci.maxLod = 1.0f;
+    vkCreateSampler(dev, &sci, nullptr, &slot->sampler);
+
+    // --- Write descriptor ---
+    VkDescriptorImageInfo dii = {};
+    dii.sampler = slot->sampler;
+    dii.imageView = slot->view;
+    dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet wds = {};
+    wds.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    wds.dstSet = ownerSet->descriptorSet;
+    wds.dstBinding = slot->binding;
+    wds.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    wds.descriptorCount = 1;
+    wds.pImageInfo = &dii;
+    vkUpdateDescriptorSets(dev, 1, &wds, 0, nullptr);
+
+    slot->loaded = true;
 }
 
 // =============================================================================
@@ -461,7 +707,6 @@ void ShaderImage::createPipeline()
     auto& ctx = getContext();
     VkDevice dev = ctx.device;
 
-    // Shader modules
     auto createModule = [&](const char* code, size_t size) -> VkShaderModule {
         VkShaderModuleCreateInfo ci = {};
         ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -486,7 +731,6 @@ void ShaderImage::createPipeline()
     stages[1].module = fragMod;
     stages[1].pName = "main";
 
-    // No vertex input (procedural fullscreen triangle)
     VkPipelineVertexInputStateCreateInfo vertexInput = {};
     vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
 
@@ -522,15 +766,15 @@ void ShaderImage::createPipeline()
     colorBlending.attachmentCount = 1;
     colorBlending.pAttachments = &blendAtt;
 
-    // Push constants
     VkPushConstantRange pcRange = {};
     pcRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     pcRange.offset = 0;
     pcRange.size = sizeof(PushConstants);
 
-    // Pipeline layout
+    // Collect descriptor set layouts in set-index order
     std::vector<VkDescriptorSetLayout> layouts;
-    if (descriptorSetLayout) layouts.push_back(descriptorSetLayout);
+    for (auto& dsi : descriptorSets)
+        layouts.push_back(dsi.layout);
 
     VkPipelineLayoutCreateInfo plci = {};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -615,11 +859,9 @@ void ShaderImage::render()
     int prev = 1 - frameIndex;
     int curr = frameIndex;
 
-    // Wait for the previous frame's GPU work to finish
     vkWaitForFences(dev, 1, &fence[prev], VK_TRUE, UINT64_MAX);
 
-    // Copy previous frame's staging buffer to display image (one frame of latency)
-    // BGRA → JUCE ARGB: identical layout on little-endian
+    // Copy previous frame's staging buffer to display image
     {
         juce::Image::BitmapData bd(displayImage, juce::Image::BitmapData::writeOnly);
         const auto* src = static_cast<const uint8_t*>(mappedStagingPtr[prev]);
@@ -628,18 +870,20 @@ void ShaderImage::render()
     }
 
     // Update storage buffer from FIFO
-    if (storageSize > 0 && mappedStoragePtr && fifo)
+    for (auto& dsi : descriptorSets)
     {
-        int available = fifo->size();
-        for (int i = 0; i < available && i < storageSize; i++)
+        if (dsi.hasStorageBuffer && dsi.mappedStoragePtr && storageSize > 0 && fifo)
         {
-            if (fifo->size() > 0)
-                storageData[i % storageSize] = fifo->pop();
+            int available = fifo->size();
+            for (int i = 0; i < available && i < storageSize; i++)
+            {
+                if (fifo->size() > 0)
+                    storageData[i % storageSize] = fifo->pop();
+            }
+            memcpy(dsi.mappedStoragePtr, storageData.data(), sizeof(float) * storageSize);
         }
-        memcpy(mappedStoragePtr, storageData.data(), sizeof(float) * storageSize);
     }
 
-    // Reset current frame's fence and record command buffer
     vkResetFences(dev, 1, &fence[curr]);
     vkResetCommandBuffer(commandBuffer[curr], 0);
 
@@ -647,7 +891,6 @@ void ShaderImage::render()
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(commandBuffer[curr], &beginInfo);
 
-    // Begin render pass
     VkClearValue clearValue = {};
     clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
 
@@ -670,17 +913,16 @@ void ShaderImage::render()
     vkCmdPushConstants(commandBuffer[curr], pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
                        0, sizeof(PushConstants), &pc);
 
-    // Bind storage buffer descriptor
-    if (descriptorSet)
+    // Bind all descriptor sets
+    for (auto& dsi : descriptorSets)
+    {
         vkCmdBindDescriptorSets(commandBuffer[curr], VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+                                pipelineLayout, dsi.set, 1, &dsi.descriptorSet, 0, nullptr);
+    }
 
-    // Draw fullscreen triangle
     vkCmdDraw(commandBuffer[curr], 3, 1, 0, 0);
-
     vkCmdEndRenderPass(commandBuffer[curr]);
 
-    // Copy rendered image to current staging buffer
     VkBufferImageCopy region = {};
     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
     region.imageExtent = { (uint32_t)w, (uint32_t)h, 1 };
@@ -689,7 +931,6 @@ void ShaderImage::render()
 
     vkEndCommandBuffer(commandBuffer[curr]);
 
-    // Submit and return immediately — GPU works while CPU is free
     VkSubmitInfo submitInfo = {};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
