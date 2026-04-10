@@ -99,6 +99,7 @@ public:
     VkSampleCountFlagBits getMaxSupportedMSAA() const { return maxSupportedMSAA; }
     VkCommandPool getCommandPool() const { return commandPool; }
     VkQueue getGraphicsQueue() const { return graphicsQueue; }
+    size_t getCurrentFrame() const { return currentFrame; }
     const core::VulkanRendererSettings& getSettings() const { return settings; }
 
     // --- Runtime settings changes ---

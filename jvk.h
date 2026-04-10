@@ -102,6 +102,7 @@
 
 // UI (Vulkan-backed juce::Graphics)
 #include "include/jvk/ui/UI2DShaders.h"
+#include "include/jvk/ui/GlyphAtlas.h"
 #include "include/jvk/ui/VulkanGraphicsContext.h"
 #include "include/jvk/ui/Graphics.h"
 #include "include/jvk/ui/AudioProcessorEditor.h"

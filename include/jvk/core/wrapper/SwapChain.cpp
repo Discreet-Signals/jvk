@@ -193,7 +193,7 @@ void SwapChain::createDepthImages()
         VkImageCreateInfo imageInfo = {};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = VK_FORMAT_D32_SFLOAT;
+        imageInfo.format = VK_FORMAT_D24_UNORM_S8_UINT;
         imageInfo.extent.width = extent.width;
         imageInfo.extent.height = extent.height;
         imageInfo.extent.depth = 1;
@@ -222,8 +222,8 @@ void SwapChain::createDepthImages()
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         viewInfo.image = depthImages[i];
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = VK_FORMAT_D32_SFLOAT;
-        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        viewInfo.format = VK_FORMAT_D24_UNORM_S8_UINT;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
         viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
         viewInfo.subresourceRange.baseArrayLayer = 0;

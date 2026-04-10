@@ -447,11 +447,11 @@ bool VulkanInstance::createRenderPass()
 
     // Attachment 2: Depth
     VkAttachmentDescription depthAttachment = {};
-    depthAttachment.format = VK_FORMAT_D32_SFLOAT;
+    depthAttachment.format = VK_FORMAT_D24_UNORM_S8_UINT;
     depthAttachment.samples = settings.msaaSamples;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
