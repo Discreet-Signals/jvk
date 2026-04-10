@@ -804,7 +804,7 @@ public:
                 .followedBy(glyphTransform);
 
             auto layers = s.font.getTypefacePtr()->getLayersForGlyph(
-                s.font.getMetricsKind(), glyphs[idx], fontTransform, fontHeight);
+                s.font.getMetricsKind(), glyphs[idx], fontTransform);
 
             auto baseColor = getColorForFill();
 
