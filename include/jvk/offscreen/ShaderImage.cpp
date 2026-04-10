@@ -825,6 +825,7 @@ void ShaderImage::setSize(int width, int height)
     auto& ctx = getContext();
     vkDeviceWaitIdle(ctx.device);
 
+    int savedFps = isTimerRunning() ? (1000 / getTimerInterval()) : 0;
     stopTimer();
     w = width;
     h = height;
@@ -836,6 +837,8 @@ void ShaderImage::setSize(int width, int height)
 
     createRenderTarget();
     createPipeline();
+
+    if (savedFps > 0) startTimerHz(savedFps);
 }
 
 void ShaderImage::setFrameRate(int fps)
