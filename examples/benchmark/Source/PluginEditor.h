@@ -36,7 +36,7 @@ public:
 private:
     void timerCallback() override;
 
-    enum class Mode { All, Text, TextStatic, ComplexPaths, Fills };
+    enum class Mode { All, Text, TextStatic, ComplexPaths, Fills, BackendComparison };
 
     void runBenchmark(Mode mode);
     void paintBenchmarkScene(juce::Graphics& g, int frame);
@@ -49,7 +49,10 @@ private:
     void sceneComplexPaths(juce::Graphics& g, float w, float h, float t, float phase);
     void sceneFills(juce::Graphics& g, float w, float h, float t, float phase);
 
-    juce::TextButton btnAll, btnText, btnTextStatic, btnPaths, btnFills;
+    juce::TextButton btnAll, btnText, btnTextStatic, btnPaths, btnFills, btnBackends;
+
+    juce::TextButton btnEdgeTable, btnStencil;
+    jvk::VulkanGraphicsContext::PathBackend activeBackend = jvk::VulkanGraphicsContext::PathBackend::Stencil;
 
     // Pregenerated complex paths (built once at startup)
     std::vector<juce::Path> waveformPaths;
@@ -58,6 +61,42 @@ private:
 
     void generatePaths(float w, float h);
     bool pathsGenerated = false;
+
+    // --- Backend comparison test ---
+    std::vector<juce::Path> testPaths;
+    std::vector<int> testPathSegCounts;
+    void generateTestPaths();
+    bool testPathsGenerated = false;
+
+    struct BackendTestState
+    {
+        bool running = false;
+        bool complete = false;
+        int currentBackendIdx = 0;
+        int currentComplexityIdx = 0;
+        int framesRendered = 0;
+        static constexpr int framesPerTest = 10;
+        static constexpr int pathsPerFrame = 10;
+
+        std::vector<int> complexities;
+
+        struct BackendResult
+        {
+            juce::String name;
+            juce::Colour color;
+            jvk::VulkanGraphicsContext::PathBackend backend;
+            std::vector<double> frameTimes;
+        };
+        std::vector<BackendResult> backends;
+
+        double frameTimeAccum = 0;
+        int globalFrame = 0;
+    };
+    BackendTestState backendTest;
+
+    void startBackendComparison();
+    void advanceBackendTest();
+    void paintBackendResults(juce::Graphics& g);
 
     // Benchmark state
     Mode activeMode = Mode::All;

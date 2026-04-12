@@ -21,6 +21,7 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include <numeric>
 
 static void styleButton(juce::TextButton& btn, const juce::String& text, juce::Colour col)
 {
@@ -38,18 +39,32 @@ BenchmarkEditor::BenchmarkEditor(BenchmarkProcessor& p)
     styleButton(btnTextStatic, "TEXT STATIC",  juce::Colour(0xFF5B5EA6));
     styleButton(btnPaths,      "COMPLEX PATHS",juce::Colour(0xFFE07A5F));
     styleButton(btnFills,      "FILLS",        juce::Colour(0xFFF4A261));
+    styleButton(btnBackends,  "BACKENDS",     juce::Colour(0xFFE84545));
 
     btnAll.onClick        = [this] { runBenchmark(Mode::All); };
     btnText.onClick       = [this] { runBenchmark(Mode::Text); };
     btnTextStatic.onClick = [this] { runBenchmark(Mode::TextStatic); };
     btnPaths.onClick      = [this] { runBenchmark(Mode::ComplexPaths); };
     btnFills.onClick      = [this] { runBenchmark(Mode::Fills); };
+    btnBackends.onClick   = [this] { runBenchmark(Mode::BackendComparison); };
 
     addAndMakeVisible(btnAll);
     addAndMakeVisible(btnText);
     addAndMakeVisible(btnTextStatic);
     addAndMakeVisible(btnPaths);
     addAndMakeVisible(btnFills);
+    addAndMakeVisible(btnBackends);
+
+    // Backend selectors
+    using PB = jvk::VulkanGraphicsContext::PathBackend;
+    auto setupBE = [&](juce::TextButton& btn, const juce::String& name, PB backend, juce::Colour col)
+    {
+        styleButton(btn, name, col);
+        btn.onClick = [this, backend] { activeBackend = backend; repaint(); };
+        addAndMakeVisible(btn);
+    };
+    setupBE(btnEdgeTable, "EdgeTable", PB::EdgeTable, juce::Colour(0xFFAAAAAA));
+    setupBE(btnStencil,   "Stencil",   PB::Stencil,   juce::Colour(0xFFE07A5F));
 
     setSize(800, 600);
 }
@@ -165,6 +180,13 @@ void BenchmarkEditor::runBenchmark(Mode mode)
         case Mode::TextStatic:   modeName = "TEXT STATIC"; break;
         case Mode::ComplexPaths: modeName = "COMPLEX PATHS"; break;
         case Mode::Fills:        modeName = "FILLS"; break;
+        case Mode::BackendComparison: modeName = "BACKENDS"; break;
+    }
+
+    if (mode == Mode::BackendComparison)
+    {
+        startBackendComparison();
+        return;
     }
 
     generatePaths(static_cast<float>(getWidth()), static_cast<float>(getHeight()));
@@ -528,6 +550,7 @@ void BenchmarkEditor::paintBenchmarkScene(juce::Graphics& g, int frame)
         case Mode::TextStatic:   sceneTextStatic(g, w, h); break;
         case Mode::ComplexPaths: sceneComplexPaths(g, w, h, t, phase); break;
         case Mode::Fills:        sceneFills(g, w, h, t, phase); break;
+        case Mode::BackendComparison: break; // handled separately
     }
 }
 
@@ -633,6 +656,74 @@ void BenchmarkEditor::paintBenchmarkResults(juce::Graphics& g)
 
 void BenchmarkEditor::paint(juce::Graphics& g)
 {
+    // Apply the user-selected path backend
+    if (auto* vkCtx = dynamic_cast<jvk::VulkanGraphicsContext*>(&g.getInternalContext()))
+        vkCtx->pathBackend = activeBackend;
+
+    // Backend comparison test — independent state machine
+    if (backendTest.running)
+    {
+        auto& bt = backendTest;
+        auto& backend = bt.backends[static_cast<size_t>(bt.currentBackendIdx)];
+
+        if (auto* vkCtx = dynamic_cast<jvk::VulkanGraphicsContext*>(&g.getInternalContext()))
+            vkCtx->pathBackend = backend.backend;
+
+        double t0 = juce::Time::getMillisecondCounterHiRes();
+
+        int pathIdx = bt.complexities[static_cast<size_t>(bt.currentComplexityIdx)];
+        auto& path = testPaths[static_cast<size_t>(pathIdx)];
+        int segs = testPathSegCounts[static_cast<size_t>(pathIdx)];
+        g.fillAll(juce::Colour(0xFF0E0E1A));
+        float w = static_cast<float>(getWidth()), h = static_cast<float>(getHeight());
+        float anim = static_cast<float>(bt.globalFrame) * 0.02f;
+
+        for (int i = 0; i < bt.pathsPerFrame; i++)
+        {
+            float fi = static_cast<float>(i);
+            float x = std::fmod(fi * 7.3f + std::sin(anim + fi * 0.1f) * 30.0f, w * 0.85f);
+            float y = std::fmod(fi * 5.1f + std::cos(anim * 0.7f + fi * 0.07f) * 20.0f, h * 0.85f);
+            float scale = 0.8f + 0.2f * std::sin(anim * 0.5f + fi * 0.05f);
+            g.setColour(juce::Colour::fromHSV(std::fmod(fi / static_cast<float>(bt.pathsPerFrame) + anim * 0.1f, 1.0f),
+                                               0.7f, 0.9f, 0.4f));
+            g.fillPath(path, juce::AffineTransform::scale(scale).translated(x, y));
+        }
+
+        double frameMs = juce::Time::getMillisecondCounterHiRes() - t0;
+        bt.frameTimeAccum += frameMs;
+        bt.framesRendered++;
+        bt.globalFrame++;
+
+        g.setColour(juce::Colour(0xCC000000));
+        g.fillRect(0, 0, getWidth(), 30);
+        g.setColour(juce::Colours::white);
+        g.setFont(juce::FontOptions(12.0f));
+        g.drawText(backend.name + " | " + juce::String(segs) + " segs | "
+                   + juce::String(bt.pathsPerFrame) + " paths | "
+                   + juce::String(frameMs, 1) + "ms | "
+                   + juce::String(bt.currentComplexityIdx + 1) + "/" + juce::String(static_cast<int>(bt.complexities.size()))
+                   + " x " + juce::String(bt.currentBackendIdx + 1) + "/" + juce::String(static_cast<int>(bt.backends.size())),
+                   10, 5, getWidth() - 20, 20, juce::Justification::centredLeft);
+
+        if (bt.framesRendered >= bt.framesPerTest)
+            advanceBackendTest();
+
+        return;
+    }
+
+    if (backendTest.complete)
+    {
+        paintBackendResults(g);
+        // Click anywhere to dismiss
+        if (juce::ModifierKeys::currentModifiers.isLeftButtonDown())
+        {
+            backendTest.complete = false;
+            showResults = false;
+            repaint();
+        }
+        return;
+    }
+
     if (showResults && !benchmarking)
     {
         paintBenchmarkResults(g);
@@ -696,14 +787,238 @@ void BenchmarkEditor::paint(juce::Graphics& g)
 
 void BenchmarkEditor::resized()
 {
-    int btnW = 130, btnH = 32, gap = 10;
-    int totalW = 5 * btnW + 4 * gap;
-    int startX = (getWidth() - totalW) / 2;
-    int y = getHeight() / 2;
+    // Backend selector row at top-right
+    int beW = 95, beH = 24, beGap = 4;
+    int beStartX = getWidth() - 2 * (beW + beGap) - 6;
+    int beY = 4;
+    btnEdgeTable.setBounds(beStartX, beY, beW, beH); beStartX += beW + beGap;
+    btnStencil.setBounds(beStartX, beY, beW, beH);
 
-    btnAll.setBounds(startX, y, btnW, btnH); startX += btnW + gap;
-    btnText.setBounds(startX, y, btnW, btnH); startX += btnW + gap;
-    btnTextStatic.setBounds(startX, y, btnW, btnH); startX += btnW + gap;
-    btnPaths.setBounds(startX, y, btnW, btnH); startX += btnW + gap;
-    btnFills.setBounds(startX, y, btnW, btnH);
+    // Benchmark buttons centered in two rows
+    int btnW = 120, btnH = 40, gap = 10;
+    int totalW = 3 * btnW + 2 * gap;
+    int startX = (getWidth() - totalW) / 2;
+    int row1Y = getHeight() / 2;
+    int row2Y = row1Y + btnH + gap;
+
+    btnAll.setBounds(startX, row1Y, btnW, btnH);
+    btnText.setBounds(startX + btnW + gap, row1Y, btnW, btnH);
+    btnTextStatic.setBounds(startX + 2 * (btnW + gap), row1Y, btnW, btnH);
+    btnPaths.setBounds(startX, row2Y, btnW, btnH);
+    btnFills.setBounds(startX + btnW + gap, row2Y, btnW, btnH);
+    btnBackends.setBounds(startX + 2 * (btnW + gap), row2Y, btnW, btnH);
+}
+
+// =============================================================================
+// Backend comparison test
+// =============================================================================
+
+void BenchmarkEditor::generateTestPaths()
+{
+    if (testPathsGenerated) return;
+    testPathsGenerated = true;
+
+    std::vector<int> targetSegments = { 10, 100, 1000, 10000, 100000 };
+
+    testPaths.clear();
+    testPaths.reserve(targetSegments.size());
+    testPathSegCounts = targetSegments;
+
+    for (int target : targetSegments)
+    {
+        juce::Path p;
+        float cx = 100.0f, cy = 100.0f;
+        p.startNewSubPath(cx, cy);
+
+        for (int i = 0; i < target; i++)
+        {
+            float angle = static_cast<float>(i) * 0.31f;
+            float r = 30.0f + static_cast<float>(i % 200) * 0.5f;
+
+            // Every 40 segments, start a new subpath (compound shape with holes)
+            if (i > 0 && i % 40 == 0)
+            {
+                p.closeSubPath();
+                float holeAngle = static_cast<float>(i) * 0.7f;
+                p.startNewSubPath(cx + std::cos(holeAngle) * 20.0f,
+                                  cy + std::sin(holeAngle) * 20.0f);
+            }
+
+            if (i % 3 == 0)
+            {
+                p.cubicTo(
+                    cx + r * std::cos(angle) * 1.3f,
+                    cy + r * std::sin(angle) * 0.8f,
+                    cx + r * std::cos(angle + 0.5f) * 0.7f,
+                    cy + r * std::sin(angle + 0.5f) * 1.2f,
+                    cx + r * std::cos(angle + 1.0f),
+                    cy + r * std::sin(angle + 1.0f));
+            }
+            else
+            {
+                p.lineTo(cx + r * std::cos(angle),
+                         cy + r * std::sin(angle));
+            }
+        }
+        p.closeSubPath();
+        testPaths.push_back(std::move(p));
+    }
+}
+
+void BenchmarkEditor::startBackendComparison()
+{
+    if (backendTest.running) return;
+
+    generateTestPaths();
+
+    backendTest = {};
+
+    backendTest.complexities.resize(static_cast<int>(testPaths.size()));
+    std::iota(backendTest.complexities.begin(), backendTest.complexities.end(), 0);
+
+    using PB = jvk::VulkanGraphicsContext::PathBackend;
+    backendTest.backends = {
+        { "EdgeTable", juce::Colour(0xFFAAAAAA), PB::EdgeTable, {} },
+        { "Stencil",   juce::Colour(0xFFE07A5F), PB::Stencil,   {} },
+    };
+
+    for (auto& b : backendTest.backends)
+        b.frameTimes.resize(backendTest.complexities.size(), 0.0);
+
+    backendTest.currentBackendIdx = 0;
+    backendTest.currentComplexityIdx = 0;
+    backendTest.framesRendered = 0;
+    backendTest.frameTimeAccum = 0;
+
+    setVulkanEnabled(true);
+    savedPresentMode = getVulkanRenderer().getSettings().presentMode;
+    getVulkanRenderer().setPresentMode(VK_PRESENT_MODE_IMMEDIATE_KHR);
+    backendTest.running = true;
+    benchmarking = true;
+    showResults = false;
+    backendTest.complete = false;
+}
+
+void BenchmarkEditor::advanceBackendTest()
+{
+    auto& bt = backendTest;
+
+    double avgMs = bt.frameTimeAccum / static_cast<double>(bt.framesRendered);
+    bt.backends[static_cast<size_t>(bt.currentBackendIdx)]
+        .frameTimes[static_cast<size_t>(bt.currentComplexityIdx)] = avgMs;
+
+    bt.frameTimeAccum = 0;
+    bt.framesRendered = 0;
+
+    bt.currentComplexityIdx++;
+    if (bt.currentComplexityIdx >= static_cast<int>(bt.complexities.size()))
+    {
+        bt.currentComplexityIdx = 0;
+        bt.currentBackendIdx++;
+
+        if (bt.currentBackendIdx >= static_cast<int>(bt.backends.size()))
+        {
+            bt.running = false;
+            bt.complete = true;
+            benchmarking = false;
+            getVulkanRenderer().setPresentMode(savedPresentMode);
+            return;
+        }
+    }
+}
+
+void BenchmarkEditor::paintBackendResults(juce::Graphics& g)
+{
+    float w = static_cast<float>(getWidth());
+    float h = static_cast<float>(getHeight());
+
+    g.fillAll(juce::Colour(0xFF0E0E1A));
+
+    g.setColour(juce::Colours::white);
+    g.setFont(juce::FontOptions(22.0f));
+    g.drawText("Backend Comparison — Frame Time vs Path Complexity",
+               0, 10, static_cast<int>(w), 30, juce::Justification::centred);
+
+    g.setFont(juce::FontOptions(11.0f));
+    g.setColour(juce::Colour(0xFFAAAAAA));
+    g.drawText(juce::String(backendTest.pathsPerFrame) + " paths/frame, "
+               + juce::String(backendTest.framesPerTest) + " frames/sample",
+               0, 38, static_cast<int>(w), 16, juce::Justification::centred);
+
+    float chartLeft = 70.0f, chartTop = 70.0f;
+    float chartW = w - 100.0f, chartH = h - 140.0f;
+
+    g.setColour(juce::Colour(0xFF16213E));
+    g.fillRoundedRectangle(chartLeft - 5, chartTop - 5, chartW + 10, chartH + 10, 6.0f);
+
+    auto& bt = backendTest;
+    if (bt.backends.empty() || bt.complexities.empty()) return;
+
+    double maxMs = 1.0;
+    for (auto& b : bt.backends)
+        for (auto t : b.frameTimes)
+            maxMs = std::max(maxMs, t);
+    maxMs *= 1.15;
+
+    // Y axis
+    g.setFont(juce::FontOptions(9.0f));
+    for (int i = 0; i <= 5; i++)
+    {
+        float y = chartTop + chartH * (1.0f - static_cast<float>(i) / 5.0f);
+        double ms = maxMs * static_cast<double>(i) / 5.0;
+        g.setColour(juce::Colours::grey);
+        g.drawText(juce::String(ms, 1) + "ms", 0, static_cast<int>(y) - 6, 65, 12,
+                    juce::Justification::centredRight);
+        g.setColour(juce::Colour(0x20FFFFFF));
+        g.drawHorizontalLine(static_cast<int>(y), chartLeft, chartLeft + chartW);
+    }
+
+    // X axis
+    g.setFont(juce::FontOptions(8.0f));
+    int numLabels = std::min(10, static_cast<int>(bt.complexities.size()));
+    for (int li = 0; li < numLabels; li++)
+    {
+        size_t ci = static_cast<size_t>(li) * (bt.complexities.size() - 1) / static_cast<size_t>(numLabels - 1);
+        float x = chartLeft + (static_cast<float>(ci) / static_cast<float>(bt.complexities.size() - 1)) * chartW;
+        int segs = testPathSegCounts[static_cast<size_t>(bt.complexities[ci])];
+        juce::String label = segs >= 1000 ? juce::String(segs / 1000) + "K" : juce::String(segs);
+        g.setColour(juce::Colours::grey);
+        g.drawText(label, static_cast<int>(x) - 20, static_cast<int>(chartTop + chartH + 4), 40, 12,
+                    juce::Justification::centred);
+    }
+    g.setColour(juce::Colour(0xFFAAAAAA));
+    g.setFont(juce::FontOptions(10.0f));
+    g.drawText("Path segments", static_cast<int>(chartLeft), static_cast<int>(chartTop + chartH + 18),
+               static_cast<int>(chartW), 14, juce::Justification::centred);
+
+    // Plot each backend
+    for (auto& backend : bt.backends)
+    {
+        g.setColour(backend.color);
+        juce::Path line;
+
+        for (size_t ci = 0; ci < bt.complexities.size(); ci++)
+        {
+            float x = chartLeft + (static_cast<float>(ci) / static_cast<float>(bt.complexities.size() - 1)) * chartW;
+            float y = chartTop + chartH * (1.0f - static_cast<float>(backend.frameTimes[ci] / maxMs));
+            if (ci == 0) line.startNewSubPath(x, y);
+            else line.lineTo(x, y);
+
+            g.fillEllipse(x - 3, y - 3, 6, 6);
+        }
+        g.strokePath(line, juce::PathStrokeType(2.0f));
+    }
+
+    // Legend
+    float legendX = chartLeft + 10, legendY = chartTop + 10;
+    g.setFont(juce::FontOptions(11.0f));
+    for (auto& backend : bt.backends)
+    {
+        g.setColour(backend.color);
+        g.fillRoundedRectangle(legendX, legendY, 12, 12, 2.0f);
+        g.setColour(juce::Colours::white);
+        g.drawText(backend.name, static_cast<int>(legendX + 16), static_cast<int>(legendY), 100, 12,
+                    juce::Justification::centredLeft);
+        legendY += 18;
+    }
 }
