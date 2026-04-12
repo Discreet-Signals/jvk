@@ -24,7 +24,7 @@
 namespace jvk::graphics
 {
 
-// ==== SDF Shape Overrides (bypass fillPath/EdgeTable) ====
+// ==== SDF Shape Overrides (bypass fillPath stencil) ====
 
 inline void fillRoundedRectangle(VulkanGraphicsContext& ctx,
                                   const juce::Rectangle<float>& r, float cornerSize)

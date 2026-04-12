@@ -99,45 +99,6 @@ inline void drawGlyphs(VulkanGraphicsContext& ctx,
 
         flush(ctx);
         ensureDescriptorSet(ctx, ctx.pipelineLayout, ctx.defaultDescriptorSet);
-        return;
-    }
-
-    // Fallback: EdgeTable per-pixel path
-    for (size_t idx = 0; idx < glyphs.size(); ++idx)
-    {
-        auto glyphTransform = juce::AffineTransform::translation(positions[idx])
-                                .followedBy(getFullTransform(ctx, t));
-
-        auto fontHeight = s.font.getHeight();
-        auto fontTransform = juce::AffineTransform::scale(
-            fontHeight * s.font.getHorizontalScale(), fontHeight)
-            .followedBy(glyphTransform);
-
-        auto layers = s.font.getTypefacePtr()->getLayersForGlyph(
-            s.font.getMetricsKind(), glyphs[idx], fontTransform);
-
-        auto baseColor = getColorForFill(ctx);
-
-        for (auto& layer : layers)
-        {
-            if (auto* cl = std::get_if<juce::ColourLayer>(&layer.layer))
-            {
-                glm::vec4 color = baseColor;
-                if (cl->colour.has_value())
-                {
-                    auto jc = *cl->colour;
-                    color = { jc.getFloatRed(), jc.getFloatGreen(),
-                              jc.getFloatBlue(), jc.getFloatAlpha() * s.opacity };
-                }
-
-                SolidEdgeTableCallback callback(ctx, color);
-                cl->clip.iterate(callback);
-            }
-            else if (auto* il = std::get_if<juce::ImageLayer>(&layer.layer))
-            {
-                drawImage(ctx, il->image, il->transform);
-            }
-        }
     }
 }
 

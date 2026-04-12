@@ -52,8 +52,7 @@ private:
 
     juce::TextButton btnAll, btnText, btnTextStatic, btnPaths, btnFills, btnImages, btnBackends;
 
-    juce::TextButton btnEdgeTable, btnStencil;
-    jvk::VulkanGraphicsContext::PathBackend activeBackend = jvk::VulkanGraphicsContext::PathBackend::Stencil;
+    juce::TextButton btnStencil;
 
     // Pregenerated complex paths (built once at startup)
     std::vector<juce::Path> waveformPaths;
@@ -92,7 +91,6 @@ private:
         {
             juce::String name;
             juce::Colour color;
-            jvk::VulkanGraphicsContext::PathBackend backend;
             std::vector<double> frameTimes;
         };
         std::vector<BackendResult> backends;

@@ -354,6 +354,12 @@ private:
             texCache.commandPool = renderer.getCommandPool();
             texCache.graphicsQueue = renderer.getGraphicsQueue();
 
+            // --- GPU memory pool (sub-allocator) ---
+            memoryPool.init(physDevice, device);
+
+            // --- Vertex ring buffer (zero-alloc dynamic geometry) ---
+            ringBuffer.create(physDevice, device);
+
             // --- Staging belt for batched texture uploads ---
             stagingBelt.init(physDevice, device);
 
@@ -381,10 +387,12 @@ private:
             hsvDescriptorHelper.reset();
             defaultTexture.destroy();
             blurTempImage.destroy();
+            ringBuffer.destroy();
             stagingBelt.destroy();
             texCache.clear();
             gradCache.clear();
             glyphAtlas.clear();
+            memoryPool.destroy();
         }
 
         void prepareFrame(VkCommandBuffer& commandBuffer) override
@@ -394,6 +402,10 @@ private:
             // Safe: VulkanInstance waited on inFlightFences[currentFrame]
             deletionQueues[frameIdx].flush();
             stagingBelt.recycle(usedStagingBlocks[frameIdx]);
+
+            // Begin ring buffer frame — resets write head, passes DeletionQueue for growth
+            if (ringBuffer.isValid())
+                ringBuffer.beginFrame(frameIdx, &deletionQueues[frameIdx]);
 
             // Record upload commands for resources staged during previous frames.
             // These must execute before the render pass so images are in
@@ -459,7 +471,8 @@ private:
                 editor.srgbPipelineMode, multiplyPipeline.get(),
                 hsvPipeline.get(), blurPipeline.get(), rpInfo,
                 &blurTempImage, blurDescriptorSet, &texCache, &glyphAtlas, &gradCache,
-                &deletionQueues[frameIdx]);
+                &deletionQueues[frameIdx],
+                ringBuffer.isValid() ? &ringBuffer : nullptr);
 
             juce::Graphics g(ctx);
             editor.inVulkanRender = true;
@@ -471,6 +484,10 @@ private:
             glyphAtlas.stageDirtyPages(stagingBelt, pendingUploads);
 
             graphics::flush(ctx);
+
+            // End ring buffer frame — record end position
+            if (ringBuffer.isValid())
+                ringBuffer.endFrame();
         }
 
         AudioProcessorEditor& editor;
@@ -487,7 +504,9 @@ private:
         VkPhysicalDevice physDevice = VK_NULL_HANDLE;
         VkDevice device = VK_NULL_HANDLE;
         static constexpr int MAX_FRAMES = 2;
-        core::Buffer persistentBuffers[MAX_FRAMES];
+        core::GPUMemoryPool memoryPool;             // sub-allocator (reduces vkAllocateMemory to ~3 calls)
+        core::VertexRingBuffer ringBuffer;           // zero-alloc per-frame vertex uploads
+        core::Buffer persistentBuffers[MAX_FRAMES]; // legacy fallback (used if ring buffer unavailable)
         void* mappedPtrs[MAX_FRAMES] = {};
         core::DeletionQueue deletionQueues[MAX_FRAMES];
         core::StagingBelt stagingBelt;

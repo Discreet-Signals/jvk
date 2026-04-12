@@ -49,12 +49,13 @@ public:
                           TextureCache* textureCache = nullptr,
                           GlyphAtlas* glyphAtlas = nullptr,
                           GradientCache* gradientCache = nullptr,
-                          core::DeletionQueue* deletionQ = nullptr);
+                          core::DeletionQueue* deletionQ = nullptr,
+                          core::VertexRingBuffer* ringBuf = nullptr);
 
     ~VulkanGraphicsContext() override;
 
-    // Path rendering backend — settable for benchmarking.
-    enum class PathBackend { EdgeTable, Stencil };
+    // Path rendering backend.
+    enum class PathBackend { Stencil };
     PathBackend pathBackend = PathBackend::Stencil;
 
     // ==== State ====
@@ -136,6 +137,7 @@ public:
 
     std::vector<SavedState> stateStack;
     std::vector<UIVertex> vertices;
+    core::VertexRingBuffer* ringBuffer = nullptr;
     core::Buffer* extBuffer = nullptr;
     void** extMappedPtr = nullptr;
     VkDeviceSize bufferWriteOffset = 0;
@@ -171,7 +173,6 @@ public:
 // ============================================================================
 #include "Helpers.h"
 #include "Flush.h"
-#include "EdgeTableCallbacks.h"
 #include "Clipping.h"
 #include "FillRect.h"
 #include "FillShapes.h"
@@ -200,10 +201,12 @@ inline VulkanGraphicsContext::VulkanGraphicsContext(
     Pipeline* blurPipeline, RenderPassInfo rpInfo,
     core::Image* blurTempImage, VkDescriptorSet blurDescSet,
     TextureCache* textureCache, GlyphAtlas* glyphAtlas,
-    GradientCache* gradientCache, core::DeletionQueue* deletionQ)
+    GradientCache* gradientCache, core::DeletionQueue* deletionQ,
+    core::VertexRingBuffer* ringBuf)
     : cmd(cmd), colorPipeline(colorPipeline), pipelineLayout(pipelineLayout),
       vpWidth(vpWidth), vpHeight(vpHeight), scale(scale), srgbMode(srgb),
       physDevice(physDevice), device(device),
+      ringBuffer(ringBuf),
       extBuffer(externalBuffer), extMappedPtr(externalMappedPtr),
       stencilPipeline(stencilPipeline), stencilCoverPipeline(stencilCoverPipeline),
       multiplyPipeline(multiplyPipeline), hsvPipeline(hsvPipeline),

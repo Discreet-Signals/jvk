@@ -59,16 +59,8 @@ BenchmarkEditor::BenchmarkEditor(BenchmarkProcessor& p)
     addAndMakeVisible(btnImages);
     addAndMakeVisible(btnBackends);
 
-    // Backend selectors
-    using PB = jvk::VulkanGraphicsContext::PathBackend;
-    auto setupBE = [&](juce::TextButton& btn, const juce::String& name, PB backend, juce::Colour col)
-    {
-        styleButton(btn, name, col);
-        btn.onClick = [this, backend] { activeBackend = backend; repaint(); };
-        addAndMakeVisible(btn);
-    };
-    setupBE(btnEdgeTable, "EdgeTable", PB::EdgeTable, juce::Colour(0xFFAAAAAA));
-    setupBE(btnStencil,   "Stencil",   PB::Stencil,   juce::Colour(0xFFE07A5F));
+    styleButton(btnStencil, "Stencil", juce::Colour(0xFFE07A5F));
+    addAndMakeVisible(btnStencil);
 
     auto fullBark = juce::ImageFileFormat::loadFrom(BinaryData::bark_png, BinaryData::bark_pngSize);
     barkImage = fullBark.rescaled(48, 48, juce::Graphics::highResamplingQuality);
@@ -306,7 +298,7 @@ void BenchmarkEditor::sceneAll(juce::Graphics& g, float w, float h, float t, flo
 
     // 200 text labels
     juce::String texts[] = { "Vulkan GPU", "SDF Shapes", "Stencil Paths", "2x Super",
-        "sRGB Gamma", "Lock Free", "Zero Alloc", "EdgeTable", "Bezier Cubic",
+        "sRGB Gamma", "Lock Free", "Zero Alloc", "GPU Cache", "Bezier Cubic",
         "Anti-Alias", "Cross Plat", "Real-Time", "MoltenVK", "Pipeline", "Descriptor", "Framebuffer" };
     for (int i = 0; i < 200; i++)
     {
@@ -706,18 +698,11 @@ void BenchmarkEditor::paintBenchmarkResults(juce::Graphics& g)
 
 void BenchmarkEditor::paint(juce::Graphics& g)
 {
-    // Apply the user-selected path backend
-    if (auto* vkCtx = dynamic_cast<jvk::VulkanGraphicsContext*>(&g.getInternalContext()))
-        vkCtx->pathBackend = activeBackend;
-
     // Backend comparison test — independent state machine
     if (backendTest.running)
     {
         auto& bt = backendTest;
         auto& backend = bt.backends[static_cast<size_t>(bt.currentBackendIdx)];
-
-        if (auto* vkCtx = dynamic_cast<jvk::VulkanGraphicsContext*>(&g.getInternalContext()))
-            vkCtx->pathBackend = backend.backend;
 
         double t0 = juce::Time::getMillisecondCounterHiRes();
 
@@ -839,9 +824,8 @@ void BenchmarkEditor::resized()
 {
     // Backend selector row at top-right
     int beW = 95, beH = 24, beGap = 4;
-    int beStartX = getWidth() - 2 * (beW + beGap) - 6;
+    int beStartX = getWidth() - (beW + beGap) - 6;
     int beY = 4;
-    btnEdgeTable.setBounds(beStartX, beY, beW, beH); beStartX += beW + beGap;
     btnStencil.setBounds(beStartX, beY, beW, beH);
 
     // Benchmark buttons centered in two rows
@@ -927,11 +911,8 @@ void BenchmarkEditor::startBackendComparison()
     backendTest.complexities.resize(static_cast<int>(testPaths.size()));
     std::iota(backendTest.complexities.begin(), backendTest.complexities.end(), 0);
 
-    using PB = jvk::VulkanGraphicsContext::PathBackend;
-    backendTest.backends = {
-        { "EdgeTable", juce::Colour(0xFFAAAAAA), PB::EdgeTable, {} },
-        { "Stencil",   juce::Colour(0xFFE07A5F), PB::Stencil,   {} },
-    };
+    backendTest.backends.clear();
+    backendTest.backends.push_back({ "Stencil", juce::Colour(0xFFE07A5F), {} });
 
     for (auto& b : backendTest.backends)
         b.frameTimes.resize(backendTest.complexities.size(), 0.0);

@@ -25,12 +25,29 @@ namespace jvk::graphics
 {
 
 // Upload vertices from a data pointer and draw. Shared by flush() and stencil fan.
+//
+// Two paths:
+// 1. Ring buffer (preferred): write into persistent ring, zero allocations.
+// 2. Legacy extBuffer: grow-on-demand HOST_VISIBLE buffer (original path).
 inline void uploadAndDraw(VulkanGraphicsContext& ctx, const UIVertex* data, uint32_t count)
 {
     if (count == 0) return;
     jassert(ctx.boundPipeline != VK_NULL_HANDLE); // No pipeline bound before draw
 
     VkDeviceSize needed = sizeof(UIVertex) * count;
+
+    // Per-frame linear allocator: memcpy + pointer bump. Doubles on overflow.
+    // If the ring buffer is available, use it exclusively — no fallback needed.
+    if (ctx.ringBuffer && ctx.ringBuffer->isValid())
+    {
+        VkDeviceSize offset = ctx.ringBuffer->write(data, needed);
+        VkBuffer buf = ctx.ringBuffer->getBuffer();
+        vkCmdBindVertexBuffers(ctx.cmd, 0, 1, &buf, &offset);
+        vkCmdDraw(ctx.cmd, count, 1, 0, 0);
+        return;
+    }
+
+    // Legacy path: grow-on-demand external buffer (used when ring buffer not wired in)
     core::Buffer* buf = ctx.extBuffer;
     void** mapped = ctx.extMappedPtr;
     core::Buffer tempBuffer;

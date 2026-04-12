@@ -55,11 +55,13 @@
 // Core
 #include "include/jvk/core/PipelineConfig.h"
 #include "include/jvk/core/wrapper/SwapChain.h"
+#include "include/jvk/core/GPUMemoryPool.h"
 #include "include/jvk/core/Buffer.h"
 #include "include/jvk/core/DescriptorHelper.h"
 #include "include/jvk/core/Image.h"
 #include "include/jvk/core/StagingBelt.h"
 #include "include/jvk/core/DeletionQueue.h"
+#include "include/jvk/core/VertexRingBuffer.h"
 #include "include/jvk/core/wrapper/Shader.h"
 #include "include/jvk/core/wrapper/Pipeline.h"
 #include "include/jvk/core/wrapper/Wrapper.h"

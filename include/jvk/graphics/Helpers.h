@@ -38,15 +38,6 @@ inline glm::vec4 convertColor(VulkanGraphicsContext& ctx, const glm::vec4& c)
     return c; // UNORM: pass sRGB values through (matches JUCE)
 }
 
-// Gamma-correct alpha for UNORM mode (EdgeTable alphas need boost for linear blend)
-inline float correctAlpha(VulkanGraphicsContext& ctx, int level)
-{
-    float a = static_cast<float>(level) / 255.0f;
-    if (!ctx.srgbMode)
-        return std::pow(a, 1.0f / 2.2f); // compensate for sRGB-designed alpha in linear blend
-    return a; // sRGB pipeline: alpha is correct as-is
-}
-
 // Scale a logical-point int rect to physical pixels
 inline juce::Rectangle<int> scaleRect(VulkanGraphicsContext& ctx, const juce::Rectangle<int>& r)
 {
