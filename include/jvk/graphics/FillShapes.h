@@ -33,8 +33,11 @@ inline void fillRoundedRectangle(VulkanGraphicsContext& ctx,
     // SDF rounded rect only works axis-aligned; fall back to path for transforms
     if (hasNonTrivialTransform(ctx)) return; // caller handles fallback
     auto& s = ctx.state();
-    auto phys = juce::Rectangle<float>(r.getX() * ctx.scale, r.getY() * ctx.scale,
-                                        r.getWidth() * ctx.scale, r.getHeight() * ctx.scale);
+    auto adjusted = r;
+    if (!s.transform.isIdentity())
+        adjusted = adjusted.translated(s.transform.getTranslationX(), s.transform.getTranslationY());
+    auto phys = juce::Rectangle<float>(adjusted.getX() * ctx.scale, adjusted.getY() * ctx.scale,
+                                        adjusted.getWidth() * ctx.scale, adjusted.getHeight() * ctx.scale);
     auto tr = phys.translated(static_cast<float>(s.origin.x), static_cast<float>(s.origin.y));
     float hw = tr.getWidth() * 0.5f, hh = tr.getHeight() * 0.5f;
     addSDFQuad(ctx, tr.getX(), tr.getY(), tr.getWidth(), tr.getHeight(),
@@ -47,8 +50,11 @@ inline void fillEllipse(VulkanGraphicsContext& ctx, const juce::Rectangle<float>
     // SDF ellipse only works axis-aligned; fall back to path for transforms
     if (hasNonTrivialTransform(ctx)) return; // caller handles fallback
     auto& s = ctx.state();
-    auto phys = juce::Rectangle<float>(area.getX() * ctx.scale, area.getY() * ctx.scale,
-                                        area.getWidth() * ctx.scale, area.getHeight() * ctx.scale);
+    auto adjusted = area;
+    if (!s.transform.isIdentity())
+        adjusted = adjusted.translated(s.transform.getTranslationX(), s.transform.getTranslationY());
+    auto phys = juce::Rectangle<float>(adjusted.getX() * ctx.scale, adjusted.getY() * ctx.scale,
+                                        adjusted.getWidth() * ctx.scale, adjusted.getHeight() * ctx.scale);
     auto tr = phys.translated(static_cast<float>(s.origin.x), static_cast<float>(s.origin.y));
     float hw = tr.getWidth() * 0.5f, hh = tr.getHeight() * 0.5f;
     addSDFQuad(ctx, tr.getX(), tr.getY(), tr.getWidth(), tr.getHeight(),

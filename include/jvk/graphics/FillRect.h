@@ -42,7 +42,11 @@ inline void emitGradientQuad(VulkanGraphicsContext& ctx, float x, float y, float
             flush(ctx);
             ensureDescriptorSet(ctx, ctx.pipelineLayout, gradDescSet);
 
-            // Compute UV coordinates in gradient space for each corner
+            // Compute UV coordinates in gradient space for each corner.
+            // Map gradient endpoints from logical to physical space through full transform.
+            auto physT = s.transform.scaled(ctx.scale)
+                         .translated(static_cast<float>(s.origin.x),
+                                     static_cast<float>(s.origin.y));
             glm::vec4 color(1.0f, 1.0f, 1.0f, s.opacity);
             float shapeType = g.isRadial ? 6.0f : 5.0f;
             glm::vec4 shape(shapeType, 0, 0, 0);
@@ -50,9 +54,12 @@ inline void emitGradientQuad(VulkanGraphicsContext& ctx, float x, float y, float
             if (g.isRadial)
             {
                 // Radial: UV = normalized offset from center, length(UV)=1 at radius edge
-                float cx = g.point1.x * ctx.scale + static_cast<float>(s.origin.x);
-                float cy = g.point1.y * ctx.scale + static_cast<float>(s.origin.y);
-                float radius = g.point1.getDistanceFrom(g.point2) * ctx.scale;
+                float p1x = g.point1.x, p1y = g.point1.y;
+                float p2x = g.point2.x, p2y = g.point2.y;
+                physT.transformPoint(p1x, p1y);
+                physT.transformPoint(p2x, p2y);
+                float cx = p1x, cy = p1y;
+                float radius = std::sqrt((p2x - p1x) * (p2x - p1x) + (p2y - p1y) * (p2y - p1y));
                 float invR = (radius > 0) ? 1.0f / radius : 0.0f;
 
                 auto uv = [&](float px, float py) -> std::pair<float, float> {
@@ -74,10 +81,10 @@ inline void emitGradientQuad(VulkanGraphicsContext& ctx, float x, float y, float
             else
             {
                 // Linear: UV.x = t along gradient axis
-                float gx1 = g.point1.x * ctx.scale + static_cast<float>(s.origin.x);
-                float gy1 = g.point1.y * ctx.scale + static_cast<float>(s.origin.y);
-                float gx2 = g.point2.x * ctx.scale + static_cast<float>(s.origin.x);
-                float gy2 = g.point2.y * ctx.scale + static_cast<float>(s.origin.y);
+                float gx1 = g.point1.x, gy1 = g.point1.y;
+                float gx2 = g.point2.x, gy2 = g.point2.y;
+                physT.transformPoint(gx1, gy1);
+                physT.transformPoint(gx2, gy2);
                 float dx = gx2 - gx1, dy = gy2 - gy1;
                 float len2 = dx * dx + dy * dy;
                 float invLen2 = (len2 > 0) ? 1.0f / len2 : 0.0f;
@@ -143,8 +150,13 @@ inline void fillRect(VulkanGraphicsContext& ctx, const juce::Rectangle<float>& r
         return;
     }
 
-    auto phys = juce::Rectangle<float>(r.getX() * ctx.scale, r.getY() * ctx.scale,
-                                        r.getWidth() * ctx.scale, r.getHeight() * ctx.scale);
+    // Fast path: identity or translation-only transform. Apply any translation before DPI scale.
+    auto adjusted = r;
+    if (!s.transform.isIdentity())
+        adjusted = adjusted.translated(s.transform.getTranslationX(), s.transform.getTranslationY());
+
+    auto phys = juce::Rectangle<float>(adjusted.getX() * ctx.scale, adjusted.getY() * ctx.scale,
+                                        adjusted.getWidth() * ctx.scale, adjusted.getHeight() * ctx.scale);
     auto translated = phys.translated(static_cast<float>(s.origin.x),
                                        static_cast<float>(s.origin.y));
 

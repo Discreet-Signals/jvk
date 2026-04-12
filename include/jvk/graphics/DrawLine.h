@@ -36,7 +36,8 @@ inline void drawLineWithThickness(VulkanGraphicsContext& ctx,
     float dx = p2.x - p1.x, dy = p2.y - p1.y;
     float len = std::sqrt(dx * dx + dy * dy);
     if (len < 0.001f) return;
-    float hw = lineThickness * ctx.scale * 0.5f;
+    float transformScale = ctx.state().transform.getScaleFactor();
+    float hw = lineThickness * transformScale * ctx.scale * 0.5f;
     float nx = -dy / len * hw, ny = dx / len * hw;
 
     addVertex(ctx, p1.x+nx, p1.y+ny, c); addVertex(ctx, p2.x+nx, p2.y+ny, c); addVertex(ctx, p2.x-nx, p2.y-ny, c);

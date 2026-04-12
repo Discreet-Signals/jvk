@@ -41,8 +41,9 @@ inline void drawGlyphs(VulkanGraphicsContext& ctx,
         auto baseColor = getColorForFill(ctx);
         float hScale = s.font.getHorizontalScale();
 
-        // Physical font size determines quad size on screen
-        float physFontHeight = fontHeight * ctx.scale;
+        // Physical font size: include accumulated transform scale (e.g. window resize)
+        float transformScale = s.transform.getScaleFactor();
+        float physFontHeight = fontHeight * transformScale * ctx.scale;
 
         VkDescriptorSet currentAtlasDescSet = VK_NULL_HANDLE;
 
