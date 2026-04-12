@@ -84,7 +84,13 @@ class VulkanRenderer :
 public:
     VulkanRenderer();
     explicit VulkanRenderer(const core::VulkanRendererSettings& s);
-    virtual ~VulkanRenderer() { }
+    virtual ~VulkanRenderer()
+    {
+        stopTimer();
+        rendering = false;
+        if (device)
+            vkDeviceWaitIdle(device);
+    }
 
     // --- Status ---
     core::VulkanStatus getStatus() const { return status; }

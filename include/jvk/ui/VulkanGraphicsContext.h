@@ -245,14 +245,18 @@ public:
         stateStack.back().clipBounds = juce::Rectangle<int>(0, 0,
             static_cast<int>(vpWidth), static_cast<int>(vpHeight));
 
-        // Bind default (1x1 white) descriptor set so non-textured draws work.
-        // Callers that switch to atlas/texture descriptors rebind this afterwards.
-        if (defaultDescriptorSet != VK_NULL_HANDLE)
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                     0, 1, &defaultDescriptorSet, 0, nullptr);
+        // Bind our pipeline + descriptor set now. VulkanInstance may have bound
+        // a different default pipeline, so we must establish ours up front.
+        // This maintains the invariant: main pipeline is always bound unless
+        // temporarily switched by stencil/effect operations (which restore it).
+        ensureMainPipeline();
     }
 
     ~VulkanGraphicsContext() override { flush(); }
+
+    // Path rendering backend — settable for benchmarking.
+    enum class PathBackend { EdgeTable, Stencil };
+    PathBackend pathBackend = PathBackend::Stencil;
 
     // ==== Query ====
     bool isVectorDevice() const override { return false; }
@@ -481,17 +485,22 @@ public:
     void fillPath(const juce::Path& path, const juce::AffineTransform& t) override
     {
         if (isClipEmpty()) return;
-        auto& s = state();
         auto combined = getFullTransform(t);
 
-        // GPU stencil path rendering (triangle fan + cover quad)
-        if (stencilPipeline != nullptr && stencilCoverPipeline != nullptr)
+        switch (pathBackend)
         {
-            fillPathStencil(path, combined);
-            return;
+            case PathBackend::Stencil:
+                fillPathStencil(path, combined);
+                return;
+            case PathBackend::EdgeTable:
+                fillPath_EdgeTable(path, combined);
+                return;
         }
+    }
 
-        // Fallback: EdgeTable path rendering (CPU rasterized, GPU drawn)
+    void fillPath_EdgeTable(const juce::Path& path, const juce::AffineTransform& combined)
+    {
+        auto& s = state();
         juce::EdgeTable et(s.clipBounds, path, combined);
 
         if (s.fillType.isGradient())
@@ -507,126 +516,72 @@ public:
     }
 
     // GPU stencil-then-cover path rendering.
-    // It caused stencil state corruption on MoltenVK with complex paths.
-    // The EdgeTable CPU fallback in fillPath() handles all path rendering.
     void fillPathStencil(const juce::Path& path, const juce::AffineTransform& combined)
     {
-        // Step 1: Flatten path to line segments, tracking subpaths.
-        // Each subpath gets its own fan center (its first point) for
-        // correct non-zero winding with holes and compound paths.
-        struct Subpath { glm::vec2 center; std::vector<glm::vec2> points; };
-        std::vector<Subpath> subpaths;
+        // Flatten path to triangle fan, computing bounds in one pass.
+        // Uses persistent scratch buffers to avoid per-path heap allocation.
+        scratchFanVerts.clear();
+
+        float fanMinX = std::numeric_limits<float>::max(), fanMinY = fanMinX;
+        float fanMaxX = -fanMinX, fanMaxY = -fanMinY;
 
         {
             juce::PathFlatteningIterator iter(path, combined);
-            Subpath* current = nullptr;
-            glm::vec2 lastStart(0);
+            glm::vec2 fanCenter(0);
+            glm::vec2 lastPt(std::numeric_limits<float>::max());
+            glm::vec2 prevPt(0);
+            bool hasSubpath = false;
+            glm::vec4 dummy(0);
+
+            auto updateBounds = [&](float x, float y) {
+                fanMinX = std::min(fanMinX, x); fanMinY = std::min(fanMinY, y);
+                fanMaxX = std::max(fanMaxX, x); fanMaxY = std::max(fanMaxY, y);
+            };
 
             while (iter.next())
             {
                 glm::vec2 p1 { iter.x1, iter.y1 };
                 glm::vec2 p2 { iter.x2, iter.y2 };
 
-                // Detect new subpath: first segment, or a jump from previous end point
-                if (!current || (current->points.size() > 0 &&
-                    (std::abs(p1.x - current->points.back().x) > 0.01f ||
-                     std::abs(p1.y - current->points.back().y) > 0.01f)))
+                // Detect new subpath: first segment, or a discontinuity
+                if (!hasSubpath ||
+                    std::abs(p1.x - lastPt.x) > 0.01f ||
+                    std::abs(p1.y - lastPt.y) > 0.01f)
                 {
-                    subpaths.push_back({ p1, {} });
-                    current = &subpaths.back();
+                    fanCenter = p1;
+                    prevPt = p1;
+                    hasSubpath = true;
+                    updateBounds(p1.x, p1.y);
                 }
-                current->points.push_back(p2);
+
+                // Emit triangle: center, prevPt, p2
+                scratchFanVerts.push_back({ fanCenter, dummy, {}, dummy });
+                scratchFanVerts.push_back({ prevPt,    dummy, {}, dummy });
+                scratchFanVerts.push_back({ p2,        dummy, {}, dummy });
+
+                updateBounds(p2.x, p2.y);
+                prevPt = p2;
+                lastPt = p2;
             }
         }
 
-        // Build triangle fan for all subpaths
-        std::vector<UIVertex> fanVerts;
-        for (auto& sp : subpaths)
-        {
-            if (sp.points.size() < 2) continue;
-            fanVerts.reserve(fanVerts.size() + sp.points.size() * 3);
-            glm::vec4 dummy(0);
-            glm::vec4 noShape(0);
-            for (size_t i = 0; i + 1 < sp.points.size(); i++)
-            {
-                fanVerts.push_back({ sp.center,    dummy, {}, noShape });
-                fanVerts.push_back({ sp.points[i], dummy, {}, noShape });
-                fanVerts.push_back({ sp.points[i+1], dummy, {}, noShape });
-            }
-        }
+        if (scratchFanVerts.empty()) return;
 
-        if (fanVerts.empty()) return;
-
-        // Compute the actual extent of all fan triangles — the cover quad
-        // must be at least this large to zero every stencil value the fan wrote.
-        float fanMinX = fanVerts[0].position.x, fanMinY = fanVerts[0].position.y;
-        float fanMaxX = fanMinX, fanMaxY = fanMinY;
-        for (auto& v : fanVerts)
-        {
-            fanMinX = std::min(fanMinX, v.position.x);
-            fanMinY = std::min(fanMinY, v.position.y);
-            fanMaxX = std::max(fanMaxX, v.position.x);
-            fanMaxY = std::max(fanMaxY, v.position.y);
-        }
-
-        // Step 2: Flush pending main vertices
+        // Flush pending main-pipeline vertices
         flush();
 
-        // Step 3: Bind stencil-write pipeline, draw triangle fan
-        // Use full viewport scissor for the fan — stencil values must be written
-        // everywhere the path covers, not clipped to the current clip region.
-        // The cover pass will apply the clip scissor.
+        // Stencil write pass — full viewport scissor
         {
             VkRect2D fullScissor = { { 0, 0 }, { static_cast<uint32_t>(vpWidth), static_cast<uint32_t>(vpHeight) } };
             vkCmdSetScissor(cmd, 0, 1, &fullScissor);
         }
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, stencilPipeline->getInternal());
-        float pushData[2] = { vpWidth, vpHeight };
-        vkCmdPushConstants(cmd, stencilPipeline->getLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
+        ensurePipeline(stencilPipeline->getInternal(), stencilPipeline->getLayout());
+        uploadAndDraw(scratchFanVerts.data(), static_cast<uint32_t>(scratchFanVerts.size()));
 
-        {
-            // Upload fan vertices using the shared buffer (same as flush())
-            VkDeviceSize needed = sizeof(UIVertex) * fanVerts.size();
-            core::Buffer* buf = extBuffer;
-            void** mapped = extMappedPtr;
-            core::Buffer tempBuf;
-            void* tempMapped = nullptr;
-            if (!buf) { buf = &tempBuf; mapped = &tempMapped; }
+        // Cover pass — clip scissor, stencil test NOT_EQUAL 0, zeros on pass
+        ensurePipeline(stencilCoverPipeline->getInternal(), stencilCoverPipeline->getLayout());
+        ensureDescriptorSet(stencilCoverPipeline->getLayout(), defaultDescriptorSet);
 
-            VkDeviceSize totalNeeded = bufferWriteOffset + needed;
-            if (!buf->isValid() || buf->getSize() < totalNeeded)
-            {
-                if (buf->isValid() && deletionQueue)
-                    deletionQueue->retire(std::move(*buf));
-
-                VkDeviceSize sz = std::max(needed, static_cast<VkDeviceSize>(sizeof(UIVertex) * 65536));
-                buf->create({ physDevice, device, sz, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT });
-                *mapped = buf->map();
-                bufferWriteOffset = 0;
-            }
-            memcpy(static_cast<char*>(*mapped) + bufferWriteOffset,
-                   fanVerts.data(), static_cast<size_t>(needed));
-
-            VkBuffer buffers[] = { buf->getBuffer() };
-            VkDeviceSize offsets[] = { bufferWriteOffset };
-            vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
-            vkCmdDraw(cmd, static_cast<uint32_t>(fanVerts.size()), 1, 0, 0);
-
-            bufferWriteOffset += needed;
-        }
-
-        // Step 4: Bind stencil cover pipeline (stencil test NOT_EQUAL 0, zeros on pass)
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, stencilCoverPipeline->getInternal());
-        vkCmdPushConstants(cmd, stencilCoverPipeline->getLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
-
-        if (defaultDescriptorSet != VK_NULL_HANDLE)
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, stencilCoverPipeline->getLayout(),
-                                     0, 1, &defaultDescriptorSet, 0, nullptr);
-
-        // Step 5: Draw cover quad over the fan's full extent.
-        // This must cover every pixel the fan touched so the ZERO op
-        // cleans up all stencil values — no per-path stencil clear needed.
         float bx = fanMinX, by = fanMinY;
         float bw = fanMaxX - fanMinX, bh = fanMaxY - fanMinY;
 
@@ -635,12 +590,9 @@ public:
 
         if (s.fillType.isGradient() && s.fillType.gradient && gradientCache)
         {
-            // GPU gradient: bind LUT and emit cover quad with gradient-space UVs
             auto& g = *s.fillType.gradient;
             VkDescriptorSet gradDescSet = gradientCache->getOrCreate(g);
-            if (gradDescSet != VK_NULL_HANDLE)
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    stencilCoverPipeline->getLayout(), 0, 1, &gradDescSet, 0, nullptr);
+            ensureDescriptorSet(stencilCoverPipeline->getLayout(), gradDescSet);
 
             glm::vec4 color(1.0f, 1.0f, 1.0f, s.opacity);
             float shapeType = g.isRadial ? 6.0f : 5.0f;
@@ -686,28 +638,17 @@ public:
         }
         else
         {
-            // Solid color or fallback gradient (4-corner CPU-sampled interpolation)
             auto fillColor = getColorForFill();
-            glm::vec4 c00 = s.fillType.isGradient() ? getColorAt(bx, by) : fillColor;
-            glm::vec4 c10 = s.fillType.isGradient() ? getColorAt(bx+bw, by) : fillColor;
-            glm::vec4 c11 = s.fillType.isGradient() ? getColorAt(bx+bw, by+bh) : fillColor;
-            glm::vec4 c01 = s.fillType.isGradient() ? getColorAt(bx, by+bh) : fillColor;
             glm::vec4 flat(0);
-            addVertex(bx,      by,      c00, 0, 0, flat);
-            addVertex(bx + bw, by,      c10, 0, 0, flat);
-            addVertex(bx + bw, by + bh, c11, 0, 0, flat);
-            addVertex(bx,      by,      c00, 0, 0, flat);
-            addVertex(bx + bw, by + bh, c11, 0, 0, flat);
-            addVertex(bx,      by + bh, c01, 0, 0, flat);
+            addVertex(bx,      by,      fillColor, 0, 0, flat);
+            addVertex(bx + bw, by,      fillColor, 0, 0, flat);
+            addVertex(bx + bw, by + bh, fillColor, 0, 0, flat);
+            addVertex(bx,      by,      fillColor, 0, 0, flat);
+            addVertex(bx + bw, by + bh, fillColor, 0, 0, flat);
+            addVertex(bx,      by + bh, fillColor, 0, 0, flat);
         }
-        flushWithPipeline(stencilCoverPipeline);
-
-        // Step 6: Restore main pipeline for subsequent draws
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipeline);
-        vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
-        if (defaultDescriptorSet != VK_NULL_HANDLE)
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                     0, 1, &defaultDescriptorSet, 0, nullptr);
+        flush();
+        ensureMainPipeline();
     }
 
     // ==== Drawing: drawImage ====
@@ -790,10 +731,11 @@ public:
             bool pending = newEntry && textureCache->stagingBelt && textureCache->pendingUploads;
             VkDescriptorSet texDescSet = pending ? defaultDescriptorSet : it->second.descriptorSet;
 
-            flush();
-
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                     0, 1, &texDescSet, 0, nullptr);
+            if (boundDescriptorSet != texDescSet)
+            {
+                flush();
+                ensureDescriptorSet(pipelineLayout, texDescSet);
+            }
 
             // Compute transformed corners
             auto p00 = juce::Point<float>(0, 0).transformedBy(combined);
@@ -810,11 +752,7 @@ public:
             addVertex(p11.x, p11.y, white, 1, 1, flat);
             addVertex(p01.x, p01.y, white, 0, 1, flat);
             flush();
-
-            // Restore default texture
-            if (defaultDescriptorSet != VK_NULL_HANDLE)
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                         0, 1, &defaultDescriptorSet, 0, nullptr);
+            ensureDescriptorSet(pipelineLayout, defaultDescriptorSet);
             return;
         }
 
@@ -840,6 +778,11 @@ public:
     // ==== Drawing: drawLine ====
     void drawLine(const juce::Line<float>& line) override
     {
+        drawLineWithThickness(line, 1.0f);
+    }
+
+    void drawLineWithThickness(const juce::Line<float>& line, float lineThickness) override
+    {
         if (isClipEmpty()) return;
         auto t = getFullTransform();
         auto c = getColorForFill();
@@ -849,8 +792,7 @@ public:
         float dx = p2.x - p1.x, dy = p2.y - p1.y;
         float len = std::sqrt(dx * dx + dy * dy);
         if (len < 0.001f) return;
-        // 1 physical pixel line width (0.5px normal on each side)
-        float hw = std::max(0.5f, scale * 0.5f);
+        float hw = lineThickness * scale * 0.5f;
         float nx = -dy / len * hw, ny = dx / len * hw;
 
         addVertex(p1.x+nx, p1.y+ny, c); addVertex(p2.x+nx, p2.y+ny, c); addVertex(p2.x-nx, p2.y-ny, c);
@@ -891,8 +833,7 @@ public:
                 if (descSet != currentAtlasDescSet)
                 {
                     flush();
-                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                             0, 1, &descSet, 0, nullptr);
+                    ensureDescriptorSet(pipelineLayout, descSet);
                     currentAtlasDescSet = descSet;
                 }
 
@@ -929,9 +870,7 @@ public:
             }
 
             flush();
-            if (defaultDescriptorSet != VK_NULL_HANDLE)
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                         0, 1, &defaultDescriptorSet, 0, nullptr);
+            ensureDescriptorSet(pipelineLayout, defaultDescriptorSet);
             return;
         }
 
@@ -975,86 +914,13 @@ public:
     }
 
     // ==== Flush ====
-    void flush()
+    // Upload vertices from a data pointer and draw. Shared by flush() and stencil fan.
+    void uploadAndDraw(const UIVertex* data, uint32_t count)
     {
-        if (vertices.empty()) return;
+        if (count == 0) return;
+        jassert(boundPipeline != VK_NULL_HANDLE); // No pipeline bound before draw
 
-        // Scissor in physical pixels (clip bounds are already physical)
-        auto& s = state();
-        VkRect2D scissor;
-        scissor.offset = { s.clipBounds.getX(), s.clipBounds.getY() };
-        scissor.extent = {
-            static_cast<uint32_t>(std::max(0, s.clipBounds.getWidth())),
-            static_cast<uint32_t>(std::max(0, s.clipBounds.getHeight()))
-        };
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipeline);
-
-        // Push physical pixel viewport size
-        float pushData[2] = { vpWidth, vpHeight };
-        vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
-
-        VkDeviceSize needed = sizeof(UIVertex) * vertices.size();
-
-        // Use external persistent buffer if provided, else create a temporary
-        core::Buffer* buf = extBuffer;
-        void** mapped = extMappedPtr;
-
-        core::Buffer tempBuffer;
-        void* tempMapped = nullptr;
-        if (!buf)
-        {
-            buf = &tempBuffer;
-            mapped = &tempMapped;
-        }
-
-        // Grow the buffer if needed
-        VkDeviceSize totalNeeded = bufferWriteOffset + needed;
-        if (!buf->isValid() || buf->getSize() < totalNeeded)
-        {
-            // Prior vkCmdDraw calls in this command buffer still reference the
-            // old buffer. Retire it so it stays alive until the frame's fence
-            // signals that the GPU is done.
-            if (buf->isValid() && deletionQueue)
-                deletionQueue->retire(std::move(*buf));
-
-            VkDeviceSize allocSize = std::max(needed, static_cast<VkDeviceSize>(sizeof(UIVertex) * 65536));
-            buf->create({ physDevice, device, allocSize,
-                          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT });
-            *mapped = buf->map();
-            bufferWriteOffset = 0;
-        }
-
-        // Write at current offset
-        memcpy(static_cast<char*>(*mapped) + bufferWriteOffset, vertices.data(), static_cast<size_t>(needed));
-
-        VkBuffer buffers[] = { buf->getBuffer() };
-        VkDeviceSize offsets[] = { bufferWriteOffset };
-        vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
-        vkCmdDraw(cmd, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
-
-        bufferWriteOffset += needed;
-        vertices.clear();
-    }
-
-    // Flush vertices using a specific pipeline (for stencil cover draws)
-    void flushWithPipeline(Pipeline* pip)
-    {
-        if (vertices.empty() || !pip) return;
-
-        auto& s = state();
-        VkRect2D scissor;
-        scissor.offset = { s.clipBounds.getX(), s.clipBounds.getY() };
-        scissor.extent = {
-            static_cast<uint32_t>(std::max(0, s.clipBounds.getWidth())),
-            static_cast<uint32_t>(std::max(0, s.clipBounds.getHeight()))
-        };
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
-
-        VkDeviceSize needed = sizeof(UIVertex) * vertices.size();
-
+        VkDeviceSize needed = sizeof(UIVertex) * count;
         core::Buffer* buf = extBuffer;
         void** mapped = extMappedPtr;
         core::Buffer tempBuffer;
@@ -1075,16 +941,46 @@ public:
             bufferWriteOffset = 0;
         }
 
-        memcpy(static_cast<char*>(*mapped) + bufferWriteOffset, vertices.data(), static_cast<size_t>(needed));
+        memcpy(static_cast<char*>(*mapped) + bufferWriteOffset, data, static_cast<size_t>(needed));
 
         VkBuffer buffers[] = { buf->getBuffer() };
         VkDeviceSize offsets[] = { bufferWriteOffset };
         vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
-        vkCmdDraw(cmd, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+        vkCmdDraw(cmd, count, 1, 0, 0);
 
         bufferWriteOffset += needed;
+    }
+
+    // Flush pending vertices with the main color pipeline.
+    // All normal drawing (fillRect, SDF quads, text, etc.) accumulates into
+    // vertices[] and is drawn with the main pipeline + default descriptor set.
+    // Ensure the main pipeline + default descriptor set are bound.
+    // Call this before any normal drawing that accumulates vertices.
+    void ensureMainPipeline()
+    {
+        ensurePipeline(colorPipeline, pipelineLayout);
+        ensureDescriptorSet(pipelineLayout, defaultDescriptorSet);
+    }
+
+    // Drain the vertex buffer with whatever pipeline is currently bound.
+    // Callers must ensure the correct pipeline is bound before adding vertices.
+    void flush()
+    {
+        if (vertices.empty()) return;
+
+        auto& s = state();
+        VkRect2D scissor;
+        scissor.offset = { s.clipBounds.getX(), s.clipBounds.getY() };
+        scissor.extent = {
+            static_cast<uint32_t>(std::max(0, s.clipBounds.getWidth())),
+            static_cast<uint32_t>(std::max(0, s.clipBounds.getHeight()))
+        };
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+        uploadAndDraw(vertices.data(), static_cast<uint32_t>(vertices.size()));
         vertices.clear();
     }
+
 
 private:
     // ==== Helpers ====
@@ -1189,8 +1085,7 @@ private:
             if (gradDescSet != VK_NULL_HANDLE)
             {
                 flush();
-                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                         0, 1, &gradDescSet, 0, nullptr);
+                ensureDescriptorSet(pipelineLayout, gradDescSet);
 
                 // Compute UV coordinates in gradient space for each corner
                 glm::vec4 color(1.0f, 1.0f, 1.0f, s.opacity);
@@ -1248,11 +1143,7 @@ private:
                 }
 
                 flush();
-
-                // Restore default texture
-                if (defaultDescriptorSet != VK_NULL_HANDLE)
-                    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                             0, 1, &defaultDescriptorSet, 0, nullptr);
+                ensureDescriptorSet(pipelineLayout, defaultDescriptorSet);
                 return;
             }
         }
@@ -1437,6 +1328,38 @@ private:
 
     friend class Graphics;
 
+    // ==== Pipeline state tracking ====
+    // Avoids redundant vkCmdBindPipeline / push constant / descriptor set calls.
+    VkPipeline boundPipeline = VK_NULL_HANDLE;
+    VkDescriptorSet boundDescriptorSet = VK_NULL_HANDLE;
+
+    void ensurePipeline(VkPipeline pipeline, VkPipelineLayout layout)
+    {
+        if (boundPipeline != pipeline)
+        {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            float pushData[2] = { vpWidth, vpHeight };
+            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
+            boundPipeline = pipeline;
+            // Pipeline layout change may invalidate descriptor set bindings
+            boundDescriptorSet = VK_NULL_HANDLE;
+        }
+    }
+
+    void ensureDescriptorSet(VkPipelineLayout layout, VkDescriptorSet ds)
+    {
+        if (boundDescriptorSet != ds && ds != VK_NULL_HANDLE)
+        {
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+                                     0, 1, &ds, 0, nullptr);
+            boundDescriptorSet = ds;
+        }
+    }
+
+    // Persistent scratch buffers for stencil path rendering — avoids per-path heap allocation
+    std::vector<glm::vec2> scratchPoints;
+    std::vector<UIVertex> scratchFanVerts;
+
     // ==== Members ====
     VkCommandBuffer cmd;
     VkPipeline colorPipeline;
@@ -1574,12 +1497,11 @@ private:
         // For now, single-pass gives a reasonable blur effect.
         // TODO: two-pass separable gaussian (horizontal → copy → vertical)
 
-        // 9. Rebind main pipeline
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipeline);
-        vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
-        if (defaultDescriptorSet != VK_NULL_HANDLE)
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                     0, 1, &defaultDescriptorSet, 0, nullptr);
+        // 9. Rebind main pipeline (invalidate tracker — blur ended/restarted render pass)
+        boundPipeline = VK_NULL_HANDLE;
+        boundDescriptorSet = VK_NULL_HANDLE;
+        ensurePipeline(colorPipeline, pipelineLayout);
+        ensureDescriptorSet(pipelineLayout, defaultDescriptorSet);
     }
     VkDescriptorSet defaultDescriptorSet = VK_NULL_HANDLE;
 
@@ -1589,17 +1511,11 @@ private:
                          const glm::vec4& shapeData = glm::vec4(0))
     {
         if (!effectPipeline) return;
-        flush(); // render pending geometry first
+        flush();
 
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, effectPipeline->getInternal());
-        float pushData[2] = { vpWidth, vpHeight };
-        vkCmdPushConstants(cmd, effectPipeline->getLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
+        ensurePipeline(effectPipeline->getInternal(), effectPipeline->getLayout());
+        ensureDescriptorSet(effectPipeline->getLayout(), defaultDescriptorSet);
 
-        if (defaultDescriptorSet != VK_NULL_HANDLE)
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, effectPipeline->getLayout(),
-                                     0, 1, &defaultDescriptorSet, 0, nullptr);
-
-        // Determine region (full viewport if empty)
         float x = region.isEmpty() ? 0 : region.getX();
         float y = region.isEmpty() ? 0 : region.getY();
         float w = region.isEmpty() ? vpWidth : region.getWidth();
@@ -1612,14 +1528,8 @@ private:
         addVertex(x + w, y + h, color, 0, 0, shapeData);
         addVertex(x,     y + h, color, 0, 0, shapeData);
 
-        flush(); // draw the effect quad
-
-        // Re-bind the main pipeline for subsequent draws
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipeline);
-        vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
-        if (defaultDescriptorSet != VK_NULL_HANDLE)
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                     0, 1, &defaultDescriptorSet, 0, nullptr);
+        flush();
+        ensureMainPipeline();
     }
     // Deferred destruction queue (owned by PaintBridge's FrameResources).
     // Old buffers/images are stashed here until the frame's fence signals.
