@@ -34,6 +34,8 @@ public:
         addAndMakeVisible(vulkanRenderer);
         vulkanRenderer.addChildComponent(&paintBridge);
         addComponentListener(this);
+        setCachedComponentImage(new NullCachedImage());
+        vulkanRenderer.setRendering(true);
     }
 
     explicit AudioProcessorEditor(juce::AudioProcessor* p)
@@ -42,6 +44,8 @@ public:
         addAndMakeVisible(vulkanRenderer);
         vulkanRenderer.addChildComponent(&paintBridge);
         addComponentListener(this);
+        setCachedComponentImage(new NullCachedImage());
+        vulkanRenderer.setRendering(true);
     }
 
     ~AudioProcessorEditor() override
@@ -49,11 +53,24 @@ public:
         removeComponentListener(this);
     }
 
-    // Toggle between Vulkan and JUCE software rendering
+    // Toggle between Vulkan and JUCE software rendering.
+    // When Vulkan is enabled, JUCE's software repaint is disabled via
+    // setCachedComponentImage — only the Vulkan render loop calls paint().
+    // When disabled, normal JUCE software rendering resumes.
     void setVulkanEnabled(bool enabled)
     {
         vulkanEnabled = enabled;
         vulkanRenderer.setVisible(enabled);
+        if (enabled)
+        {
+            setCachedComponentImage(new NullCachedImage());
+            vulkanRenderer.setRendering(true);
+        }
+        else
+        {
+            vulkanRenderer.setRendering(false);
+            setCachedComponentImage(nullptr);
+        }
         repaint();
     }
 
@@ -63,6 +80,10 @@ public:
     {
         return vulkanRenderer.getStatus() == core::VulkanStatus::Ready;
     }
+
+    bool isInVulkanRender() const { return inVulkanRender; }
+
+    VulkanRenderer& getVulkanRenderer() { return vulkanRenderer; }
 
     // Physically correct sRGB blending (brighter semi-transparent content)
     // vs JUCE-identical UNORM blending (default). Requires rebuild.
@@ -74,6 +95,18 @@ public:
     bool isSRGBPipeline() const { return srgbPipelineMode; }
 
 private:
+    // Tells JUCE's repaint manager to skip software rendering for this component.
+    // paintWithinParentContext() sees this and calls paint() on it (no-op) instead
+    // of paintEntireComponent(). The Vulkan render path calls paintEntireComponent()
+    // directly, bypassing this entirely.
+    struct NullCachedImage : public juce::CachedComponentImage
+    {
+        void paint(juce::Graphics&) override {}
+        bool invalidateAll() override { return false; }
+        bool invalidate(const juce::Rectangle<int>&) override { return false; }
+        void releaseResources() override {}
+    };
+
     void componentMovedOrResized(juce::Component&, bool, bool wasResized) override
     {
         if (wasResized)
@@ -116,7 +149,7 @@ private:
             descriptorHelper->addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                           VK_SHADER_STAGE_FRAGMENT_BIT);
             auto dsLayout = descriptorHelper->buildLayout();
-            descriptorHelper->createPool(128); // descriptor sets for textures + effects
+            descriptorHelper->createPool(512); // descriptor sets for textures, atlas pages, gradients
 
             // --- Main SDF+textured pipeline ---
             {
@@ -351,6 +384,17 @@ private:
             texCache.commandPool = renderer.getCommandPool();
             texCache.graphicsQueue = renderer.getGraphicsQueue();
 
+            // --- Staging belt for batched texture uploads ---
+            stagingBelt.init(physDevice, device);
+
+            // Wire staging into caches (enables deferred uploads)
+            gradCache.stagingBelt = &stagingBelt;
+            gradCache.pendingUploads = &pendingUploads;
+            gradCache.defaultDescriptorSet = defaultDescriptorSet;
+            texCache.stagingBelt = &stagingBelt;
+            texCache.pendingUploads = &pendingUploads;
+            texCache.defaultDescriptorSet = defaultDescriptorSet;
+
             setPipeline(mainPipeline->getInternal());
         }
 
@@ -366,9 +410,28 @@ private:
             hsvDescriptorHelper.reset();
             defaultTexture.destroy();
             blurTempImage.destroy();
+            stagingBelt.destroy();
             texCache.clear();
             gradCache.clear();
             glyphAtlas.clear();
+        }
+
+        void prepareFrame(VkCommandBuffer& commandBuffer) override
+        {
+            int frameIdx = static_cast<int>(getRenderer()->getCurrentFrame() % MAX_FRAMES);
+
+            // Safe: VulkanInstance waited on inFlightFences[currentFrame]
+            deletionQueues[frameIdx].flush();
+            stagingBelt.recycle(usedStagingBlocks[frameIdx]);
+
+            // Record upload commands for resources staged during previous frames.
+            // These must execute before the render pass so images are in
+            // SHADER_READ_ONLY_OPTIMAL layout when fragment shaders sample them.
+            core::StagingBelt::recordUploads(commandBuffer, pendingUploads);
+
+            // Move staging blocks used for these uploads to the per-frame list
+            // so they stay alive until this frame's fence signals.
+            stagingBelt.moveActiveTo(usedStagingBlocks[frameIdx]);
         }
 
         void render(VkCommandBuffer& commandBuffer) override
@@ -404,9 +467,6 @@ private:
             // Note: these are set by VulkanInstance before calling render
             rpInfo.extent = { fw, fh };
 
-            // Upload any dirty glyph atlas pages before rendering
-            glyphAtlas.uploadDirtyPages();
-
             // Update cache frame counters and evict stale entries
             texCache.currentFrame++;
             gradCache.currentFrame++;
@@ -426,10 +486,18 @@ private:
                 defaultDescriptorSet,
                 editor.srgbPipelineMode, multiplyPipeline.get(),
                 hsvPipeline.get(), blurPipeline.get(), rpInfo,
-                &blurTempImage, blurDescriptorSet, &texCache, &glyphAtlas, &gradCache);
+                &blurTempImage, blurDescriptorSet, &texCache, &glyphAtlas, &gradCache,
+                &deletionQueues[frameIdx]);
 
             juce::Graphics g(ctx);
+            editor.inVulkanRender = true;
             editor.paintEntireComponent(g, false);
+            editor.inVulkanRender = false;
+
+            // Stage dirty atlas pages for upload in the next frame's prepareFrame().
+            // New glyphs render as invisible (white atlas background) for one frame.
+            glyphAtlas.stageDirtyPages(stagingBelt, pendingUploads);
+
             ctx.flush();
         }
 
@@ -449,6 +517,10 @@ private:
         static constexpr int MAX_FRAMES = 2;
         core::Buffer persistentBuffers[MAX_FRAMES];
         void* mappedPtrs[MAX_FRAMES] = {};
+        core::DeletionQueue deletionQueues[MAX_FRAMES];
+        core::StagingBelt stagingBelt;
+        std::vector<core::StagingBelt::Block> usedStagingBlocks[MAX_FRAMES];
+        std::vector<core::PendingUpload> pendingUploads;
         core::Image blurTempImage;      // lazy persistent — allocated on first blur, reused
         VkDescriptorSet blurDescriptorSet = VK_NULL_HANDLE;
         TextureCache texCache;          // GPU texture cache for drawImage
@@ -460,6 +532,7 @@ private:
     PaintBridge paintBridge;
     bool vulkanEnabled = true;
     bool srgbPipelineMode = false;
+    bool inVulkanRender = false;
 };
 
 } // jvk

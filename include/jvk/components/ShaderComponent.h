@@ -48,10 +48,9 @@ public:
     {
         preProcessData(data, num);
         fifo.push_num(data, num);
-        if (auto* r = getRenderer()) r->markDirty();
     }
 protected:
-    virtual void preProcessData(float* data, int num) { };
+    virtual void preProcessData(float* data, int num) { }
 
 private:
     void sendDataToShader()

@@ -71,21 +71,22 @@ struct VulkanRendererSettings
 {
     VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_1_BIT;
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
-    int maxFrameRate = 60;  // 0 = dirty-only rendering
+    // Frame rate is controlled by present mode (FIFO = vsync, IMMEDIATE = uncapped)
     bool srgbPipeline = false; // true = physically correct blending, false = JUCE-identical
 };
 
 class VulkanInstance
 {
 public:
-    VulkanInstance() { };
-    virtual ~VulkanInstance() { };
+    VulkanInstance() { }
+    virtual ~VulkanInstance() { }
 
 protected:
-    virtual void renderComponents(VkCommandBuffer& commandBuffer) { };
+    virtual void prepareComponents(VkCommandBuffer& commandBuffer) { }
+    virtual void renderComponents(VkCommandBuffer& commandBuffer) { }
 
-    virtual std::vector<const char*> getExtensions() { return {}; };
-    virtual void createSurface() { };
+    virtual std::vector<const char*> getExtensions() { return {}; }
+    virtual void createSurface() { }
 
     void initializeVulkan();
     bool createInstance();

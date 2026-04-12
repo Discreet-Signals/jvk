@@ -52,6 +52,7 @@ struct GradientCache
         core::Image texture;
         VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
         uint64_t lastUsedFrame = 0;
+        uint64_t uploadFrame = 0; // frame when upload was staged
     };
 
     std::unordered_map<uint64_t, Entry> entries;
@@ -61,6 +62,9 @@ struct GradientCache
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     uint64_t currentFrame = 0;
+    core::StagingBelt* stagingBelt = nullptr;
+    std::vector<core::PendingUpload>* pendingUploads = nullptr;
+    VkDescriptorSet defaultDescriptorSet = VK_NULL_HANDLE;
 
     static uint64_t hashGradient(const juce::ColourGradient& g)
     {
@@ -85,6 +89,9 @@ struct GradientCache
         if (it != entries.end())
         {
             it->second.lastUsedFrame = currentFrame;
+            // If upload is still pending (staged last frame), use fallback
+            if (it->second.uploadFrame + 1 > currentFrame)
+                return defaultDescriptorSet;
             return it->second.descriptorSet;
         }
 
@@ -106,16 +113,27 @@ struct GradientCache
             static_cast<uint32_t>(LUT_WIDTH), 1,
             VK_FORMAT_R8G8B8A8_UNORM,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT });
-        entry.texture.upload(physDevice, commandPool, graphicsQueue,
-            pixels.data(), static_cast<uint32_t>(LUT_WIDTH), 1, VK_FORMAT_R8G8B8A8_UNORM);
         entry.texture.createSampler(VK_FILTER_LINEAR, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+
+        // Stage upload — no GPU stall. Upload commands recorded next prepareFrame().
+        if (stagingBelt && pendingUploads)
+            stagingBelt->stageImageUpload(entry.texture, *pendingUploads,
+                pixels.data(), static_cast<uint32_t>(LUT_WIDTH), 1);
+        else
+            entry.texture.upload(physDevice, commandPool, graphicsQueue,
+                pixels.data(), static_cast<uint32_t>(LUT_WIDTH), 1, VK_FORMAT_R8G8B8A8_UNORM);
 
         entry.descriptorSet = descriptorHelper->allocateSet();
         core::DescriptorHelper::writeImage(device, entry.descriptorSet, 0,
             entry.texture.getView(), entry.texture.getSampler());
 
         entry.lastUsedFrame = currentFrame;
+        entry.uploadFrame = currentFrame;
         auto [insertIt, _] = entries.emplace(key, std::move(entry));
+
+        // Return fallback for this frame — image not uploaded yet
+        if (stagingBelt && pendingUploads)
+            return defaultDescriptorSet;
         return insertIt->second.descriptorSet;
     }
 
@@ -149,6 +167,7 @@ struct TextureCache
         core::Image texture;
         VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
         uint64_t lastUsedFrame = 0;
+        uint64_t uploadFrame = 0;
     };
 
     std::unordered_map<uint64_t, Entry> entries;
@@ -158,6 +177,9 @@ struct TextureCache
     VkCommandPool commandPool = VK_NULL_HANDLE;
     VkQueue graphicsQueue = VK_NULL_HANDLE;
     uint64_t currentFrame = 0;
+    core::StagingBelt* stagingBelt = nullptr;
+    std::vector<core::PendingUpload>* pendingUploads = nullptr;
+    VkDescriptorSet defaultDescriptorSet = VK_NULL_HANDLE;
 
     void evict(uint64_t maxAge = 120)
     {
@@ -205,7 +227,8 @@ public:
                           VkDescriptorSet blurDescSet = VK_NULL_HANDLE,
                           TextureCache* textureCache = nullptr,
                           GlyphAtlas* glyphAtlas = nullptr,
-                          GradientCache* gradientCache = nullptr)
+                          GradientCache* gradientCache = nullptr,
+                          core::DeletionQueue* deletionQ = nullptr)
         : cmd(cmd), colorPipeline(colorPipeline), pipelineLayout(pipelineLayout),
           vpWidth(vpWidth), vpHeight(vpHeight), scale(scale), srgbMode(srgb),
           physDevice(physDevice), device(device),
@@ -214,12 +237,19 @@ public:
           multiplyPipeline(multiplyPipeline), hsvPipeline(hsvPipeline),
           blurPipeline(blurPipeline), rpInfo(rpInfo), blurTempImage(blurTempImage), blurDescSet(blurDescSet),
           defaultDescriptorSet(defaultDescSet), textureCache(textureCache),
-          glyphAtlas(glyphAtlas), gradientCache(gradientCache)
+          glyphAtlas(glyphAtlas), gradientCache(gradientCache),
+          deletionQueue(deletionQ)
     {
         stateStack.push_back({});
         // Clip bounds in physical pixels
         stateStack.back().clipBounds = juce::Rectangle<int>(0, 0,
             static_cast<int>(vpWidth), static_cast<int>(vpHeight));
+
+        // Bind default (1x1 white) descriptor set so non-textured draws work.
+        // Callers that switch to atlas/texture descriptors rebind this afterwards.
+        if (defaultDescriptorSet != VK_NULL_HANDLE)
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
+                                     0, 1, &defaultDescriptorSet, 0, nullptr);
     }
 
     ~VulkanGraphicsContext() override { flush(); }
@@ -229,7 +259,7 @@ public:
     uint64_t getFrameId() const override { return frameId++; }
     float getPhysicalPixelScaleFactor() const override { return scale; }
 
-    std::unique_ptr<juce::ImageType> getPreferredImageTypeForTemporaryImages() const override
+    std::unique_ptr<juce::ImageType> getPreferredImageTypeForTemporaryImages() const
     {
         return std::make_unique<juce::NativeImageType>();
     }
@@ -252,6 +282,7 @@ public:
     // JUCE passes logical point rects. Scale to physical pixels.
     bool clipToRectangle(const juce::Rectangle<int>& r) override
     {
+        flush();
         auto& s = state();
         auto scaled = scaleRect(r);
         s.clipBounds = s.clipBounds.getIntersection(scaled.translated(s.origin.x, s.origin.y));
@@ -267,18 +298,34 @@ public:
 
     void excludeClipRectangle(const juce::Rectangle<int>& r) override
     {
+        flush();
         auto& s = state();
         auto excluded = scaleRect(r).translated(s.origin.x, s.origin.y);
-        if (s.clipBounds.intersects(excluded))
+        if (!s.clipBounds.intersects(excluded)) return;
+
+        // With a single scissor rect, we can only exclude regions that touch
+        // an edge of the clip bounds. Pick the largest remaining rectangle.
+        bool spansWidth  = excluded.getX() <= s.clipBounds.getX() && excluded.getRight() >= s.clipBounds.getRight();
+        bool spansHeight = excluded.getY() <= s.clipBounds.getY() && excluded.getBottom() >= s.clipBounds.getBottom();
+
+        if (spansWidth)
         {
-            if (excluded.getX() <= s.clipBounds.getX() && excluded.getRight() >= s.clipBounds.getRight())
-            {
-                if (excluded.getY() <= s.clipBounds.getY())
-                    s.clipBounds.setTop(excluded.getBottom());
-                else if (excluded.getBottom() >= s.clipBounds.getBottom())
-                    s.clipBounds.setBottom(excluded.getY());
-            }
+            // Exclusion spans full width — shrink vertically
+            if (excluded.getY() <= s.clipBounds.getY())
+                s.clipBounds.setTop(excluded.getBottom());
+            else if (excluded.getBottom() >= s.clipBounds.getBottom())
+                s.clipBounds.setBottom(excluded.getY());
         }
+        else if (spansHeight)
+        {
+            // Exclusion spans full height — shrink horizontally
+            if (excluded.getX() <= s.clipBounds.getX())
+                s.clipBounds.setLeft(excluded.getRight());
+            else if (excluded.getRight() >= s.clipBounds.getRight())
+                s.clipBounds.setRight(excluded.getX());
+        }
+        // For arbitrary interior exclusions, we'd need stencil clipping.
+        // The remaining visible area is approximated by the unchanged clip bounds.
     }
 
     void clipToPath(const juce::Path& path, const juce::AffineTransform& t) override
@@ -322,8 +369,9 @@ public:
     bool isClipEmpty() const override { return state().clipBounds.isEmpty(); }
 
     // ==== State stack ====
-    void saveState() override { stateStack.push_back(stateStack.back()); }
-    void restoreState() override { if (stateStack.size() > 1) stateStack.pop_back(); }
+    // Flush pending vertices before state changes so they use the correct scissor.
+    void saveState() override { flush(); stateStack.push_back(stateStack.back()); }
+    void restoreState() override { flush(); if (stateStack.size() > 1) stateStack.pop_back(); }
 
     // ==== Transparency layers ====
     void beginTransparencyLayer(float opacity) override
@@ -346,6 +394,12 @@ public:
     void fillRoundedRectangle(const juce::Rectangle<float>& r, float cornerSize) override
     {
         if (isClipEmpty()) return;
+        // SDF rounded rect only works axis-aligned; fall back to path for transforms
+        if (hasNonTrivialTransform())
+        {
+            juce::LowLevelGraphicsContext::fillRoundedRectangle(r, cornerSize);
+            return;
+        }
         auto& s = state();
         auto phys = juce::Rectangle<float>(r.getX() * scale, r.getY() * scale,
                                             r.getWidth() * scale, r.getHeight() * scale);
@@ -358,6 +412,12 @@ public:
     void fillEllipse(const juce::Rectangle<float>& area) override
     {
         if (isClipEmpty()) return;
+        // SDF ellipse only works axis-aligned; fall back to path for transforms
+        if (hasNonTrivialTransform())
+        {
+            juce::LowLevelGraphicsContext::fillEllipse(area);
+            return;
+        }
         auto& s = state();
         auto phys = juce::Rectangle<float>(area.getX() * scale, area.getY() * scale,
                                             area.getWidth() * scale, area.getHeight() * scale);
@@ -375,6 +435,26 @@ public:
     {
         if (isClipEmpty()) return;
         auto& s = state();
+
+        if (hasNonTrivialTransform())
+        {
+            // Non-trivial transform: emit a transformed quad
+            auto t = getFullTransform();
+            auto p00 = juce::Point<float>(r.getX(), r.getY()).transformedBy(t);
+            auto p10 = juce::Point<float>(r.getRight(), r.getY()).transformedBy(t);
+            auto p11 = juce::Point<float>(r.getRight(), r.getBottom()).transformedBy(t);
+            auto p01 = juce::Point<float>(r.getX(), r.getBottom()).transformedBy(t);
+            auto c = getColorForFill();
+            glm::vec4 flat(0);
+            addVertex(p00.x, p00.y, c, 0, 0, flat);
+            addVertex(p10.x, p10.y, c, 0, 0, flat);
+            addVertex(p11.x, p11.y, c, 0, 0, flat);
+            addVertex(p00.x, p00.y, c, 0, 0, flat);
+            addVertex(p11.x, p11.y, c, 0, 0, flat);
+            addVertex(p01.x, p01.y, c, 0, 0, flat);
+            return;
+        }
+
         auto phys = juce::Rectangle<float>(r.getX() * scale, r.getY() * scale,
                                             r.getWidth() * scale, r.getHeight() * scale);
         auto translated = phys.translated(static_cast<float>(s.origin.x),
@@ -402,8 +482,7 @@ public:
     {
         if (isClipEmpty()) return;
         auto& s = state();
-        auto combined = t.scaled(scale).translated(
-            static_cast<float>(s.origin.x), static_cast<float>(s.origin.y));
+        auto combined = getFullTransform(t);
 
         // GPU stencil path rendering (triangle fan + cover quad)
         if (stencilPipeline != nullptr && stencilCoverPipeline != nullptr)
@@ -412,7 +491,7 @@ public:
             return;
         }
 
-        // Fallback: EdgeTable path rendering (CPU per-pixel)
+        // Fallback: EdgeTable path rendering (CPU rasterized, GPU drawn)
         juce::EdgeTable et(s.clipBounds, path, combined);
 
         if (s.fillType.isGradient())
@@ -427,48 +506,86 @@ public:
         }
     }
 
+    // GPU stencil-then-cover path rendering.
+    // It caused stencil state corruption on MoltenVK with complex paths.
+    // The EdgeTable CPU fallback in fillPath() handles all path rendering.
     void fillPathStencil(const juce::Path& path, const juce::AffineTransform& combined)
     {
-        // Step 1: Flatten path to line segments
-        juce::PathFlatteningIterator iter(path, combined);
-        std::vector<glm::vec2> points;
-        points.reserve(64);
+        // Step 1: Flatten path to line segments, tracking subpaths.
+        // Each subpath gets its own fan center (its first point) for
+        // correct non-zero winding with holes and compound paths.
+        struct Subpath { glm::vec2 center; std::vector<glm::vec2> points; };
+        std::vector<Subpath> subpaths;
 
-        glm::vec2 firstPoint(0);
-        bool hasFirst = false;
-
-        while (iter.next())
         {
-            if (!hasFirst) { firstPoint = { iter.x1, iter.y1 }; hasFirst = true; }
-            points.push_back({ iter.x2, iter.y2 });
+            juce::PathFlatteningIterator iter(path, combined);
+            Subpath* current = nullptr;
+            glm::vec2 lastStart(0);
+
+            while (iter.next())
+            {
+                glm::vec2 p1 { iter.x1, iter.y1 };
+                glm::vec2 p2 { iter.x2, iter.y2 };
+
+                // Detect new subpath: first segment, or a jump from previous end point
+                if (!current || (current->points.size() > 0 &&
+                    (std::abs(p1.x - current->points.back().x) > 0.01f ||
+                     std::abs(p1.y - current->points.back().y) > 0.01f)))
+                {
+                    subpaths.push_back({ p1, {} });
+                    current = &subpaths.back();
+                }
+                current->points.push_back(p2);
+            }
         }
 
-        if (points.size() < 2 || !hasFirst) return;
+        // Build triangle fan for all subpaths
+        std::vector<UIVertex> fanVerts;
+        for (auto& sp : subpaths)
+        {
+            if (sp.points.size() < 2) continue;
+            fanVerts.reserve(fanVerts.size() + sp.points.size() * 3);
+            glm::vec4 dummy(0);
+            glm::vec4 noShape(0);
+            for (size_t i = 0; i + 1 < sp.points.size(); i++)
+            {
+                fanVerts.push_back({ sp.center,    dummy, {}, noShape });
+                fanVerts.push_back({ sp.points[i], dummy, {}, noShape });
+                fanVerts.push_back({ sp.points[i+1], dummy, {}, noShape });
+            }
+        }
+
+        if (fanVerts.empty()) return;
+
+        // Compute the actual extent of all fan triangles — the cover quad
+        // must be at least this large to zero every stencil value the fan wrote.
+        float fanMinX = fanVerts[0].position.x, fanMinY = fanVerts[0].position.y;
+        float fanMaxX = fanMinX, fanMaxY = fanMinY;
+        for (auto& v : fanVerts)
+        {
+            fanMinX = std::min(fanMinX, v.position.x);
+            fanMinY = std::min(fanMinY, v.position.y);
+            fanMaxX = std::max(fanMaxX, v.position.x);
+            fanMaxY = std::max(fanMaxY, v.position.y);
+        }
 
         // Step 2: Flush pending main vertices
         flush();
 
         // Step 3: Bind stencil-write pipeline, draw triangle fan
+        // Use full viewport scissor for the fan — stencil values must be written
+        // everywhere the path covers, not clipped to the current clip region.
+        // The cover pass will apply the clip scissor.
+        {
+            VkRect2D fullScissor = { { 0, 0 }, { static_cast<uint32_t>(vpWidth), static_cast<uint32_t>(vpHeight) } };
+            vkCmdSetScissor(cmd, 0, 1, &fullScissor);
+        }
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, stencilPipeline->getInternal());
         float pushData[2] = { vpWidth, vpHeight };
         vkCmdPushConstants(cmd, stencilPipeline->getLayout(), VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
 
-        // Emit triangle fan: fan center → consecutive edge points
-        glm::vec4 dummy(0); // color irrelevant for stencil
-        glm::vec4 noShape(0);
-        std::vector<UIVertex> fanVerts;
-        fanVerts.reserve(points.size() * 3);
-
-        for (size_t i = 0; i + 1 < points.size(); i++)
         {
-            fanVerts.push_back({ firstPoint, dummy, {}, noShape });
-            fanVerts.push_back({ points[i],  dummy, {}, noShape });
-            fanVerts.push_back({ points[i+1], dummy, {}, noShape });
-        }
-
-        if (!fanVerts.empty())
-        {
-            // Upload and draw fan
+            // Upload fan vertices using the shared buffer (same as flush())
             VkDeviceSize needed = sizeof(UIVertex) * fanVerts.size();
             core::Buffer* buf = extBuffer;
             void** mapped = extMappedPtr;
@@ -476,20 +593,27 @@ public:
             void* tempMapped = nullptr;
             if (!buf) { buf = &tempBuf; mapped = &tempMapped; }
 
-            if (!buf->isValid() || buf->getSize() < needed)
+            VkDeviceSize totalNeeded = bufferWriteOffset + needed;
+            if (!buf->isValid() || buf->getSize() < totalNeeded)
             {
-                buf->destroy();
+                if (buf->isValid() && deletionQueue)
+                    deletionQueue->retire(std::move(*buf));
+
                 VkDeviceSize sz = std::max(needed, static_cast<VkDeviceSize>(sizeof(UIVertex) * 65536));
                 buf->create({ physDevice, device, sz, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT });
                 *mapped = buf->map();
+                bufferWriteOffset = 0;
             }
-            memcpy(*mapped, fanVerts.data(), static_cast<size_t>(needed));
+            memcpy(static_cast<char*>(*mapped) + bufferWriteOffset,
+                   fanVerts.data(), static_cast<size_t>(needed));
 
             VkBuffer buffers[] = { buf->getBuffer() };
-            VkDeviceSize offsets[] = { 0 };
+            VkDeviceSize offsets[] = { bufferWriteOffset };
             vkCmdBindVertexBuffers(cmd, 0, 1, buffers, offsets);
             vkCmdDraw(cmd, static_cast<uint32_t>(fanVerts.size()), 1, 0, 0);
+
+            bufferWriteOffset += needed;
         }
 
         // Step 4: Bind stencil cover pipeline (stencil test NOT_EQUAL 0, zeros on pass)
@@ -500,10 +624,11 @@ public:
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, stencilCoverPipeline->getLayout(),
                                      0, 1, &defaultDescriptorSet, 0, nullptr);
 
-        // Step 5: Draw cover quad over path bounding box
-        auto bounds = path.getBoundsTransformed(combined);
-        float bx = bounds.getX(), by = bounds.getY();
-        float bw = bounds.getWidth(), bh = bounds.getHeight();
+        // Step 5: Draw cover quad over the fan's full extent.
+        // This must cover every pixel the fan touched so the ZERO op
+        // cleans up all stencil values — no per-path stencil clear needed.
+        float bx = fanMinX, by = fanMinY;
+        float bw = fanMaxX - fanMinX, bh = fanMaxY - fanMinY;
 
         auto& s = state();
         vertices.clear();
@@ -590,8 +715,7 @@ public:
     {
         if (isClipEmpty() || !image.isValid()) return;
         auto& s = state();
-        auto combined = t.scaled(scale).translated(
-            static_cast<float>(s.origin.x), static_cast<float>(s.origin.y));
+        auto combined = getFullTransform(t);
 
         int w = image.getWidth(), h = image.getHeight();
 
@@ -614,16 +738,17 @@ public:
             key ^= reinterpret_cast<uint64_t>(bmp.data);
 
             auto it = textureCache->entries.find(key);
+            bool newEntry = false;
             if (it == textureCache->entries.end())
             {
-                // Upload image to GPU texture
                 TextureCache::Entry entry;
                 entry.texture.create({ textureCache->physDevice, textureCache->device,
                     static_cast<uint32_t>(w), static_cast<uint32_t>(h),
                     VK_FORMAT_R8G8B8A8_UNORM,
                     VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT });
+                entry.texture.createSampler(VK_FILTER_LINEAR);
 
-                // Convert JUCE image to RGBA8 for upload
+                // Convert JUCE image to RGBA8
                 std::vector<uint32_t> pixels(static_cast<size_t>(w * h));
                 for (int iy = 0; iy < h; iy++)
                     for (int ix = 0; ix < w; ix++)
@@ -636,30 +761,39 @@ public:
                           | (static_cast<uint32_t>(c.getAlpha()) << 24);
                     }
 
-                entry.texture.upload(textureCache->physDevice, textureCache->commandPool,
-                    textureCache->graphicsQueue, pixels.data(),
-                    static_cast<uint32_t>(w), static_cast<uint32_t>(h),
-                    VK_FORMAT_R8G8B8A8_UNORM);
-                entry.texture.createSampler(VK_FILTER_LINEAR);
+                // Stage upload — no GPU stall
+                if (textureCache->stagingBelt && textureCache->pendingUploads)
+                    textureCache->stagingBelt->stageImageUpload(entry.texture, *textureCache->pendingUploads,
+                        pixels.data(), static_cast<uint32_t>(w), static_cast<uint32_t>(h));
+                else
+                    entry.texture.upload(textureCache->physDevice, textureCache->commandPool,
+                        textureCache->graphicsQueue, pixels.data(),
+                        static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+                        VK_FORMAT_R8G8B8A8_UNORM);
 
                 entry.descriptorSet = textureCache->descriptorHelper->allocateSet();
                 core::DescriptorHelper::writeImage(textureCache->device, entry.descriptorSet, 0,
                     entry.texture.getView(), entry.texture.getSampler());
 
                 entry.lastUsedFrame = textureCache->currentFrame;
+                entry.uploadFrame = textureCache->currentFrame;
                 auto [insertIt, _] = textureCache->entries.emplace(key, std::move(entry));
                 it = insertIt;
+                newEntry = true;
             }
             else
             {
                 it->second.lastUsedFrame = textureCache->currentFrame;
             }
 
-            // Flush pending vertices, bind image texture, draw textured quad, restore default
+            // Use fallback descriptor if upload hasn't been processed yet
+            bool pending = newEntry && textureCache->stagingBelt && textureCache->pendingUploads;
+            VkDescriptorSet texDescSet = pending ? defaultDescriptorSet : it->second.descriptorSet;
+
             flush();
 
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                     0, 1, &it->second.descriptorSet, 0, nullptr);
+                                     0, 1, &texDescSet, 0, nullptr);
 
             // Compute transformed corners
             auto p00 = juce::Point<float>(0, 0).transformedBy(combined);
@@ -707,19 +841,20 @@ public:
     void drawLine(const juce::Line<float>& line) override
     {
         if (isClipEmpty()) return;
-        auto& s = state();
+        auto t = getFullTransform();
         auto c = getColorForFill();
-        float ox = static_cast<float>(s.origin.x), oy = static_cast<float>(s.origin.y);
 
-        float x1 = line.getStartX() * scale + ox, y1 = line.getStartY() * scale + oy;
-        float x2 = line.getEndX() * scale + ox, y2 = line.getEndY() * scale + oy;
-        float dx = x2 - x1, dy = y2 - y1;
+        auto p1 = line.getStart().transformedBy(t);
+        auto p2 = line.getEnd().transformedBy(t);
+        float dx = p2.x - p1.x, dy = p2.y - p1.y;
         float len = std::sqrt(dx * dx + dy * dy);
         if (len < 0.001f) return;
-        float nx = -dy / len * 0.5f, ny = dx / len * 0.5f;
+        // 1 physical pixel line width (0.5px normal on each side)
+        float hw = std::max(0.5f, scale * 0.5f);
+        float nx = -dy / len * hw, ny = dx / len * hw;
 
-        addVertex(x1+nx, y1+ny, c); addVertex(x2+nx, y2+ny, c); addVertex(x2-nx, y2-ny, c);
-        addVertex(x1+nx, y1+ny, c); addVertex(x2-nx, y2-ny, c); addVertex(x1-nx, y1-ny, c);
+        addVertex(p1.x+nx, p1.y+ny, c); addVertex(p2.x+nx, p2.y+ny, c); addVertex(p2.x-nx, p2.y-ny, c);
+        addVertex(p1.x+nx, p1.y+ny, c); addVertex(p2.x-nx, p2.y-ny, c); addVertex(p1.x-nx, p1.y-ny, c);
     }
 
     // ==== Drawing: drawGlyphs ====
@@ -730,21 +865,22 @@ public:
         if (isClipEmpty() || glyphs.empty()) return;
         auto& s = state();
 
-        // GPU SDF atlas path: each glyph = 1 textured quad, resolution-independent
+        // GPU MSDF atlas path: each glyph = 1 textured quad, resolution-independent
         if (glyphAtlas)
         {
             auto* typeface = s.font.getTypefacePtr().get();
-            auto fontHeight = juce::detail::FontRendering::getEffectiveHeight(s.font);
+            auto fontHeight = s.font.getHeight();
             auto baseColor = getColorForFill();
-
-            // Scale factor: how big to render relative to the SDF generation size
-            float sdfScale = (fontHeight * scale) / static_cast<float>(GlyphAtlas::SDF_GLYPH_SIZE);
             float hScale = s.font.getHorizontalScale();
+
+            // Physical font size determines quad size on screen
+            float physFontHeight = fontHeight * scale;
 
             VkDescriptorSet currentAtlasDescSet = VK_NULL_HANDLE;
 
             for (size_t idx = 0; idx < glyphs.size(); ++idx)
             {
+                // MSDF atlas is resolution-independent: one entry per glyph per typeface
                 GlyphAtlas::GlyphKey key { typeface, glyphs[idx] };
                 auto* entry = glyphAtlas->getGlyph(key, s.font);
                 if (!entry) continue;
@@ -752,7 +888,6 @@ public:
                 auto descSet = glyphAtlas->getDescriptorSet(entry->atlasIndex);
                 if (descSet == VK_NULL_HANDLE) continue;
 
-                // Switch atlas texture if needed
                 if (descSet != currentAtlasDescSet)
                 {
                     flush();
@@ -761,27 +896,38 @@ public:
                     currentAtlasDescSet = descSet;
                 }
 
-                // Position: glyph origin in physical pixels, scaled from SDF space
-                auto glyphPos = positions[idx].transformedBy(t);
-                float ox = static_cast<float>(s.origin.x);
-                float oy = static_cast<float>(s.origin.y);
-                // Offset by the path bounds origin (where the glyph actually starts)
-                float px = glyphPos.x * scale + ox + (entry->offsetX - GlyphAtlas::SDF_PADDING) * sdfScale * hScale;
-                float py = glyphPos.y * scale + oy + (entry->offsetY - GlyphAtlas::SDF_PADDING) * sdfScale;
-                float gw = static_cast<float>(entry->w) * sdfScale * hScale;
-                float gh = static_cast<float>(entry->h) * sdfScale;
+                // Glyph position in physical pixels (applies addTransform + scale + origin)
+                auto fullT = getFullTransform(t);
+                auto glyphPos = positions[idx].transformedBy(fullT);
 
-                // shapeInfo.x = 4.0 tells the fragment shader to use SDF text evaluation
-                glm::vec4 sdfType(4.0f, 0, 0, 0);
-                addVertex(px,      py,      baseColor, entry->u0, entry->v0, sdfType);
-                addVertex(px + gw, py,      baseColor, entry->u1, entry->v0, sdfType);
-                addVertex(px + gw, py + gh, baseColor, entry->u1, entry->v1, sdfType);
-                addVertex(px,      py,      baseColor, entry->u0, entry->v0, sdfType);
-                addVertex(px + gw, py + gh, baseColor, entry->u1, entry->v1, sdfType);
-                addVertex(px,      py + gh, baseColor, entry->u0, entry->v1, sdfType);
+                // The entry bounds are in normalized font units (height=1.0).
+                // Scale to physical pixels for screen positioning.
+                float quadX = glyphPos.x + entry->boundsX * physFontHeight * hScale
+                            - GlyphAtlas::GLYPH_PADDING * (entry->boundsW * physFontHeight * hScale / static_cast<float>(entry->w - GlyphAtlas::GLYPH_PADDING * 2));
+                float quadY = glyphPos.y + entry->boundsY * physFontHeight
+                            - GlyphAtlas::GLYPH_PADDING * (entry->boundsH * physFontHeight / static_cast<float>(entry->h - GlyphAtlas::GLYPH_PADDING * 2));
+
+                // Quad size: scale the MSDF texel dimensions to screen pixels
+                // The inner glyph region maps to boundsW*fontHeight x boundsH*fontHeight
+                // Plus padding on each side
+                float texelsPerUnit = static_cast<float>(entry->w) / (entry->boundsW + 2.0f * GlyphAtlas::GLYPH_PADDING / (entry->boundsW > 0 ? (static_cast<float>(entry->w - GlyphAtlas::GLYPH_PADDING * 2) / entry->boundsW) : 1.0f));
+                float gw = static_cast<float>(entry->w) * (entry->boundsW * physFontHeight * hScale) / static_cast<float>(entry->w - GlyphAtlas::GLYPH_PADDING * 2);
+                float gh = static_cast<float>(entry->h) * (entry->boundsH * physFontHeight) / static_cast<float>(entry->h - GlyphAtlas::GLYPH_PADDING * 2);
+
+                // Screen pixel range for MSDF: how many screen pixels the distance range covers
+                float screenPxRange = std::max(1.0f,
+                    static_cast<float>(GlyphAtlas::MSDF_PIXEL_RANGE) * (gw / static_cast<float>(entry->w)));
+
+                // Type 4: MSDF text, shapeInfo.y = screenPxRange
+                glm::vec4 msdfType(4.0f, screenPxRange, 0.0f, 0);
+                addVertex(quadX,      quadY,      baseColor, entry->u0, entry->v0, msdfType);
+                addVertex(quadX + gw, quadY,      baseColor, entry->u1, entry->v0, msdfType);
+                addVertex(quadX + gw, quadY + gh, baseColor, entry->u1, entry->v1, msdfType);
+                addVertex(quadX,      quadY,      baseColor, entry->u0, entry->v0, msdfType);
+                addVertex(quadX + gw, quadY + gh, baseColor, entry->u1, entry->v1, msdfType);
+                addVertex(quadX,      quadY + gh, baseColor, entry->u0, entry->v1, msdfType);
             }
 
-            // Flush remaining glyphs and restore default texture
             flush();
             if (defaultDescriptorSet != VK_NULL_HANDLE)
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
@@ -793,12 +939,9 @@ public:
         for (size_t idx = 0; idx < glyphs.size(); ++idx)
         {
             auto glyphTransform = juce::AffineTransform::translation(positions[idx])
-                                    .followedBy(t)
-                                    .scaled(scale)
-                                    .translated(static_cast<float>(s.origin.x),
-                                                static_cast<float>(s.origin.y));
+                                    .followedBy(getFullTransform(t));
 
-            auto fontHeight = juce::detail::FontRendering::getEffectiveHeight(s.font);
+            auto fontHeight = s.font.getHeight();
             auto fontTransform = juce::AffineTransform::scale(
                 fontHeight * s.font.getHorizontalScale(), fontHeight)
                 .followedBy(glyphTransform);
@@ -848,11 +991,6 @@ public:
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, colorPipeline);
 
-        // Bind default descriptor set (1x1 white texture for non-textured draws)
-        if (defaultDescriptorSet != VK_NULL_HANDLE)
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
-                                     0, 1, &defaultDescriptorSet, 0, nullptr);
-
         // Push physical pixel viewport size
         float pushData[2] = { vpWidth, vpHeight };
         vkCmdPushConstants(cmd, pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pushData), pushData);
@@ -875,13 +1013,18 @@ public:
         VkDeviceSize totalNeeded = bufferWriteOffset + needed;
         if (!buf->isValid() || buf->getSize() < totalNeeded)
         {
-            buf->destroy();
-            VkDeviceSize allocSize = std::max(totalNeeded, static_cast<VkDeviceSize>(sizeof(UIVertex) * 65536));
+            // Prior vkCmdDraw calls in this command buffer still reference the
+            // old buffer. Retire it so it stays alive until the frame's fence
+            // signals that the GPU is done.
+            if (buf->isValid() && deletionQueue)
+                deletionQueue->retire(std::move(*buf));
+
+            VkDeviceSize allocSize = std::max(needed, static_cast<VkDeviceSize>(sizeof(UIVertex) * 65536));
             buf->create({ physDevice, device, allocSize,
                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT });
             *mapped = buf->map();
-            bufferWriteOffset = 0; // buffer was reallocated, reset offset
+            bufferWriteOffset = 0;
         }
 
         // Write at current offset
@@ -921,7 +1064,9 @@ public:
         VkDeviceSize totalNeeded = bufferWriteOffset + needed;
         if (!buf->isValid() || buf->getSize() < totalNeeded)
         {
-            buf->destroy();
+            if (buf->isValid() && deletionQueue)
+                deletionQueue->retire(std::move(*buf));
+
             VkDeviceSize allocSize = std::max(totalNeeded, static_cast<VkDeviceSize>(sizeof(UIVertex) * 65536));
             buf->create({ physDevice, device, allocSize,
                           VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -949,7 +1094,7 @@ private:
         juce::AffineTransform transform;
         juce::FillType fillType { juce::Colours::black };
         float opacity = 1.0f;
-        juce::Font font;
+        juce::Font font { juce::FontOptions {} };
         juce::Rectangle<int> clipBounds; // physical pixels
     };
 
@@ -962,6 +1107,26 @@ private:
         return juce::Rectangle<int>(
             static_cast<int>(r.getX() * scale), static_cast<int>(r.getY() * scale),
             static_cast<int>(r.getWidth() * scale), static_cast<int>(r.getHeight() * scale));
+    }
+
+    // Compose the accumulated addTransform() state with a local transform,
+    // then apply logical→physical scaling and origin translation.
+    // This is the single source of truth for coordinate mapping.
+    juce::AffineTransform getFullTransform(const juce::AffineTransform& local = {}) const
+    {
+        auto& s = state();
+        return local.followedBy(s.transform)
+                    .scaled(scale)
+                    .translated(static_cast<float>(s.origin.x),
+                                static_cast<float>(s.origin.y));
+    }
+
+    // Check if the accumulated transform is non-trivial (rotation/skew/non-uniform-scale).
+    // SDF shapes (rounded rect, ellipse) only work axis-aligned.
+    bool hasNonTrivialTransform() const
+    {
+        auto& t = state().transform;
+        return !t.isIdentity() && !t.isOnlyTranslation();
     }
 
     void addVertex(float x, float y, const glm::vec4& color,
@@ -1456,6 +1621,9 @@ private:
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout,
                                      0, 1, &defaultDescriptorSet, 0, nullptr);
     }
+    // Deferred destruction queue (owned by PaintBridge's FrameResources).
+    // Old buffers/images are stashed here until the frame's fence signals.
+    core::DeletionQueue* deletionQueue = nullptr;
     mutable uint64_t frameId = 0;
 };
 

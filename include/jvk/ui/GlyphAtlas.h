@@ -2,13 +2,6 @@
  ----------------------------------------------------------------------------
  Copyright (c) 2026 Discreet Signals LLC
 
- ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
- ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
- ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
- ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
- ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
- ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
-
  Licensed under the MIT License. See LICENSE file in the project root
  for full license text.
 
@@ -20,21 +13,22 @@
 */
 
 #pragma once
+#include <msdfgen.h>
 
 namespace jvk
 {
 
-// GPU SDF glyph atlas for resolution-independent text rendering.
-// Generates a signed distance field per glyph at a fixed resolution,
-// then renders at any size via the SDF fragment shader (type 4).
-// One small atlas per typeface serves all font sizes.
+// GPU MSDF glyph atlas for resolution-independent text rendering.
+// Generates multi-channel signed distance fields from JUCE glyph outlines
+// via msdfgen, then renders at any size with a simple fragment shader.
+// One atlas per typeface serves all font sizes with sharp corners preserved.
 class GlyphAtlas
 {
 public:
-    static constexpr int ATLAS_SIZE = 1024;
-    static constexpr int SDF_GLYPH_SIZE = 48;     // fixed render height for SDF generation
-    static constexpr int SDF_PADDING = 4;          // padding for distance field spread
-    static constexpr float SDF_SPREAD = 6.0f;      // max distance in pixels for SDF encoding
+    static constexpr int ATLAS_SIZE = 2048;
+    static constexpr int MSDF_GLYPH_SIZE = 32;   // texels per glyph (resolution-independent)
+    static constexpr int GLYPH_PADDING = 2;
+    static constexpr double MSDF_PIXEL_RANGE = 4.0; // distance range in atlas pixels
 
     struct GlyphKey
     {
@@ -59,23 +53,22 @@ public:
 
     struct AtlasEntry
     {
-        float u0, v0, u1, v1;      // UV coordinates in atlas
-        int w, h;                   // SDF glyph dimensions in atlas pixels
-        int atlasIndex;             // which atlas page
-        // Metrics for positioning (in SDF-space, scale by fontHeight/SDF_GLYPH_SIZE)
-        float offsetX, offsetY;     // path bounds origin offset
-        float pathW, pathH;         // original path bounds size at SDF_GLYPH_SIZE
+        float u0, v0, u1, v1; // UV coordinates in atlas
+        int w, h;              // MSDF dimensions in atlas pixels
+        int atlasIndex;
+        // Glyph metrics for positioning (in normalized font units, height=1.0)
+        float boundsX, boundsY, boundsW, boundsH;
     };
 
-    void init(VkPhysicalDevice physDevice, VkDevice device,
-              VkCommandPool commandPool, VkQueue graphicsQueue,
-              core::DescriptorHelper* descriptorHelper)
+    void init(VkPhysicalDevice pd, VkDevice d,
+              VkCommandPool cp, VkQueue gq,
+              core::DescriptorHelper* dh)
     {
-        this->physDevice = physDevice;
-        this->device = device;
-        this->commandPool = commandPool;
-        this->graphicsQueue = graphicsQueue;
-        this->descriptorHelper = descriptorHelper;
+        physDevice = pd;
+        device = d;
+        commandPool = cp;
+        graphicsQueue = gq;
+        descriptorHelper = dh;
     }
 
     const AtlasEntry* getGlyph(const GlyphKey& key, const juce::Font& font)
@@ -83,7 +76,6 @@ public:
         auto it = entries.find(key);
         if (it != entries.end())
             return &it->second;
-
         return rasterizeGlyph(key, font);
     }
 
@@ -94,28 +86,29 @@ public:
         return atlasPages[static_cast<size_t>(atlasIndex)].descriptorSet;
     }
 
+    // Stage dirty atlas pages for deferred upload via StagingBelt.
+    // Pixels are copied to staging memory; actual GPU transfer commands
+    // are recorded in the next frame's prepareFrame() before the render pass.
+    void stageDirtyPages(core::StagingBelt& belt, std::vector<core::PendingUpload>& uploads)
+    {
+        for (auto& page : atlasPages)
+        {
+            if (page.needsUpload)
+            {
+                belt.stageImageUpload(page.texture, uploads,
+                    page.pixels.data(),
+                    static_cast<uint32_t>(ATLAS_SIZE), static_cast<uint32_t>(ATLAS_SIZE));
+                page.needsUpload = false;
+            }
+        }
+    }
+
     void clear()
     {
         entries.clear();
         for (auto& page : atlasPages)
             page.texture.destroy();
         atlasPages.clear();
-    }
-
-    // Upload any dirty atlas pages to GPU before rendering
-    void uploadDirtyPages()
-    {
-        for (auto& page : atlasPages)
-        {
-            if (page.needsUpload)
-            {
-                page.texture.upload(physDevice, commandPool, graphicsQueue,
-                    page.pixels.data(),
-                    static_cast<uint32_t>(ATLAS_SIZE), static_cast<uint32_t>(ATLAS_SIZE),
-                    VK_FORMAT_R8G8B8A8_UNORM);
-                page.needsUpload = false;
-            }
-        }
     }
 
 private:
@@ -130,53 +123,61 @@ private:
         bool needsUpload = false;
     };
 
-    // Generate SDF from a binary image using the dead reckoning algorithm
-    static void generateSDF(const std::vector<bool>& bitmap, int bw, int bh,
-                            std::vector<float>& sdf, int sw, int sh,
-                            int padX, int padY, float spread)
+    // Convert a JUCE Path to an msdfgen Shape
+    static msdfgen::Shape jucePathToShape(const juce::Path& path)
     {
-        sdf.resize(static_cast<size_t>(sw * sh), -spread);
+        msdfgen::Shape shape;
+        msdfgen::Contour* contour = nullptr;
 
-        // For each SDF texel, compute distance to nearest edge in the bitmap
-        for (int sy = 0; sy < sh; sy++)
+        juce::Path::Iterator it(path);
+        msdfgen::Point2 lastPoint(0, 0);
+
+        while (it.next())
         {
-            for (int sx = 0; sx < sw; sx++)
+            switch (it.elementType)
             {
-                // Map SDF coordinate back to bitmap coordinate
-                int bx = sx - padX;
-                int by = sy - padY;
+                case juce::Path::Iterator::startNewSubPath:
+                    contour = &shape.addContour();
+                    lastPoint = msdfgen::Point2(it.x1, it.y1);
+                    break;
 
-                // Check if this texel is inside the glyph
-                bool inside = (bx >= 0 && bx < bw && by >= 0 && by < bh)
-                              && bitmap[static_cast<size_t>(by * bw + bx)];
-
-                // Brute force nearest edge search within spread radius
-                float minDist = spread;
-                int searchR = static_cast<int>(spread) + 1;
-
-                for (int dy = -searchR; dy <= searchR; dy++)
-                {
-                    for (int dx = -searchR; dx <= searchR; dx++)
+                case juce::Path::Iterator::lineTo:
+                    if (contour)
                     {
-                        int nx = bx + dx;
-                        int ny = by + dy;
-                        bool nInside = (nx >= 0 && nx < bw && ny >= 0 && ny < bh)
-                                       && bitmap[static_cast<size_t>(ny * bw + nx)];
-
-                        if (nInside != inside)
-                        {
-                            float d = std::sqrt(static_cast<float>(dx * dx + dy * dy));
-                            minDist = std::min(minDist, d);
-                        }
+                        msdfgen::Point2 p(it.x1, it.y1);
+                        contour->addEdge(msdfgen::EdgeHolder(lastPoint, p));
+                        lastPoint = p;
                     }
-                }
+                    break;
 
-                // Signed: positive inside, negative outside
-                float signedDist = inside ? minDist : -minDist;
+                case juce::Path::Iterator::quadraticTo:
+                    if (contour)
+                    {
+                        msdfgen::Point2 c(it.x1, it.y1);
+                        msdfgen::Point2 p(it.x2, it.y2);
+                        contour->addEdge(msdfgen::EdgeHolder(lastPoint, c, p));
+                        lastPoint = p;
+                    }
+                    break;
 
-                sdf[static_cast<size_t>(sy * sw + sx)] = signedDist;
+                case juce::Path::Iterator::cubicTo:
+                    if (contour)
+                    {
+                        msdfgen::Point2 c1(it.x1, it.y1);
+                        msdfgen::Point2 c2(it.x2, it.y2);
+                        msdfgen::Point2 p(it.x3, it.y3);
+                        contour->addEdge(msdfgen::EdgeHolder(lastPoint, c1, c2, p));
+                        lastPoint = p;
+                    }
+                    break;
+
+                case juce::Path::Iterator::closePath:
+                    // msdfgen contours auto-close
+                    break;
             }
         }
+
+        return shape;
     }
 
     const AtlasEntry* rasterizeGlyph(const GlyphKey& key, const juce::Font& font)
@@ -184,94 +185,111 @@ private:
         auto* typeface = key.typeface;
         if (!typeface) return nullptr;
 
-        // Get glyph outline path
+        // Get glyph outline (normalized to height=1.0 by JUCE)
         juce::Path glyphPath;
         typeface->getOutlineForGlyph(font.getMetricsKind(), key.glyphId, glyphPath);
         if (glyphPath.isEmpty()) return nullptr;
 
-        // Scale path to fixed SDF render size
-        float sdfHeight = static_cast<float>(SDF_GLYPH_SIZE);
-        auto scaledPath = glyphPath;
-        scaledPath.applyTransform(juce::AffineTransform::scale(sdfHeight, sdfHeight));
+        auto pathBounds = glyphPath.getBounds();
+        if (pathBounds.isEmpty()) return nullptr;
 
-        auto pathBounds = scaledPath.getBounds();
-        int bw = static_cast<int>(std::ceil(pathBounds.getWidth())) + 1;
-        int bh = static_cast<int>(std::ceil(pathBounds.getHeight())) + 1;
+        // Convert JUCE path to msdfgen shape
+        msdfgen::Shape shape = jucePathToShape(glyphPath);
+        if (shape.contours.empty()) return nullptr;
 
-        if (bw <= 0 || bh <= 0) return nullptr;
+        // JUCE's getOutlineForGlyph applies scale(s, -s) which flips Y.
+        // This makes the Y-down shape coords match Vulkan's V-down texture convention,
+        // so we leave inverseYAxis=false for correct atlas storage order.
+        // The Y-flip reverses winding, which inverts inside/outside sign —
+        // we compensate in the fragment shader with (0.5 - sd) instead of (sd - 0.5).
+        shape.normalize();
+        msdfgen::edgeColoringSimple(shape, 3.0);
 
-        // Rasterize to binary bitmap using JUCE software renderer
-        juce::Image binaryImg(juce::Image::SingleChannel, bw, bh, true);
-        {
-            juce::Graphics g(binaryImg);
-            g.setColour(juce::Colours::white);
-            g.fillPath(scaledPath, juce::AffineTransform::translation(
-                -pathBounds.getX(), -pathBounds.getY()));
-        }
+        // Compute MSDF dimensions — scale glyph to fit in MSDF_GLYPH_SIZE texels
+        // with padding for the distance field spread
+        float glyphMaxDim = std::max(pathBounds.getWidth(), pathBounds.getHeight());
+        if (glyphMaxDim <= 0) return nullptr;
 
-        // Extract binary bitmap
-        std::vector<bool> bitmap(static_cast<size_t>(bw * bh), false);
-        {
-            juce::Image::BitmapData bmp(binaryImg, juce::Image::BitmapData::readOnly);
-            for (int y = 0; y < bh; y++)
-                for (int x = 0; x < bw; x++)
-                    bitmap[static_cast<size_t>(y * bw + x)] = (bmp.getPixelColour(x, y).getAlpha() > 127);
-        }
+        // Scale so the glyph fits in (MSDF_GLYPH_SIZE - 2*GLYPH_PADDING) texels
+        int innerSize = MSDF_GLYPH_SIZE - GLYPH_PADDING * 2;
+        double texelScale = static_cast<double>(innerSize) / static_cast<double>(glyphMaxDim);
 
-        // Generate SDF with padding
-        int sw = bw + SDF_PADDING * 2;
-        int sh = bh + SDF_PADDING * 2;
+        // Actual output dimensions based on glyph aspect ratio
+        int msdfW = static_cast<int>(std::ceil(pathBounds.getWidth() * texelScale)) + GLYPH_PADDING * 2;
+        int msdfH = static_cast<int>(std::ceil(pathBounds.getHeight() * texelScale)) + GLYPH_PADDING * 2;
+        msdfW = std::max(msdfW, 4);
+        msdfH = std::max(msdfH, 4);
 
-        if (sw > ATLAS_SIZE || sh > ATLAS_SIZE) return nullptr;
+        if (msdfW > ATLAS_SIZE / 2 || msdfH > ATLAS_SIZE / 2) return nullptr;
 
-        std::vector<float> sdf;
-        generateSDF(bitmap, bw, bh, sdf, sw, sh, SDF_PADDING, SDF_PADDING, SDF_SPREAD);
+        // Generate MSDF using msdfgen
+        msdfgen::Bitmap<float, 3> msdf(msdfW, msdfH);
+
+        // Transform: scale glyph coordinates to texel coordinates, with padding offset
+        msdfgen::Vector2 translate(
+            -static_cast<double>(pathBounds.getX()) + GLYPH_PADDING / texelScale,
+            -static_cast<double>(pathBounds.getY()) + GLYPH_PADDING / texelScale);
+
+        // Generate MSDF: Projection maps shape coords → pixel coords.
+        // Range must be in shape units — convert pixel range by dividing by scale.
+        // msdfgen computes distances in shape space, so Range(px/scale) ensures
+        // MSDF_PIXEL_RANGE pixels of distance map to the full [0,1] output.
+        msdfgen::Projection projection(msdfgen::Vector2(texelScale), translate);
+        double rangeInShapeUnits = MSDF_PIXEL_RANGE / texelScale;
+        msdfgen::generateMSDF(msdf, shape, projection, msdfgen::Range(rangeInShapeUnits));
 
         // Find space in atlas
-        auto* page = findSpace(sw, sh);
+        auto* page = findSpace(msdfW + 1, msdfH + 1);
         if (!page) return nullptr;
 
         int atlasIdx = static_cast<int>(page - atlasPages.data());
         int px = page->cursorX;
         int py = page->cursorY;
 
-        // Write SDF to atlas pixels (distance encoded in alpha channel)
-        for (int y = 0; y < sh; y++)
+        // Copy MSDF to atlas pixels (RGB = distance channels, A = 255)
+        for (int y = 0; y < msdfH; y++)
         {
-            for (int x = 0; x < sw; x++)
+            for (int x = 0; x < msdfW; x++)
             {
-                float d = sdf[static_cast<size_t>(y * sw + x)];
-                // Normalize distance to 0-1 range: 0.5 = edge, >0.5 = inside, <0.5 = outside
-                float normalized = (d / SDF_SPREAD) * 0.5f + 0.5f;
-                uint8_t alpha = static_cast<uint8_t>(juce::jlimit(0.0f, 255.0f, normalized * 255.0f));
+                // msdfgen output is float [0,1] after normalization
+                // Clamp and convert to 8-bit
+                const float* pixel = msdf(x, y);
+                auto toU8 = [](float v) -> uint8_t {
+                    return static_cast<uint8_t>(juce::jlimit(0.0f, 255.0f, v * 255.0f));
+                };
+
                 size_t idx = static_cast<size_t>((py + y) * ATLAS_SIZE + (px + x));
-                // Store in RGBA with alpha = SDF value, RGB = white (color comes from vertex)
-                page->pixels[idx] = 0x00FFFFFF | (static_cast<uint32_t>(alpha) << 24);
+                page->pixels[idx] =
+                    static_cast<uint32_t>(toU8(pixel[0]))
+                  | (static_cast<uint32_t>(toU8(pixel[1])) << 8)
+                  | (static_cast<uint32_t>(toU8(pixel[2])) << 16)
+                  | (0xFFu << 24); // full alpha
             }
         }
         page->needsUpload = true;
 
-        // Advance cursor
-        page->cursorX = px + sw + 1;
-        page->shelfHeight = std::max(page->shelfHeight, sh + 1);
+        // Advance shelf cursor
+        page->cursorX = px + msdfW + 1;
+        page->shelfHeight = std::max(page->shelfHeight, msdfH + 1);
 
-        // Store entry with positioning metrics
+        // Store entry with normalized glyph metrics
         float invSize = 1.0f / static_cast<float>(ATLAS_SIZE);
         AtlasEntry entry;
         entry.u0 = static_cast<float>(px) * invSize;
         entry.v0 = static_cast<float>(py) * invSize;
-        entry.u1 = static_cast<float>(px + sw) * invSize;
-        entry.v1 = static_cast<float>(py + sh) * invSize;
-        entry.w = sw;
-        entry.h = sh;
+        entry.u1 = static_cast<float>(px + msdfW) * invSize;
+        entry.v1 = static_cast<float>(py + msdfH) * invSize;
+        entry.w = msdfW;
+        entry.h = msdfH;
         entry.atlasIndex = atlasIdx;
-        entry.offsetX = pathBounds.getX();
-        entry.offsetY = pathBounds.getY();
-        entry.pathW = pathBounds.getWidth();
-        entry.pathH = pathBounds.getHeight();
+        // Store bounds in normalized font units (height=1.0) for positioning
+        entry.boundsX = pathBounds.getX();
+        entry.boundsY = pathBounds.getY();
+        entry.boundsW = pathBounds.getWidth();
+        entry.boundsH = pathBounds.getHeight();
 
-        auto [it, _] = entries.emplace(key, entry);
-        return &it->second;
+        auto [insertIt, _] = entries.emplace(key, entry);
+        return &insertIt->second;
     }
 
     AtlasPage* findSpace(int w, int h)
@@ -280,7 +298,6 @@ private:
         {
             if (page.cursorX + w <= ATLAS_SIZE && page.cursorY + h <= ATLAS_SIZE)
                 return &page;
-
             if (page.cursorX + w > ATLAS_SIZE)
             {
                 page.cursorY += page.shelfHeight;
@@ -298,7 +315,9 @@ private:
         if (!device || !descriptorHelper) return nullptr;
 
         AtlasPage page;
-        page.pixels.resize(static_cast<size_t>(ATLAS_SIZE * ATLAS_SIZE), 0);
+        // Initialize to white (sd=1.0 per channel = "far outside glyph") so that
+        // linear filtering near quad edges doesn't bleed opaque border artifacts.
+        page.pixels.resize(static_cast<size_t>(ATLAS_SIZE * ATLAS_SIZE), 0xFFFFFFFF);
 
         page.texture.create({ physDevice, device,
             static_cast<uint32_t>(ATLAS_SIZE), static_cast<uint32_t>(ATLAS_SIZE),
@@ -306,10 +325,12 @@ private:
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT });
         page.texture.createSampler(VK_FILTER_LINEAR);
 
-        page.texture.upload(physDevice, commandPool, graphicsQueue,
-            page.pixels.data(),
-            static_cast<uint32_t>(ATLAS_SIZE), static_cast<uint32_t>(ATLAS_SIZE),
-            VK_FORMAT_R8G8B8A8_UNORM);
+        // Don't upload here — createPage() may be called during command buffer
+        // recording (inside paintEntireComponent). Uploading would submit a
+        // separate command buffer from the same pool/queue, which conflicts
+        // with MoltenVK. Instead, mark as dirty and let uploadDirtyPages()
+        // handle it after painting completes.
+        page.needsUpload = true;
 
         page.descriptorSet = descriptorHelper->allocateSet();
         core::DescriptorHelper::writeImage(device, page.descriptorSet, 0,

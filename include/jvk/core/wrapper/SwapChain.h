@@ -36,7 +36,7 @@ static inline uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t 
     }
     // Handle Error
     return 0;
-};
+}
 
 
 struct SwapChainSupportDetails
@@ -66,15 +66,15 @@ public:
     SwapChain(SwapChainInfo sc_info, VkSwapchainKHR previous);
     ~SwapChain();
 
-    VkSwapchainKHR getInternal() const { return swapChain; };
-    VkFormat getFormat() const { return format; };
-    VkExtent2D getExtent() const { return extent; };
+    VkSwapchainKHR getInternal() const { return swapChain; }
+    VkFormat getFormat() const { return format; }
+    VkExtent2D getExtent() const { return extent; }
     int getNumImages() const { return static_cast<int>(images.size()); }
-    int getWidth() const { return info.size.x; };
-    int getHeight() const { return info.size.y; };
+    int getWidth() const { return info.size.x; }
+    int getHeight() const { return info.size.y; }
 
     void createFrameBuffers(VkRenderPass renderPass);
-    VkFramebuffer getFrameBuffer(int i) { return frameBuffers[i]; };
+    VkFramebuffer getFrameBuffer(int i) { return frameBuffers[i]; }
 private:
     SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device);
     VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& availableFormats);

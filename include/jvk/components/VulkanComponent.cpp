@@ -115,11 +115,7 @@ VulkanRenderer::VulkanRenderer()
     renderer = this;
     initializeVulkan();
     if (status == core::VulkanStatus::Ready)
-    {
         setPipeline(getDefaultPipeline());
-        if (settings.maxFrameRate > 0)
-            startTimerHz(settings.maxFrameRate);
-    }
 }
 
 VulkanRenderer::VulkanRenderer(const core::VulkanRendererSettings& s)
@@ -128,11 +124,7 @@ VulkanRenderer::VulkanRenderer(const core::VulkanRendererSettings& s)
     renderer = this;
     initializeVulkan();
     if (status == core::VulkanStatus::Ready)
-    {
         setPipeline(getDefaultPipeline());
-        if (settings.maxFrameRate > 0)
-            startTimerHz(settings.maxFrameRate);
-    }
 }
 
 // =============================================================================
@@ -154,23 +146,23 @@ void VulkanRenderer::setPresentMode(VkPresentModeKHR mode)
     rebuildAll();
 }
 
-void VulkanRenderer::setMaxFrameRate(int fps)
+void VulkanRenderer::setRendering(bool enabled)
 {
-    settings.maxFrameRate = fps;
-    stopTimer();
-    if (fps > 0) startTimerHz(fps);
-}
-
-void VulkanRenderer::markDirty()
-{
-    if (settings.maxFrameRate == 0)
-        triggerAsyncUpdate();
+    rendering = enabled;
+    if (enabled)
+        startTimerHz(1000);
+    else
+        stopTimer();
 }
 
 void VulkanRenderer::rebuildAll()
 {
     if (status != core::VulkanStatus::Ready) return;
+
+    bool wasRendering = rendering;
     stopTimer();
+
+    if (device) vkDeviceWaitIdle(device);
 
     notifyChildrenRemoved();
     rebuildSwapchainAndPipelines();
@@ -178,8 +170,8 @@ void VulkanRenderer::rebuildAll()
 
     setPipeline(getDefaultPipeline());
 
-    if (settings.maxFrameRate > 0)
-        startTimerHz(settings.maxFrameRate);
+    if (wasRendering)
+        startTimerHz(1000);
 }
 
 void VulkanRenderer::notifyChildrenRemoved()

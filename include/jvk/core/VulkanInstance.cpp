@@ -447,7 +447,7 @@ bool VulkanInstance::createRenderPass()
 
     // Attachment 2: Depth
     VkAttachmentDescription depthAttachment = {};
-    depthAttachment.format = VK_FORMAT_D24_UNORM_S8_UINT;
+    depthAttachment.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
     depthAttachment.samples = settings.msaaSamples;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -649,6 +649,10 @@ void VulkanInstance::submitCommandBuffer(int i)
 
     renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
     renderPassInfo.pClearValues = clearValues.data();
+
+    // Pre-render-pass phase: record deferred uploads (staging → image transfers).
+    // Must happen before the render pass so images are in SHADER_READ_ONLY layout.
+    prepareComponents(commandBuffers[i]);
 
     vkCmdBeginRenderPass(commandBuffers[i], &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 

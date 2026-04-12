@@ -32,10 +32,11 @@ public:
     VulkanComponent() { }
     virtual ~VulkanComponent() { if (renderer != nullptr) removedFromRenderer(*renderer); }
 
-    virtual void addedToRenderer(const jvk::VulkanRenderer& renderer) { };
-    virtual void removedFromRenderer(const jvk::VulkanRenderer& renderer) { };
-    virtual void render(VkCommandBuffer& commandBuffer) { };
-    virtual void resized() { };
+    virtual void addedToRenderer(const jvk::VulkanRenderer& renderer) { }
+    virtual void removedFromRenderer(const jvk::VulkanRenderer& renderer) { }
+    virtual void prepareFrame(VkCommandBuffer& commandBuffer) { }
+    virtual void render(VkCommandBuffer& commandBuffer) { }
+    virtual void resized() { }
 
     void setPipeline(VkPipeline new_pipeline) { pipeline = new_pipeline; }
     VkPipeline getPipeline() const { return pipeline; }
@@ -62,7 +63,7 @@ private:
     void renderChildren(VkCommandBuffer& commandBuffer);
     VulkanRenderer* renderer { nullptr };
     VulkanComponent* parent { nullptr };
-    std::vector<VulkanComponent*> children { };
+    std::vector<VulkanComponent*> children;
     juce::Rectangle<float> bounds { 0,0,0,0 };
     VkPipeline pipeline { VK_NULL_HANDLE };
     int order { 0 };
@@ -78,13 +79,12 @@ using OSWindowComponent = core::windows::VulkanHWNDComponent;
 class VulkanRenderer :
     private VulkanComponent,
     public OSWindowComponent,
-    public juce::Timer,
-    public juce::AsyncUpdater
+    private juce::Timer
 {
 public:
     VulkanRenderer();
     explicit VulkanRenderer(const core::VulkanRendererSettings& s);
-    virtual ~VulkanRenderer() { };
+    virtual ~VulkanRenderer() { }
 
     // --- Status ---
     core::VulkanStatus getStatus() const { return status; }
@@ -105,8 +105,8 @@ public:
     // --- Runtime settings changes ---
     void setMSAA(VkSampleCountFlagBits samples);
     void setPresentMode(VkPresentModeKHR mode);
-    void setMaxFrameRate(int fps);
-    void markDirty();
+    void setRendering(bool enabled);
+    bool isRendering() const { return rendering; }
 
     // --- Bounds ---
     void setBounds(juce::Rectangle<int> new_bounds) { OSWindowComponent::setBounds(new_bounds); }
@@ -121,9 +121,17 @@ public:
     const std::vector<VulkanComponent*> getChildren() const { return children; }
 
 protected:
-    virtual void render(VkCommandBuffer& commandBuffer) override { };
+    virtual void render(VkCommandBuffer& commandBuffer) override { }
 
 private:
+    void prepareComponents(VkCommandBuffer& commandBuffer) override
+    {
+        prepareFrame(commandBuffer);
+        const std::vector<VulkanComponent*> components = VulkanComponent::getChildren();
+        for (VulkanComponent* comp : components)
+            comp->prepareFrame(commandBuffer);
+    }
+
     void renderComponents(VkCommandBuffer& commandBuffer) override
     {
         renderInternal(commandBuffer);
@@ -137,14 +145,13 @@ private:
 
     void timerCallback() override
     {
-        if (status != core::VulkanStatus::Ready) return;
-        checkForResize();
-        execute();
-    }
+        if (!rendering || status != core::VulkanStatus::Ready) return;
 
-    void handleAsyncUpdate() override
-    {
-        if (status != core::VulkanStatus::Ready) return;
+        // Non-blocking fence check — only render when a frame slot is free.
+        // Avoids blocking the message thread on vkWaitForFences inside execute().
+        if (vkGetFenceStatus(device, inFlightFences[currentFrame]) != VK_SUCCESS)
+            return; // GPU still working on this slot, try again next tick
+
         checkForResize();
         execute();
     }
@@ -152,6 +159,8 @@ private:
     void rebuildAll();
     void notifyChildrenRemoved();
     void notifyChildrenAdded();
+
+    bool rendering = false;
 };
 
 } // jvk

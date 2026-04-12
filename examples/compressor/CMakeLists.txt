@@ -1,21 +1,3 @@
-cmake_minimum_required(VERSION 3.20)
-project(VulkanCompressor VERSION 1.0)
-
-if (NOT COMMAND juce_add_plugin)
-    include(FetchContent)
-    FetchContent_Declare(
-        JUCE
-        GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
-        GIT_TAG        master
-        GIT_SHALLOW    TRUE
-    )
-    FetchContent_MakeAvailable(JUCE)
-endif()
-
-if (NOT TARGET jvk)
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../.. ${CMAKE_CURRENT_BINARY_DIR}/jvk)
-endif()
-
 juce_add_plugin(VulkanCompressor
     PRODUCT_NAME "VulkanCompressor"
     COMPANY_NAME "DiscreetSignals"
@@ -85,7 +67,7 @@ endif()
 if (APPLE AND NOT CMAKE_GENERATOR MATCHES "Xcode")
     foreach(_fmt Standalone AU)
         if (TARGET VulkanCompressor_${_fmt})
-            set(_ent "${CMAKE_BINARY_DIR}/VulkanCompressor_artefacts/JuceLibraryCode/VulkanCompressor_${_fmt}.entitlements")
+            set(_ent "${CMAKE_CURRENT_BINARY_DIR}/VulkanCompressor_artefacts/JuceLibraryCode/VulkanCompressor_${_fmt}.entitlements")
             add_custom_command(TARGET VulkanCompressor_${_fmt} POST_BUILD
                 COMMAND codesign --force --sign - --options runtime
                     --entitlements "${_ent}"

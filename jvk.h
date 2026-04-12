@@ -58,6 +58,8 @@
 #include "include/jvk/core/Buffer.h"
 #include "include/jvk/core/DescriptorHelper.h"
 #include "include/jvk/core/Image.h"
+#include "include/jvk/core/StagingBelt.h"
+#include "include/jvk/core/DeletionQueue.h"
 #include "include/jvk/core/wrapper/Shader.h"
 #include "include/jvk/core/wrapper/Pipeline.h"
 #include "include/jvk/core/wrapper/Wrapper.h"
