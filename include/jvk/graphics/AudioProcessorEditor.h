@@ -32,6 +32,7 @@ public:
         : juce::AudioProcessorEditor(p), paintBridge(*this)
     {
         addAndMakeVisible(vulkanRenderer);
+        vulkanRenderer.setInterceptsMouseClicks(false, false);
         vulkanRenderer.addChildComponent(&paintBridge);
         addComponentListener(this);
         setCachedComponentImage(new NullCachedImage());
@@ -42,6 +43,7 @@ public:
         : juce::AudioProcessorEditor(p), paintBridge(*this)
     {
         addAndMakeVisible(vulkanRenderer);
+        vulkanRenderer.setInterceptsMouseClicks(false, false);
         vulkanRenderer.addChildComponent(&paintBridge);
         addComponentListener(this);
         setCachedComponentImage(new NullCachedImage());
@@ -176,6 +178,45 @@ private:
                     std::move(vertLayout), std::move(config));
             }
 
+            // --- Main pipeline with stencil clip test ---
+            // Same as main pipeline, but only draws where stencil != 0.
+            // Used when a path clip is active (stencilClipDepth > 0).
+            {
+                VertexLayout clipVertLayout;
+                clipVertLayout.binding = { 0, sizeof(UIVertex), VK_VERTEX_INPUT_RATE_VERTEX };
+                clipVertLayout.attributes = {
+                    { 0, 0, VK_FORMAT_R32G32_SFLOAT,       offsetof(UIVertex, position) },
+                    { 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, color) },
+                    { 2, 0, VK_FORMAT_R32G32_SFLOAT,        offsetof(UIVertex, uv) },
+                    { 3, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, shapeInfo) }
+                };
+
+                shaders::ShaderGroup clipSg;
+                clipSg.addShader(VK_SHADER_STAGE_VERTEX_BIT,
+                                  shaders::ui2d::vert_spv, shaders::ui2d::vert_spvSize);
+                clipSg.addShader(VK_SHADER_STAGE_FRAGMENT_BIT,
+                                  shaders::ui2d::frag_spv, shaders::ui2d::frag_spvSize);
+                clipSg.addDescriptorSetLayout(dsLayout);
+
+                PipelineConfig clipConfig;
+                clipConfig.cullMode = VK_CULL_MODE_NONE;
+                clipConfig.depthTestEnable = false;
+                clipConfig.depthWriteEnable = false;
+                clipConfig.blendMode = BlendMode::AlphaBlend;
+                clipConfig.pushConstantRanges = pushRanges;
+                // Stencil test: only draw where stencil >= ref (ref set dynamically)
+                clipConfig.stencilTestEnable = true;
+                clipConfig.stencilCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+                clipConfig.stencilPassOp = VK_STENCIL_OP_KEEP;
+                clipConfig.stencilFailOp = VK_STENCIL_OP_KEEP;
+                clipConfig.stencilWriteMask = 0x00; // don't modify stencil during drawing
+
+                mainClipPipeline = std::make_unique<Pipeline>(
+                    device, renderer.getRenderPass(),
+                    std::move(clipSg), renderer.getMSAASamples(),
+                    std::move(clipVertLayout), std::move(clipConfig));
+            }
+
             // --- Stencil write pipeline ---
             {
                 VertexLayout stencilVertLayout;
@@ -250,6 +291,8 @@ private:
                     std::move(coverSg), renderer.getMSAASamples(),
                     std::move(coverVertLayout), std::move(coverConfig));
             }
+
+
 
             // --- Multiply blend pipeline (for color grading effects) ---
             {
@@ -378,6 +421,7 @@ private:
         {
             if (!device) return;
             mainPipeline.reset();
+            mainClipPipeline.reset();
             stencilPipeline.reset();
             stencilCoverPipeline.reset();
             multiplyPipeline.reset();
@@ -473,6 +517,7 @@ private:
                 &blurTempImage, blurDescriptorSet, &texCache, &glyphAtlas, &gradCache,
                 &deletionQueues[frameIdx],
                 ringBuffer.isValid() ? &ringBuffer : nullptr);
+            ctx.mainClipPipeline = mainClipPipeline.get();
 
             juce::Graphics g(ctx);
             editor.inVulkanRender = true;
@@ -492,6 +537,7 @@ private:
 
         AudioProcessorEditor& editor;
         std::unique_ptr<Pipeline> mainPipeline;
+        std::unique_ptr<Pipeline> mainClipPipeline;
         std::unique_ptr<Pipeline> stencilPipeline;
         std::unique_ptr<Pipeline> stencilCoverPipeline;
         std::unique_ptr<Pipeline> multiplyPipeline;

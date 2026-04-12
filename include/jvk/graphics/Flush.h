@@ -83,10 +83,19 @@ inline void uploadAndDraw(VulkanGraphicsContext& ctx, const UIVertex* data, uint
 // vertices[] and is drawn with the main pipeline + default descriptor set.
 // Ensure the main pipeline + default descriptor set are bound.
 // Call this before any normal drawing that accumulates vertices.
+// When a stencil clip is active, use the clip-testing pipeline variant.
 inline void ensureMainPipeline(VulkanGraphicsContext& ctx)
 {
-    ensurePipeline(ctx, ctx.colorPipeline, ctx.pipelineLayout);
-    ensureDescriptorSet(ctx, ctx.pipelineLayout, ctx.defaultDescriptorSet);
+    if (ctx.state().stencilClipDepth > 0 && ctx.mainClipPipeline)
+    {
+        ensurePipeline(ctx, ctx.mainClipPipeline->getInternal(), ctx.mainClipPipeline->getLayout());
+        ensureDescriptorSet(ctx, ctx.mainClipPipeline->getLayout(), ctx.defaultDescriptorSet);
+    }
+    else
+    {
+        ensurePipeline(ctx, ctx.colorPipeline, ctx.pipelineLayout);
+        ensureDescriptorSet(ctx, ctx.pipelineLayout, ctx.defaultDescriptorSet);
+    }
 }
 
 // Drain the vertex buffer with whatever pipeline is currently bound.

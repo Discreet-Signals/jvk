@@ -67,6 +67,10 @@ public:
         float opacity = 1.0f;
         juce::Font font { juce::FontOptions {} };
         juce::Rectangle<int> clipBounds; // physical pixels
+
+        // Stencil-based path clipping
+        uint8_t stencilClipDepth = 0;    // current nesting depth (0 = no clip)
+        std::vector<UIVertex> clipFanVerts; // fan verts to unstencil on restore
     };
 
     SavedState& state() { return stateStack.back(); }
@@ -146,6 +150,7 @@ public:
     TextureCache* textureCache = nullptr;
     GlyphAtlas* glyphAtlas = nullptr;
     GradientCache* gradientCache = nullptr;
+    Pipeline* mainClipPipeline = nullptr;  // main pipeline + stencil test for path clipping
     Pipeline* multiplyPipeline = nullptr;
     Pipeline* hsvPipeline = nullptr;
     Pipeline* blurPipeline = nullptr;
@@ -181,6 +186,70 @@ public:
 #include "DrawLine.h"
 #include "DrawGlyphs.h"
 #include "Effects.h"
+
+// ============================================================================
+// Deferred Clipping implementations (need FillPath.h for writeStencilClip)
+// ============================================================================
+namespace jvk::graphics
+{
+
+inline void clipToPath(VulkanGraphicsContext& ctx, const juce::Path& path, const juce::AffineTransform& t)
+{
+    auto combined = getFullTransform(ctx, t);
+
+    // Always intersect bounding box for fast scissor rejection
+    auto pathBounds = path.getBoundsTransformed(combined).getSmallestIntegerContainer();
+    ctx.state().clipBounds = ctx.state().clipBounds.getIntersection(pathBounds);
+
+    // Write the path into the stencil buffer for pixel-accurate clipping.
+    auto fanVerts = writeStencilClip(ctx, path, combined);
+    if (!fanVerts.empty())
+    {
+        auto& s = ctx.state();
+        s.stencilClipDepth++;
+        s.clipFanVerts = std::move(fanVerts);
+        vkCmdSetStencilReference(ctx.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s.stencilClipDepth);
+        // Force rebind to the clip-testing pipeline now that depth > 0.
+        // writeStencilClip called ensureMainPipeline while depth was still 0,
+        // which bound the regular (non-testing) pipeline.
+        ctx.boundPipeline = VK_NULL_HANDLE;
+        ensureMainPipeline(ctx);
+    }
+}
+
+inline void restoreState(VulkanGraphicsContext& ctx)
+{
+    flush(ctx);
+    if (ctx.stateStack.size() <= 1) return;
+
+    auto& popped = ctx.stateStack.back();
+
+    // If the popped state had a stencil clip, decrement by re-drawing
+    // the same fan with reversed winding (flips increment→decrement).
+    if (popped.stencilClipDepth > 0 && !popped.clipFanVerts.empty() && ctx.stencilPipeline)
+    {
+        auto reversed = popped.clipFanVerts;
+        for (size_t i = 0; i + 2 < reversed.size(); i += 3)
+            std::swap(reversed[i + 1], reversed[i + 2]);
+
+        VkRect2D fullScissor = { { 0, 0 }, { static_cast<uint32_t>(ctx.vpWidth),
+                                              static_cast<uint32_t>(ctx.vpHeight) } };
+        vkCmdSetScissor(ctx.cmd, 0, 1, &fullScissor);
+        ensurePipeline(ctx, ctx.stencilPipeline->getInternal(), ctx.stencilPipeline->getLayout());
+        uploadAndDraw(ctx, reversed.data(), static_cast<uint32_t>(reversed.size()));
+        ensureMainPipeline(ctx);
+    }
+
+    ctx.stateStack.pop_back();
+
+    vkCmdSetStencilReference(ctx.cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
+                              ctx.state().stencilClipDepth);
+    // Force rebind — may need to switch between clip and regular pipeline
+    ctx.boundPipeline = VK_NULL_HANDLE;
+    ensureMainPipeline(ctx);
+}
+
+} // jvk::graphics
 
 // ============================================================================
 // VulkanGraphicsContext method definitions (delegate to free functions above)

@@ -216,6 +216,7 @@ inline void fillPathStencil(VulkanGraphicsContext& ctx, const juce::Path& path,
         VkRect2D fullScissor = { { 0, 0 }, { static_cast<uint32_t>(ctx.vpWidth), static_cast<uint32_t>(ctx.vpHeight) } };
         vkCmdSetScissor(ctx.cmd, 0, 1, &fullScissor);
     }
+
     ensurePipeline(ctx, ctx.stencilPipeline->getInternal(), ctx.stencilPipeline->getLayout());
     uploadAndDraw(ctx, ctx.scratchFanVerts.data(), static_cast<uint32_t>(ctx.scratchFanVerts.size()));
 
@@ -296,6 +297,134 @@ inline void fillPathStencil(VulkanGraphicsContext& ctx, const juce::Path& path,
     }
     flush(ctx);
     ensureMainPipeline(ctx);
+}
+
+// Write a path into the stencil buffer (increment) without a cover pass.
+// Returns the fan vertices so they can be stored for later decrement (unstencil).
+// Used by clipToPath for stencil-based path clipping.
+inline std::vector<UIVertex> writeStencilClip(VulkanGraphicsContext& ctx,
+                                                const juce::Path& path,
+                                                const juce::AffineTransform& combined)
+{
+    if (!ctx.stencilPipeline) return {};
+
+    // Reuse the same fan generation as fillPathStencil
+    ctx.scratchFanVerts.clear();
+    ctx.scratchPoints.clear();
+
+    {
+        const float SUBPATH_MARKER = -std::numeric_limits<float>::infinity();
+        constexpr float flatTol = 0.5f;
+        juce::Path::Iterator iter(path);
+        glm::vec2 lastPt(0), subpathStart(0);
+
+        auto transformPt = [&](float x, float y) -> glm::vec2 {
+            combined.transformPoint(x, y);
+            return { x, y };
+        };
+
+        auto flattenCubic = [&](glm::vec2 p0, glm::vec2 c1, glm::vec2 c2, glm::vec2 p3)
+        {
+            struct Segment { glm::vec2 a, b, c, d; };
+            std::vector<Segment> stack;
+            stack.push_back({ p0, c1, c2, p3 });
+            while (!stack.empty())
+            {
+                auto [a, b, c, d] = stack.back();
+                stack.pop_back();
+                float dx = d.x - a.x, dy = d.y - a.y;
+                float len2 = dx * dx + dy * dy;
+                float d1, d2;
+                if (len2 > 0.0001f)
+                {
+                    float inv = 1.0f / len2;
+                    float t1 = ((b.x - a.x) * dx + (b.y - a.y) * dy) * inv;
+                    float t2 = ((c.x - a.x) * dx + (c.y - a.y) * dy) * inv;
+                    d1 = (a.x + t1*dx - b.x)*(a.x + t1*dx - b.x) + (a.y + t1*dy - b.y)*(a.y + t1*dy - b.y);
+                    d2 = (a.x + t2*dx - c.x)*(a.x + t2*dx - c.x) + (a.y + t2*dy - c.y)*(a.y + t2*dy - c.y);
+                }
+                else
+                {
+                    d1 = (b.x-a.x)*(b.x-a.x) + (b.y-a.y)*(b.y-a.y);
+                    d2 = (c.x-a.x)*(c.x-a.x) + (c.y-a.y)*(c.y-a.y);
+                }
+                if (d1 <= flatTol*flatTol && d2 <= flatTol*flatTol)
+                    ctx.scratchPoints.push_back(d);
+                else
+                {
+                    auto mid = [](glm::vec2 u, glm::vec2 v) { return (u+v)*0.5f; };
+                    auto ab = mid(a,b), bc = mid(b,c), cd = mid(c,d);
+                    auto abc = mid(ab,bc), bcd = mid(bc,cd), abcd = mid(abc,bcd);
+                    stack.push_back({ abcd, bcd, cd, d });
+                    stack.push_back({ a, ab, abc, abcd });
+                }
+            }
+        };
+
+        auto flattenQuad = [&](glm::vec2 p0, glm::vec2 c, glm::vec2 p2)
+        {
+            flattenCubic(p0, p0 + (2.0f/3.0f)*(c-p0), p2 + (2.0f/3.0f)*(c-p2), p2);
+        };
+
+        while (iter.next())
+        {
+            switch (iter.elementType)
+            {
+                case juce::Path::Iterator::startNewSubPath:
+                    { auto pt = transformPt(iter.x1, iter.y1);
+                      ctx.scratchPoints.push_back({ SUBPATH_MARKER, 0 });
+                      ctx.scratchPoints.push_back(pt);
+                      subpathStart = pt; lastPt = pt; break; }
+                case juce::Path::Iterator::lineTo:
+                    { auto pt = transformPt(iter.x1, iter.y1);
+                      ctx.scratchPoints.push_back(pt); lastPt = pt; break; }
+                case juce::Path::Iterator::quadraticTo:
+                    { auto c = transformPt(iter.x1, iter.y1);
+                      auto p = transformPt(iter.x2, iter.y2);
+                      flattenQuad(lastPt, c, p); lastPt = p; break; }
+                case juce::Path::Iterator::cubicTo:
+                    { auto c1 = transformPt(iter.x1, iter.y1);
+                      auto c2 = transformPt(iter.x2, iter.y2);
+                      auto p  = transformPt(iter.x3, iter.y3);
+                      flattenCubic(lastPt, c1, c2, p); lastPt = p; break; }
+                case juce::Path::Iterator::closePath:
+                    ctx.scratchPoints.push_back(subpathStart);
+                    lastPt = subpathStart; break;
+            }
+        }
+
+        glm::vec4 dummy(0);
+        glm::vec2 fanCenter(0), prevPt2(0);
+        bool inSubpath = false;
+        for (size_t i = 0; i < ctx.scratchPoints.size(); i++)
+        {
+            if (ctx.scratchPoints[i].x == SUBPATH_MARKER)
+            {
+                if (++i >= ctx.scratchPoints.size()) break;
+                fanCenter = ctx.scratchPoints[i]; prevPt2 = fanCenter;
+                inSubpath = true; continue;
+            }
+            if (!inSubpath) continue;
+            glm::vec2 pt = ctx.scratchPoints[i];
+            ctx.scratchFanVerts.push_back({ fanCenter, dummy, {}, dummy });
+            ctx.scratchFanVerts.push_back({ prevPt2,   dummy, {}, dummy });
+            ctx.scratchFanVerts.push_back({ pt,        dummy, {}, dummy });
+            prevPt2 = pt;
+        }
+    }
+
+    if (ctx.scratchFanVerts.empty()) return {};
+
+    flush(ctx);
+
+    // Stencil write — full viewport scissor, increment on front, decrement on back (non-zero winding)
+    VkRect2D fullScissor = { { 0, 0 }, { static_cast<uint32_t>(ctx.vpWidth), static_cast<uint32_t>(ctx.vpHeight) } };
+    vkCmdSetScissor(ctx.cmd, 0, 1, &fullScissor);
+    ensurePipeline(ctx, ctx.stencilPipeline->getInternal(), ctx.stencilPipeline->getLayout());
+    uploadAndDraw(ctx, ctx.scratchFanVerts.data(), static_cast<uint32_t>(ctx.scratchFanVerts.size()));
+    ensureMainPipeline(ctx);
+
+    return { ctx.scratchFanVerts.begin(), ctx.scratchFanVerts.end() };
 }
 
 // ==== Drawing: fillPath ====

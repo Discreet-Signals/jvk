@@ -105,12 +105,8 @@ inline void excludeClipRectangle(VulkanGraphicsContext& ctx, const juce::Rectang
     // The remaining visible area is approximated by the unchanged clip bounds.
 }
 
-inline void clipToPath(VulkanGraphicsContext& ctx, const juce::Path& path, const juce::AffineTransform& t)
-{
-    auto combined = getFullTransform(ctx, t);
-    auto pathBounds = path.getBoundsTransformed(combined).getSmallestIntegerContainer();
-    ctx.state().clipBounds = ctx.state().clipBounds.getIntersection(pathBounds);
-}
+// clipToPath — defined after FillPath.h include (needs writeStencilClip)
+inline void clipToPath(VulkanGraphicsContext& ctx, const juce::Path& path, const juce::AffineTransform& t);
 
 // Image-based alpha clipping is not supported in the GPU pipeline.
 // Falls back to bounding-box clip (matches JUCE's OpenGL renderer behavior).
@@ -158,13 +154,13 @@ inline void saveState(VulkanGraphicsContext& ctx)
 {
     flush(ctx);
     ctx.stateStack.push_back(ctx.stateStack.back());
+    // Clear clip fan verts on the new state — only the state that
+    // called clipToPath should unstencil on restore.
+    ctx.stateStack.back().clipFanVerts.clear();
 }
 
-inline void restoreState(VulkanGraphicsContext& ctx)
-{
-    flush(ctx);
-    if (ctx.stateStack.size() > 1) ctx.stateStack.pop_back();
-}
+// restoreState — defined after FillPath.h include (needs stencil pipeline access)
+inline void restoreState(VulkanGraphicsContext& ctx);
 
 // ==== Transparency layers ====
 inline void beginTransparencyLayer(VulkanGraphicsContext& ctx, float opacity)

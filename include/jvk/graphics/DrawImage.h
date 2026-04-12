@@ -76,15 +76,12 @@ inline void drawImage(VulkanGraphicsContext& ctx, const juce::Image& image,
                       | (static_cast<uint32_t>(c.getAlpha()) << 24);
                 }
 
-            // Stage upload — no GPU stall
-            if (ctx.textureCache->stagingBelt && ctx.textureCache->pendingUploads)
-                ctx.textureCache->stagingBelt->stageImageUpload(entry.texture, *ctx.textureCache->pendingUploads,
-                    pixels.data(), static_cast<uint32_t>(w), static_cast<uint32_t>(h));
-            else
-                entry.texture.upload(ctx.textureCache->physDevice, ctx.textureCache->commandPool,
-                    ctx.textureCache->graphicsQueue, pixels.data(),
-                    static_cast<uint32_t>(w), static_cast<uint32_t>(h),
-                    VK_FORMAT_R8G8B8A8_UNORM);
+            // Synchronous upload — texture is immediately available for sampling.
+            // Avoids 1-frame flash that deferred staging would cause.
+            entry.texture.upload(ctx.textureCache->physDevice, ctx.textureCache->commandPool,
+                ctx.textureCache->graphicsQueue, pixels.data(),
+                static_cast<uint32_t>(w), static_cast<uint32_t>(h),
+                VK_FORMAT_R8G8B8A8_UNORM);
 
             entry.descriptorSet = ctx.textureCache->descriptorHelper->allocateSet();
             if (entry.descriptorSet == VK_NULL_HANDLE)
@@ -106,9 +103,7 @@ inline void drawImage(VulkanGraphicsContext& ctx, const juce::Image& image,
             it->second.lastUsedFrame = ctx.textureCache->currentFrame;
         }
 
-        // Use fallback descriptor if upload hasn't been processed yet
-        bool pending = newEntry && ctx.textureCache->stagingBelt && ctx.textureCache->pendingUploads;
-        VkDescriptorSet texDescSet = pending ? ctx.defaultDescriptorSet : it->second.descriptorSet;
+        VkDescriptorSet texDescSet = it->second.descriptorSet;
 
         if (ctx.boundDescriptorSet != texDescSet)
         {
