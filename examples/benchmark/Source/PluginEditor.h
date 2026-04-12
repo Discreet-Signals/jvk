@@ -36,7 +36,7 @@ public:
 private:
     void timerCallback() override;
 
-    enum class Mode { All, Text, TextStatic, ComplexPaths, Fills, BackendComparison };
+    enum class Mode { All, Text, TextStatic, ComplexPaths, Fills, Images, BackendComparison };
 
     void runBenchmark(Mode mode);
     void paintBenchmarkScene(juce::Graphics& g, int frame);
@@ -48,8 +48,9 @@ private:
     void sceneTextStatic(juce::Graphics& g, float w, float h);
     void sceneComplexPaths(juce::Graphics& g, float w, float h, float t, float phase);
     void sceneFills(juce::Graphics& g, float w, float h, float t, float phase);
+    void sceneImages(juce::Graphics& g, float w, float h);
 
-    juce::TextButton btnAll, btnText, btnTextStatic, btnPaths, btnFills, btnBackends;
+    juce::TextButton btnAll, btnText, btnTextStatic, btnPaths, btnFills, btnImages, btnBackends;
 
     juce::TextButton btnEdgeTable, btnStencil;
     jvk::VulkanGraphicsContext::PathBackend activeBackend = jvk::VulkanGraphicsContext::PathBackend::Stencil;
@@ -61,6 +62,13 @@ private:
 
     void generatePaths(float w, float h);
     bool pathsGenerated = false;
+
+    // --- Image benchmark ---
+    juce::Image barkImage;
+    struct Sprite { float x, y, vx, vy; };
+    std::vector<Sprite> sprites;
+    void initSprites(float w, float h);
+    bool spritesInitialized = false;
 
     // --- Backend comparison test ---
     std::vector<juce::Path> testPaths;

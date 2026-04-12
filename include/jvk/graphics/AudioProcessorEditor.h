@@ -282,45 +282,12 @@ private:
                     std::move(mulVertLayout), std::move(mulConfig));
             }
 
-            // --- HSV effect pipeline (reads framebuffer via input attachment) ---
-            {
-                // Separate descriptor set layout for input attachment (set 0, binding 1)
-                hsvDescriptorHelper = std::make_unique<core::DescriptorHelper>(device);
-                hsvDescriptorHelper->addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                                  VK_SHADER_STAGE_FRAGMENT_BIT);
-                hsvDescriptorHelper->addBinding(1, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
-                                                  VK_SHADER_STAGE_FRAGMENT_BIT);
-                auto hsvDsLayout = hsvDescriptorHelper->buildLayout();
-                hsvDescriptorHelper->createPool(4);
-
-                shaders::ShaderGroup hsvSg;
-                hsvSg.addShader(VK_SHADER_STAGE_VERTEX_BIT,
-                                 shaders::ui2d::vert_spv, shaders::ui2d::vert_spvSize);
-                hsvSg.addShader(VK_SHADER_STAGE_FRAGMENT_BIT,
-                                 shaders::ui2d::hsv_frag_spv, shaders::ui2d::hsv_frag_spvSize);
-                hsvSg.addDescriptorSetLayout(hsvDsLayout);
-
-                VertexLayout hsvVertLayout;
-                hsvVertLayout.binding = { 0, sizeof(UIVertex), VK_VERTEX_INPUT_RATE_VERTEX };
-                hsvVertLayout.attributes = {
-                    { 0, 0, VK_FORMAT_R32G32_SFLOAT,       offsetof(UIVertex, position) },
-                    { 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, color) },
-                    { 2, 0, VK_FORMAT_R32G32_SFLOAT,        offsetof(UIVertex, uv) },
-                    { 3, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, shapeInfo) }
-                };
-
-                PipelineConfig hsvConfig;
-                hsvConfig.cullMode = VK_CULL_MODE_NONE;
-                hsvConfig.depthTestEnable = false;
-                hsvConfig.depthWriteEnable = false;
-                hsvConfig.blendMode = BlendMode::Opaque; // overwrite with HSV result
-                hsvConfig.pushConstantRanges = pushRanges;
-
-                hsvPipeline = std::make_unique<Pipeline>(
-                    device, renderer.getRenderPass(),
-                    std::move(hsvSg), renderer.getMSAASamples(),
-                    std::move(hsvVertLayout), std::move(hsvConfig));
-            }
+            // --- HSV effect pipeline ---
+            // TODO: HSV needs framebuffer read-back. Requires either:
+            //   1. Copy framebuffer to temp texture (like blur does), or
+            //   2. Proper subpassInput with MoltenVK resource type annotations.
+            // Disabled for now — drawEffectQuad null-checks the pipeline pointer.
+            // hsvPipeline remains nullptr.
 
             // --- Blur pipeline (reads from temp texture sampler) ---
             {
@@ -503,7 +470,7 @@ private:
             // New glyphs render as invisible (white atlas background) for one frame.
             glyphAtlas.stageDirtyPages(stagingBelt, pendingUploads);
 
-            ctx.flush();
+            graphics::flush(ctx);
         }
 
         AudioProcessorEditor& editor;

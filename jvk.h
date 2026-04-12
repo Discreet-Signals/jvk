@@ -96,18 +96,17 @@
 #include "include/jvk/FIFO.h"
 #include "include/jvk/components/VulkanComponent.h"
 #include "include/jvk/components/ShaderComponent.h"
-#include "include/jvk/components/Components.h"
 
 // Scene integration (after VulkanComponent and Scene)
 #include "include/jvk/ecs/ForwardRenderer.h"
 #include "include/jvk/components/SceneComponent.h"
 
-// UI (Vulkan-backed juce::Graphics)
-#include "include/jvk/ui/UI2DShaders.h"
-#include "include/jvk/ui/GlyphAtlas.h"
-#include "include/jvk/ui/VulkanGraphicsContext.h"
-#include "include/jvk/ui/Graphics.h"
-#include "include/jvk/ui/AudioProcessorEditor.h"
+// Graphics (Vulkan-backed juce::Graphics)
+#include "include/jvk/graphics/UI2DShaders.h"
+#include "include/jvk/graphics/GlyphAtlas.h"
+#include "include/jvk/graphics/VulkanGraphicsContext.h"
+#include "include/jvk/graphics/Graphics.h"
+#include "include/jvk/graphics/AudioProcessorEditor.h"
 
 // Offscreen rendering
 #include "include/jvk/offscreen/FullscreenShaders.h"

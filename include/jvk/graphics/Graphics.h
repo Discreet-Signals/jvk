@@ -121,7 +121,7 @@ public:
     void multiplyRGB(float r, float green, float b,
                       juce::Rectangle<float> region = {})
     {
-        ctx.drawEffectQuad(ctx.multiplyPipeline, { r, green, b, 1.0f }, region);
+        graphics::drawEffectQuad(ctx, ctx.multiplyPipeline, { r, green, b, 1.0f }, region);
     }
 
     // Convenience wrappers
@@ -149,7 +149,7 @@ public:
         // HSV multiply goes in vertex color, HSV add goes in shapeInfo
         glm::vec4 mulColor(h, s, v, 1.0f);
         glm::vec4 addValues(0, 0, 0, 0);
-        ctx.drawEffectQuad(ctx.hsvPipeline, mulColor, region, addValues);
+        graphics::drawEffectQuad(ctx, ctx.hsvPipeline, mulColor, region, addValues);
     }
 
     // Add to existing pixels' HSV values. (0,0,0) = no change.
@@ -158,7 +158,7 @@ public:
     {
         glm::vec4 mulColor(1.0f, 1.0f, 1.0f, 1.0f); // multiply by 1 (no change)
         glm::vec4 addValues(h, s, v, 0);
-        ctx.drawEffectQuad(ctx.hsvPipeline, mulColor, region, addValues);
+        graphics::drawEffectQuad(ctx, ctx.hsvPipeline, mulColor, region, addValues);
     }
 
     // Convenience HSV wrappers
@@ -178,12 +178,12 @@ public:
     // Gaussian blur — requires render pass restart (case 3: two-buffer)
     void blur(juce::Rectangle<float> region, float radius)
     {
-        ctx.executeBlur(region, radius);
+        graphics::executeBlur(ctx, region, radius);
     }
 
     void blur(float radius)
     {
-        ctx.executeBlur({}, radius);
+        graphics::executeBlur(ctx, {}, radius);
     }
 
     void applyShader(VkPipeline shader, juce::Rectangle<float> region = {})
@@ -202,7 +202,7 @@ public:
     float getScale() const                    { return ctx.scale; }
 
     // Flush pending juce::Graphics draws to GPU before custom Vulkan operations
-    void flush()                              { ctx.flush(); }
+    void flush()                              { graphics::flush(ctx); }
 
     // Submit raw vertices directly
     void submitVertices(const UIVertex* verts, int count)

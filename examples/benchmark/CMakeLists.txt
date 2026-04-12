@@ -14,6 +14,10 @@ juce_add_plugin(JVKBenchmark
     HARDENED_RUNTIME_OPTIONS "com.apple.security.device.audio-input"
 )
 
+juce_add_binary_data(JVKBenchmarkData SOURCES
+    bark.png
+)
+
 target_sources(JVKBenchmark PRIVATE
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
@@ -28,6 +32,7 @@ target_compile_definitions(JVKBenchmark PUBLIC
 
 target_link_libraries(JVKBenchmark
     PRIVATE
+        JVKBenchmarkData
         juce::juce_audio_basics
         juce::juce_audio_devices
         juce::juce_audio_formats

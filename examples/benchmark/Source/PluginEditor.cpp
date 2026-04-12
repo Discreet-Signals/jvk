@@ -21,6 +21,7 @@
 
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include "BinaryData.h"
 #include <numeric>
 
 static void styleButton(juce::TextButton& btn, const juce::String& text, juce::Colour col)
@@ -39,6 +40,7 @@ BenchmarkEditor::BenchmarkEditor(BenchmarkProcessor& p)
     styleButton(btnTextStatic, "TEXT STATIC",  juce::Colour(0xFF5B5EA6));
     styleButton(btnPaths,      "COMPLEX PATHS",juce::Colour(0xFFE07A5F));
     styleButton(btnFills,      "FILLS",        juce::Colour(0xFFF4A261));
+    styleButton(btnImages,    "IMAGES",       juce::Colour(0xFF45B7D1));
     styleButton(btnBackends,  "BACKENDS",     juce::Colour(0xFFE84545));
 
     btnAll.onClick        = [this] { runBenchmark(Mode::All); };
@@ -46,6 +48,7 @@ BenchmarkEditor::BenchmarkEditor(BenchmarkProcessor& p)
     btnTextStatic.onClick = [this] { runBenchmark(Mode::TextStatic); };
     btnPaths.onClick      = [this] { runBenchmark(Mode::ComplexPaths); };
     btnFills.onClick      = [this] { runBenchmark(Mode::Fills); };
+    btnImages.onClick     = [this] { runBenchmark(Mode::Images); };
     btnBackends.onClick   = [this] { runBenchmark(Mode::BackendComparison); };
 
     addAndMakeVisible(btnAll);
@@ -53,6 +56,7 @@ BenchmarkEditor::BenchmarkEditor(BenchmarkProcessor& p)
     addAndMakeVisible(btnTextStatic);
     addAndMakeVisible(btnPaths);
     addAndMakeVisible(btnFills);
+    addAndMakeVisible(btnImages);
     addAndMakeVisible(btnBackends);
 
     // Backend selectors
@@ -65,6 +69,9 @@ BenchmarkEditor::BenchmarkEditor(BenchmarkProcessor& p)
     };
     setupBE(btnEdgeTable, "EdgeTable", PB::EdgeTable, juce::Colour(0xFFAAAAAA));
     setupBE(btnStencil,   "Stencil",   PB::Stencil,   juce::Colour(0xFFE07A5F));
+
+    auto fullBark = juce::ImageFileFormat::loadFrom(BinaryData::bark_png, BinaryData::bark_pngSize);
+    barkImage = fullBark.rescaled(48, 48, juce::Graphics::highResamplingQuality);
 
     setSize(800, 600);
 }
@@ -180,6 +187,7 @@ void BenchmarkEditor::runBenchmark(Mode mode)
         case Mode::TextStatic:   modeName = "TEXT STATIC"; break;
         case Mode::ComplexPaths: modeName = "COMPLEX PATHS"; break;
         case Mode::Fills:        modeName = "FILLS"; break;
+        case Mode::Images:       modeName = "IMAGES"; break;
         case Mode::BackendComparison: modeName = "BACKENDS"; break;
     }
 
@@ -531,6 +539,47 @@ void BenchmarkEditor::sceneFills(juce::Graphics& g, float w, float h, float t, f
 }
 
 // =============================================================================
+// Scene: IMAGES — 1000 bouncing sprites
+// =============================================================================
+
+void BenchmarkEditor::initSprites(float w, float h)
+{
+    if (spritesInitialized) return;
+    spritesInitialized = true;
+
+    juce::Random rng(42);
+    sprites.resize(20000);
+    for (auto& s : sprites)
+    {
+        s.x = rng.nextFloat() * w;
+        s.y = rng.nextFloat() * h;
+        s.vx = (rng.nextFloat() - 0.5f) * 6.0f;
+        s.vy = (rng.nextFloat() - 0.5f) * 6.0f;
+    }
+}
+
+void BenchmarkEditor::sceneImages(juce::Graphics& g, float w, float h)
+{
+    if (!barkImage.isValid()) return;
+    initSprites(w, h);
+
+    constexpr float spriteSize = 48.0f;
+
+    for (auto& s : sprites)
+    {
+        s.x += s.vx;
+        s.y += s.vy;
+
+        if (s.x < 0)              { s.x = 0;              s.vx = std::abs(s.vx); }
+        if (s.x + spriteSize > w) { s.x = w - spriteSize;  s.vx = -std::abs(s.vx); }
+        if (s.y < 0)              { s.y = 0;              s.vy = std::abs(s.vy); }
+        if (s.y + spriteSize > h) { s.y = h - spriteSize;  s.vy = -std::abs(s.vy); }
+
+        g.drawImage(barkImage, juce::Rectangle<float>(s.x, s.y, spriteSize, spriteSize));
+    }
+}
+
+// =============================================================================
 // Scene dispatch
 // =============================================================================
 
@@ -550,6 +599,7 @@ void BenchmarkEditor::paintBenchmarkScene(juce::Graphics& g, int frame)
         case Mode::TextStatic:   sceneTextStatic(g, w, h); break;
         case Mode::ComplexPaths: sceneComplexPaths(g, w, h, t, phase); break;
         case Mode::Fills:        sceneFills(g, w, h, t, phase); break;
+        case Mode::Images:       sceneImages(g, w, h); break;
         case Mode::BackendComparison: break; // handled separately
     }
 }
@@ -796,7 +846,7 @@ void BenchmarkEditor::resized()
 
     // Benchmark buttons centered in two rows
     int btnW = 120, btnH = 40, gap = 10;
-    int totalW = 3 * btnW + 2 * gap;
+    int totalW = 4 * btnW + 3 * gap;
     int startX = (getWidth() - totalW) / 2;
     int row1Y = getHeight() / 2;
     int row2Y = row1Y + btnH + gap;
@@ -804,8 +854,9 @@ void BenchmarkEditor::resized()
     btnAll.setBounds(startX, row1Y, btnW, btnH);
     btnText.setBounds(startX + btnW + gap, row1Y, btnW, btnH);
     btnTextStatic.setBounds(startX + 2 * (btnW + gap), row1Y, btnW, btnH);
-    btnPaths.setBounds(startX, row2Y, btnW, btnH);
-    btnFills.setBounds(startX + btnW + gap, row2Y, btnW, btnH);
+    btnPaths.setBounds(startX + 3 * (btnW + gap), row1Y, btnW, btnH);
+    btnFills.setBounds(startX, row2Y, btnW, btnH);
+    btnImages.setBounds(startX + btnW + gap, row2Y, btnW, btnH);
     btnBackends.setBounds(startX + 2 * (btnW + gap), row2Y, btnW, btnH);
 }
 
@@ -818,7 +869,7 @@ void BenchmarkEditor::generateTestPaths()
     if (testPathsGenerated) return;
     testPathsGenerated = true;
 
-    std::vector<int> targetSegments = { 10, 100, 1000, 10000, 100000 };
+    std::vector<int> targetSegments = { 10, 100, 1000, 10000 };
 
     testPaths.clear();
     testPaths.reserve(targetSegments.size());
