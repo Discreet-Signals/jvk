@@ -1,17 +1,17 @@
 /*
  ----------------------------------------------------------------------------
  Copyright (c) 2026 Discreet Signals LLC
- 
+
  ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
  ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
  ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
  ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
  ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
  ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
- 
+
  Licensed under the MIT License. See LICENSE file in the project root
  for full license text.
- 
+
  For questions, contact gavin@discreetsignals.com
  ------------------------------------------------------------------------------
  File: ShaderImage.h
@@ -27,6 +27,9 @@ namespace jvk
 class ShaderImage : private juce::Timer
 {
 public:
+    // storageBufferSize: number of floats for the storage buffer (0 = no storage buffer).
+    // The shader's descriptor bindings (samplers, storage buffers) are auto-discovered
+    // from the SPIR-V bytecode via reflection.
     ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
                 int width, int height, int storageBufferSize = 0);
     ~ShaderImage();
@@ -36,7 +39,11 @@ public:
     void setSize(int width, int height);
     juce::Point<int> getSize() const { return { w, h }; }
 
+    // Push float data to the storage buffer (consumed each frame via FIFO)
     void pushData(const float* data, int count);
+
+    // Load a texture into a specific binding slot (set/binding discovered from SPIR-V)
+    void loadTexture(int binding, const juce::Image& image);
 
     void setFrameRate(int fps);
     void render();
@@ -46,12 +53,13 @@ public:
 private:
     void timerCallback() override { render(); }
 
+    void reflectShader();
     void createRenderTarget();
     void destroyRenderTarget();
     void createPipeline();
     void destroyPipeline();
-    void createStorageBuffer();
-    void destroyStorageBuffer();
+    void createDescriptors();
+    void destroyDescriptors();
 
     // Shared context
     struct Context;
@@ -80,14 +88,37 @@ private:
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
     VkPipeline graphicsPipeline = VK_NULL_HANDLE;
 
-    // Storage buffer for shader data
-    VkBuffer storageBuffer = VK_NULL_HANDLE;
-    VkDeviceMemory storageBufferMemory = VK_NULL_HANDLE;
-    void* mappedStoragePtr = nullptr;
+    // --- Reflected descriptor bindings ---
+    struct TextureSlot
+    {
+        int binding = -1;
+        VkImage image = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkSampler sampler = VK_NULL_HANDLE;
+        bool loaded = false;
+    };
+
+    struct DescriptorSetInfo
+    {
+        uint32_t set = 0;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+
+        // Storage buffer (if this set has one)
+        bool hasStorageBuffer = false;
+        int storageBinding = -1;
+        VkBuffer storageBuffer = VK_NULL_HANDLE;
+        VkDeviceMemory storageBufferMemory = VK_NULL_HANDLE;
+        void* mappedStoragePtr = nullptr;
+
+        // Textures in this set
+        std::vector<TextureSlot> textures;
+    };
+
+    std::vector<DescriptorSetInfo> descriptorSets;
     int storageSize = 0;
-    VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
 
     // Command buffer + sync (double-buffered)
     VkCommandBuffer commandBuffer[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
