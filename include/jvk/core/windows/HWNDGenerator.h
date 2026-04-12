@@ -48,7 +48,8 @@ public:
 
         if (!RegisterClassEx(&wc))
             DBG("Failed to Create Window!");
-        hwnd = CreateWindow(
+        hwnd = CreateWindowEx(
+            WS_EX_TRANSPARENT | WS_EX_LAYERED,
             className,
             className,
             WS_POPUP,
@@ -85,6 +86,21 @@ private:
         case WM_DESTROY:
             PostQuitMessage(0);
             return 0;
+        // Forward all mouse messages to the parent (JUCE's HWND)
+        case WM_NCHITTEST:
+            return HTTRANSPARENT;
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+        case WM_RBUTTONDOWN: case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN: case WM_MBUTTONUP:
+        case WM_MOUSEWHEEL:  case WM_MOUSEHWHEEL:
+        case WM_MOUSELEAVE:
+        {
+            HWND parent = GetParent(hwnd);
+            if (parent)
+                return SendMessage(parent, uMsg, wParam, lParam);
+            break;
+        }
         }
         return DefWindowProc(hwnd, uMsg, wParam, lParam);
     }

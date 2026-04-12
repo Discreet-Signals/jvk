@@ -23,6 +23,17 @@
 #import <QuartzCore/QuartzCore.h>
 #include "NSViewGenerator.h"
 
+// NSView subclass that is transparent to mouse events.
+// Returns nil from hitTest: so macOS skips this view and delivers
+// mouse events to the JUCE component view behind it.
+@interface JVKMetalView : NSView
+@end
+
+@implementation JVKMetalView
+- (NSView*)hitTest:(NSPoint)point { return nil; }
+- (BOOL)acceptsFirstMouse:(NSEvent*)event { return NO; }
+@end
+
 namespace jvk::core::macos
 {
 
@@ -43,7 +54,7 @@ bool NSViewGenerator::isValid()
 
 void* NSViewGenerator::create()
 {
-    NSView* view = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 800, 600)];
+    NSView* view = [[JVKMetalView alloc] initWithFrame:NSMakeRect(0, 0, 800, 600)];
     if (!view.layer || ![view.layer isKindOfClass:[CAMetalLayer class]])
     {
         view.wantsLayer = YES;
