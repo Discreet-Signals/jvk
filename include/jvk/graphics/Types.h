@@ -124,6 +124,11 @@ struct GradientCache
                 pixels.data(), static_cast<uint32_t>(LUT_WIDTH), 1, VK_FORMAT_R8G8B8A8_UNORM);
 
         entry.descriptorSet = descriptorHelper->allocateSet();
+        if (entry.descriptorSet == VK_NULL_HANDLE)
+        {
+            entry.texture.destroy();
+            return defaultDescriptorSet;
+        }
         core::DescriptorHelper::writeImage(device, entry.descriptorSet, 0,
             entry.texture.getView(), entry.texture.getSampler());
 
@@ -143,6 +148,8 @@ struct GradientCache
         {
             if (currentFrame - it->second.lastUsedFrame > maxAge)
             {
+                if (descriptorHelper)
+                    descriptorHelper->freeSet(it->second.descriptorSet);
                 it->second.texture.destroy();
                 it = entries.erase(it);
             }
@@ -154,7 +161,11 @@ struct GradientCache
     void clear()
     {
         for (auto& [k, e] : entries)
+        {
+            if (descriptorHelper)
+                descriptorHelper->freeSet(e.descriptorSet);
             e.texture.destroy();
+        }
         entries.clear();
     }
 };
@@ -187,6 +198,8 @@ struct TextureCache
         {
             if (currentFrame - it->second.lastUsedFrame > maxAge)
             {
+                if (descriptorHelper)
+                    descriptorHelper->freeSet(it->second.descriptorSet);
                 it->second.texture.destroy();
                 it = entries.erase(it);
             }
@@ -198,7 +211,11 @@ struct TextureCache
     void clear()
     {
         for (auto& [k, e] : entries)
+        {
+            if (descriptorHelper)
+                descriptorHelper->freeSet(e.descriptorSet);
             e.texture.destroy();
+        }
         entries.clear();
     }
 };

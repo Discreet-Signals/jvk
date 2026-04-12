@@ -87,6 +87,11 @@ inline void drawImage(VulkanGraphicsContext& ctx, const juce::Image& image,
                     VK_FORMAT_R8G8B8A8_UNORM);
 
             entry.descriptorSet = ctx.textureCache->descriptorHelper->allocateSet();
+            if (entry.descriptorSet == VK_NULL_HANDLE)
+            {
+                entry.texture.destroy();
+                return; // descriptor pool exhausted — skip drawing this image
+            }
             core::DescriptorHelper::writeImage(ctx.textureCache->device, entry.descriptorSet, 0,
                 entry.texture.getView(), entry.texture.getSampler());
 

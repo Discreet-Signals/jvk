@@ -25,19 +25,25 @@ namespace jvk::graphics
 {
 
 // ==== Transform ====
-// JUCE passes logical point offsets in the current coordinate space.
-// Transform through accumulated state transform, then scale to physical pixels.
+// JUCE's setOrigin(P) appends translate(P) to the transform, equivalent to
+// shifting every subsequent point by P before the accumulated transform.
+// Only the LINEAR part of the transform (scale/rotation) affects the physical
+// offset — the translation component must NOT be included, otherwise offsets
+// from prior addTransform calls (like SVG fitting translations) get double-counted.
 inline void setOrigin(VulkanGraphicsContext& ctx, juce::Point<int> o)
 {
     auto& s = ctx.state();
     float fx = static_cast<float>(o.x);
     float fy = static_cast<float>(o.y);
-    s.transform.transformPoint(fx, fy);
+    float ox = s.transform.mat00 * fx + s.transform.mat01 * fy;
+    float oy = s.transform.mat10 * fx + s.transform.mat11 * fy;
     s.origin += juce::Point<int>(
-        static_cast<int>(fx * ctx.scale),
-        static_cast<int>(fy * ctx.scale));
+        static_cast<int>(ox * ctx.scale),
+        static_cast<int>(oy * ctx.scale));
 }
 
+// JUCE appends: A.followedBy(B) applies B to the point first, then A.
+// So the newest transform (t) is applied to the point first, then accumulated.
 inline void addTransform(VulkanGraphicsContext& ctx, const juce::AffineTransform& t)
 {
     ctx.state().transform = ctx.state().transform.followedBy(t);
