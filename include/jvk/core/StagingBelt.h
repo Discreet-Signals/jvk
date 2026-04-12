@@ -85,15 +85,21 @@ struct StagingBelt
             }
         }
 
-        // Need a new block — check free list first (zero allocation in steady state)
+        // Need a new block — check free list for one large enough (zero allocation in steady state)
         Block block;
-        if (!freeBlocks.empty())
+        bool foundFree = false;
+        for (size_t i = freeBlocks.size(); i-- > 0; )
         {
-            block = std::move(freeBlocks.back());
-            freeBlocks.pop_back();
-            block.offset = 0;
+            if (freeBlocks[i].buffer.getSize() >= size)
+            {
+                block = std::move(freeBlocks[i]);
+                freeBlocks.erase(freeBlocks.begin() + static_cast<ptrdiff_t>(i));
+                block.offset = 0;
+                foundFree = true;
+                break;
+            }
         }
-        else
+        if (!foundFree)
         {
             VkDeviceSize blockSize = std::max(BLOCK_SIZE, size);
             block.buffer.create({ physDevice, device, blockSize,
