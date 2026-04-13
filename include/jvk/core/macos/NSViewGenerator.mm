@@ -61,7 +61,7 @@ void* NSViewGenerator::create()
         view.layer = [CAMetalLayer layer];
     }
     view.layer.opaque = NO;
-    view.layer.contentsScale = 2.0;  // 2x supersampling for sharp edges
+    view.layer.contentsScale = 2.0;  // Match Retina backing scale; MSAA handles anti-aliasing
     view.layer.backgroundColor = CGColorGetConstantColor(kCGColorClear);
     [view retain];
     ptr = (void*)view;

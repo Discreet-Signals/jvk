@@ -421,7 +421,7 @@ bool VulkanInstance::createRenderPass()
 {
     DBG("Creating Render Pass...");
 
-    // Attachment 0: MSAA color
+    // Attachment 0: MSAA color (4x multisampled — render target)
     VkAttachmentDescription colorAttachment = {};
     colorAttachment.format = swapChain->getFormat();
     colorAttachment.samples = settings.msaaSamples;
@@ -433,7 +433,7 @@ bool VulkanInstance::createRenderPass()
     colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     VkAttachmentReference colorAttachmentRef = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
 
-    // Attachment 1: Resolve (1x)
+    // Attachment 1: Resolve (1x swapchain image — MSAA resolves here)
     VkAttachmentDescription resolveAttachment = {};
     resolveAttachment.format = swapChain->getFormat();
     resolveAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -445,7 +445,7 @@ bool VulkanInstance::createRenderPass()
     resolveAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     VkAttachmentReference resolveAttachmentRef = { 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
 
-    // Attachment 2: Depth
+    // Attachment 2: Depth/Stencil (multisampled to match MSAA)
     VkAttachmentDescription depthAttachment = {};
     depthAttachment.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
     depthAttachment.samples = settings.msaaSamples;
@@ -457,28 +457,12 @@ bool VulkanInstance::createRenderPass()
     depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VkAttachmentReference depthAttachmentRef = { 2, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
 
-    // Input attachment ref — allows fragment shader to read the MSAA color attachment
-    VkAttachmentReference inputAttachmentRef = { 0, VK_IMAGE_LAYOUT_GENERAL };
-
     VkSubpassDescription subpass = {};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &colorAttachmentRef;
     subpass.pResolveAttachments = &resolveAttachmentRef;
     subpass.pDepthStencilAttachment = &depthAttachmentRef;
-    subpass.inputAttachmentCount = 1;
-    subpass.pInputAttachments = &inputAttachmentRef;
-
-    // Self-dependency: allows reading the color attachment we're writing to
-    // (for post-processing effects like HSV, blur that need framebuffer read)
-    VkSubpassDependency selfDep = {};
-    selfDep.srcSubpass = 0;
-    selfDep.dstSubpass = 0;
-    selfDep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    selfDep.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    selfDep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    selfDep.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-    selfDep.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
 
     VkAttachmentDescription attachments[3] = { colorAttachment, resolveAttachment, depthAttachment };
     VkRenderPassCreateInfo renderPassInfo = {};
@@ -487,8 +471,6 @@ bool VulkanInstance::createRenderPass()
     renderPassInfo.pAttachments = attachments;
     renderPassInfo.subpassCount = 1;
     renderPassInfo.pSubpasses = &subpass;
-    renderPassInfo.dependencyCount = 1;
-    renderPassInfo.pDependencies = &selfDep;
 
     if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS)
     {
