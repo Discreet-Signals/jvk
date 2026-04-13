@@ -96,6 +96,8 @@ public:
     }
     bool isSRGBPipeline() const { return srgbPipelineMode; }
 
+    int getVulkanFps() const { return vulkanFps; }
+
 private:
     // Tells JUCE's repaint manager to skip software rendering for this component.
     // paintWithinParentContext() sees this and calls paint() on it (no-op) instead
@@ -427,6 +429,13 @@ private:
         void removedFromRenderer(const VulkanRenderer&) override
         {
             if (!device) return;
+            // Free any retired descriptor sets before destroying the pool
+            for (int i = 0; i < MAX_FRAMES; ++i)
+            {
+                for (auto ds : retiredDescriptorSets[i])
+                    descriptorHelper->freeSet(ds);
+                retiredDescriptorSets[i].clear();
+            }
             mainPipeline.reset();
             mainClipPipeline.reset();
             stencilPipeline.reset();
@@ -452,6 +461,12 @@ private:
 
             // Safe: VulkanInstance waited on inFlightFences[currentFrame]
             deletionQueues[frameIdx].flush();
+
+            // Free descriptor sets retired during a previous frame on this slot
+            for (auto ds : retiredDescriptorSets[frameIdx])
+                descriptorHelper->freeSet(ds);
+            retiredDescriptorSets[frameIdx].clear();
+
             stagingBelt.recycle(usedStagingBlocks[frameIdx]);
 
             // Begin ring buffer frame — resets write head, passes DeletionQueue for growth
@@ -478,8 +493,14 @@ private:
 
             // Lazy-allocate blur temp image (persistent, reused every frame)
             uint32_t fw = static_cast<uint32_t>(w), fh = static_cast<uint32_t>(h);
+            int frameIdx = static_cast<int>(getRenderer()->getCurrentFrame() % MAX_FRAMES);
             if (blurTempImage.getWidth() != fw || blurTempImage.getHeight() != fh)
             {
+                // Retire old descriptor set — freed once the GPU is done with this frame slot
+                if (blurDescriptorSet != VK_NULL_HANDLE)
+                    retiredDescriptorSets[frameIdx].push_back(blurDescriptorSet);
+                blurDescriptorSet = VK_NULL_HANDLE;
+
                 blurTempImage.destroy();
                 if (fw > 0 && fh > 0)
                 {
@@ -490,8 +511,9 @@ private:
 
                     // Update blur descriptor set
                     blurDescriptorSet = descriptorHelper->allocateSet();
-                    core::DescriptorHelper::writeImage(device, blurDescriptorSet, 0,
-                        blurTempImage.getView(), blurTempImage.getSampler());
+                    if (blurDescriptorSet != VK_NULL_HANDLE)
+                        core::DescriptorHelper::writeImage(device, blurDescriptorSet, 0,
+                            blurTempImage.getView(), blurTempImage.getSampler());
                 }
             }
 
@@ -511,8 +533,6 @@ private:
                 gradCache.evict();
             }
 
-            int frameIdx = static_cast<int>(getRenderer()->getCurrentFrame() % MAX_FRAMES);
-
             VulkanGraphicsContext ctx(
                 commandBuffer, mainPipeline->getInternal(), mainPipeline->getLayout(),
                 w, h, physDevice, device, 2.0f,
@@ -530,6 +550,16 @@ private:
             editor.inVulkanRender = true;
             editor.paintEntireComponent(g, false);
             editor.inVulkanRender = false;
+
+            // FPS tracking — always active
+            {
+                auto now = std::chrono::steady_clock::now();
+                fpsTimestamps.push_back(now);
+                auto cutoff = now - std::chrono::seconds(1);
+                while (!fpsTimestamps.empty() && fpsTimestamps.front() < cutoff)
+                    fpsTimestamps.pop_front();
+                editor.vulkanFps = static_cast<int>(fpsTimestamps.size());
+            }
 
             // Stage dirty atlas pages for upload in the next frame's prepareFrame().
             // New glyphs render as invisible (white atlas background) for one frame.
@@ -567,6 +597,8 @@ private:
         std::vector<core::PendingUpload> pendingUploads;
         core::Image blurTempImage;      // lazy persistent — allocated on first blur, reused
         VkDescriptorSet blurDescriptorSet = VK_NULL_HANDLE;
+        std::vector<VkDescriptorSet> retiredDescriptorSets[MAX_FRAMES]; // freed after fence
+        std::deque<std::chrono::steady_clock::time_point> fpsTimestamps;
         TextureCache texCache;          // GPU texture cache for drawImage
         GradientCache gradCache;        // GPU gradient LUT cache
         GlyphAtlas glyphAtlas;          // GPU glyph atlas for text rendering
@@ -577,6 +609,7 @@ private:
     bool vulkanEnabled = true;
     bool srgbPipelineMode = false;
     bool inVulkanRender = false;
+    int vulkanFps = 0;
 };
 
 } // jvk

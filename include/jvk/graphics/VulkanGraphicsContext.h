@@ -314,7 +314,8 @@ inline void VulkanGraphicsContext::endTransparencyLayer() { graphics::endTranspa
 // SDF shape overrides
 inline void VulkanGraphicsContext::fillRoundedRectangle(const juce::Rectangle<float>& r, float cornerSize)
 {
-    if (graphics::hasNonTrivialTransform(*this))
+    // SDF path only supports solid fills; gradients need stencil-then-cover
+    if (graphics::hasNonTrivialTransform(*this) || state().fillType.isGradient())
     {
         juce::LowLevelGraphicsContext::fillRoundedRectangle(r, cornerSize);
         return;
@@ -324,7 +325,7 @@ inline void VulkanGraphicsContext::fillRoundedRectangle(const juce::Rectangle<fl
 
 inline void VulkanGraphicsContext::fillEllipse(const juce::Rectangle<float>& area)
 {
-    if (graphics::hasNonTrivialTransform(*this))
+    if (graphics::hasNonTrivialTransform(*this) || state().fillType.isGradient())
     {
         juce::LowLevelGraphicsContext::fillEllipse(area);
         return;

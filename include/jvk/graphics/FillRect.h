@@ -43,8 +43,12 @@ inline void emitGradientQuad(VulkanGraphicsContext& ctx, float x, float y, float
             ensureDescriptorSet(ctx, ctx.pipelineLayout, gradDescSet);
 
             // Compute UV coordinates in gradient space for each corner.
-            // Map gradient endpoints from logical to physical space through full transform.
-            auto physT = s.complexTransform.scaled(ctx.scale);
+            // fillType.transform maps gradient space → logical space.
+            // complexTransform.scaled(scale) maps logical → physical.
+            // Compose them so gradient endpoints land in physical space.
+            auto physT = s.fillType.transform
+                             .followedBy(s.complexTransform)
+                             .scaled(ctx.scale);
             glm::vec4 color(1.0f, 1.0f, 1.0f, s.opacity);
             float shapeType = g.isRadial ? 6.0f : 5.0f;
             glm::vec4 shape(shapeType, 0, 0, 0);
@@ -147,11 +151,13 @@ inline void fillRect(VulkanGraphicsContext& ctx, const juce::Rectangle<float>& r
                 flush(ctx);
                 ensureDescriptorSet(ctx, ctx.pipelineLayout, gradDescSet);
 
-                // Transform gradient endpoints to physical space
+                // Transform gradient endpoints to physical space.
+                // fillType.transform maps gradient → logical, t maps logical → physical.
+                auto gradT = s.fillType.transform.followedBy(t);
                 float gx1 = g.point1.x, gy1 = g.point1.y;
                 float gx2 = g.point2.x, gy2 = g.point2.y;
-                t.transformPoint(gx1, gy1);
-                t.transformPoint(gx2, gy2);
+                gradT.transformPoint(gx1, gy1);
+                gradT.transformPoint(gx2, gy2);
 
                 glm::vec4 color(1.0f, 1.0f, 1.0f, s.opacity);
                 float shapeType = g.isRadial ? 6.0f : 5.0f;
