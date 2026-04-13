@@ -75,6 +75,8 @@ public:
 
     void createFrameBuffers(VkRenderPass renderPass);
     VkFramebuffer getFrameBuffer(int i) { return frameBuffers[i]; }
+    VkImage getResolveImage(int i) const { return resolveImages[i]; }
+    VkImage getSwapchainImage(int i) const { return images[i]; }
 private:
     SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device);
     VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& availableFormats);
@@ -82,6 +84,7 @@ private:
     VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities);
 
     void createMsaaImages();
+    void createResolveImages();
     void createDepthImages();
     void createImageViews();
 
@@ -93,6 +96,9 @@ private:
     std::vector<VkImage> msaaImages;
     std::vector<VkDeviceMemory> msaaImageMemory;
     std::vector<VkImageView> msaaImageViews;
+    std::vector<VkImage> resolveImages;
+    std::vector<VkDeviceMemory> resolveImageMemory;
+    std::vector<VkImageView> resolveImageViews;
     std::vector<VkImage> depthImages;
     std::vector<VkDeviceMemory> depthImageMemory;
     std::vector<VkImageView> depthImageViews;

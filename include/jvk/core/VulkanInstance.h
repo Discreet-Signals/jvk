@@ -73,6 +73,10 @@ struct VulkanRendererSettings
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     // Frame rate is controlled by present mode (FIFO = vsync, IMMEDIATE = uncapped)
     bool srgbPipeline = false; // true = physically correct blending, false = JUCE-identical
+    // When set, swapchain is created at this fixed size and never recreated
+    // on resize — only viewport/scissor change.  Set to 0 for normal mode.
+    int maxWidth = 0;
+    int maxHeight = 0;
 };
 
 class VulkanInstance

@@ -111,6 +111,7 @@ public:
     // --- Runtime settings changes ---
     void setMSAA(VkSampleCountFlagBits samples);
     void setPresentMode(VkPresentModeKHR mode);
+    void setMaxSize(int maxPixelWidth, int maxPixelHeight);
     void setRendering(bool enabled);
     bool isRendering() const { return rendering; }
 

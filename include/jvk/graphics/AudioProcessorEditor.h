@@ -113,6 +113,13 @@ private:
     {
         if (wasResized)
         {
+            if (auto* c = getConstrainer())
+            {
+                constexpr float pixelScale = 2.0f;
+                vulkanRenderer.setMaxSize(
+                    static_cast<int>(c->getMaximumWidth()  * pixelScale),
+                    static_cast<int>(c->getMaximumHeight() * pixelScale));
+            }
             vulkanRenderer.setBounds(getLocalBounds());
             // PaintBridge bounds must match the 2x swapchain resolution
             auto b = getLocalBounds().toFloat();

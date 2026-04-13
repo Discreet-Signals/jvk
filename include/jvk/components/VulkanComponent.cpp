@@ -146,6 +146,14 @@ void VulkanRenderer::setPresentMode(VkPresentModeKHR mode)
     rebuildAll();
 }
 
+void VulkanRenderer::setMaxSize(int maxPixelWidth, int maxPixelHeight)
+{
+    if (maxPixelWidth == settings.maxWidth && maxPixelHeight == settings.maxHeight) return;
+    settings.maxWidth = maxPixelWidth;
+    settings.maxHeight = maxPixelHeight;
+    rebuildAll();
+}
+
 void VulkanRenderer::setRendering(bool enabled)
 {
     rendering = enabled;

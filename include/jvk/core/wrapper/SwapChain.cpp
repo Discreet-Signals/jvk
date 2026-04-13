@@ -89,7 +89,7 @@ SwapChain::SwapChain(SwapChainInfo sc_info, VkSwapchainKHR previous) : info(sc_i
     createInfo.imageColorSpace = surfaceFormat.colorSpace;
     createInfo.imageExtent = swapExtent;
     createInfo.imageArrayLayers = 1;
-    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 
     uint32_t queueFamilyIndices[] = { info.graphicsQueueFamilyIndex, info.presentQueueFamilyIndex };
     if (info.graphicsQueueFamilyIndex != info.presentQueueFamilyIndex)
@@ -136,6 +136,7 @@ SwapChain::SwapChain(SwapChainInfo sc_info, VkSwapchainKHR previous) : info(sc_i
     extent = swapExtent;
 
     createMsaaImages();
+    createResolveImages();
     createDepthImages();
     createImageViews();
 
@@ -181,6 +182,43 @@ void SwapChain::createMsaaImages()
     }
 }
 
+
+void SwapChain::createResolveImages()
+{
+    resolveImages.resize(images.size());
+    resolveImageMemory.resize(images.size());
+
+    for (size_t i = 0; i < images.size(); i++)
+    {
+        VkImageCreateInfo imageInfo = {};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = format;
+        imageInfo.extent.width = extent.width;
+        imageInfo.extent.height = extent.height;
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        vkCreateImage(info.device, &imageInfo, nullptr, &resolveImages[i]);
+
+        VkMemoryRequirements memRequirements;
+        vkGetImageMemoryRequirements(info.device, resolveImages[i], &memRequirements);
+
+        VkMemoryAllocateInfo allocInfo = {};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = findMemoryType(info.physicalDevice, memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        vkAllocateMemory(info.device, &allocInfo, nullptr, &resolveImageMemory[i]);
+        vkBindImageMemory(info.device, resolveImages[i], resolveImageMemory[i], 0);
+    }
+}
 
 void SwapChain::createDepthImages()
 {
@@ -235,46 +273,31 @@ void SwapChain::createDepthImages()
 
 void SwapChain::createImageViews()
 {
+    auto makeColorView = [&](VkImage image) {
+        VkImageViewCreateInfo ci = {};
+        ci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        ci.image = image;
+        ci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        ci.format = format;
+        ci.components = { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                          VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY };
+        ci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        VkImageView view;
+        vkCreateImageView(info.device, &ci, nullptr, &view);
+        return view;
+    };
+
     msaaImageViews.resize(msaaImages.size());
     for (size_t i = 0; i < msaaImages.size(); i++)
-    {
-        VkImageViewCreateInfo createInfo = {};
-        createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        createInfo.image = msaaImages[i];
-        createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        createInfo.format = format;
-        createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        createInfo.subresourceRange.baseMipLevel = 0;
-        createInfo.subresourceRange.levelCount = 1;
-        createInfo.subresourceRange.baseArrayLayer = 0;
-        createInfo.subresourceRange.layerCount = 1;
+        msaaImageViews[i] = makeColorView(msaaImages[i]);
 
-        vkCreateImageView(info.device, &createInfo, nullptr, &msaaImageViews[i]);
-    }
+    resolveImageViews.resize(resolveImages.size());
+    for (size_t i = 0; i < resolveImages.size(); i++)
+        resolveImageViews[i] = makeColorView(resolveImages[i]);
+
     imageViews.resize(images.size());
     for (size_t i = 0; i < images.size(); i++)
-    {
-        VkImageViewCreateInfo createInfo = {};
-        createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        createInfo.image = images[i];
-        createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        createInfo.format = format;
-        createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-        createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        createInfo.subresourceRange.baseMipLevel = 0;
-        createInfo.subresourceRange.levelCount = 1;
-        createInfo.subresourceRange.baseArrayLayer = 0;
-        createInfo.subresourceRange.layerCount = 1;
-
-        vkCreateImageView(info.device, &createInfo, nullptr, &imageViews[i]);
-    }
+        imageViews[i] = makeColorView(images[i]);
 }
 
 void SwapChain::createFrameBuffers(VkRenderPass renderPass)
@@ -284,7 +307,7 @@ void SwapChain::createFrameBuffers(VkRenderPass renderPass)
     {
         VkImageView attachments[] = {
             msaaImageViews[i],
-            imageViews[i],
+            resolveImageViews[i],
             depthImageViews[i]
         };
 
@@ -307,6 +330,12 @@ SwapChain::~SwapChain()
         vkDestroyFramebuffer(info.device, framebuffer, nullptr);
     for (auto imageView : imageViews)
         vkDestroyImageView(info.device, imageView, nullptr);
+    for (auto imageView : resolveImageViews)
+        vkDestroyImageView(info.device, imageView, nullptr);
+    for (auto image : resolveImages)
+        vkDestroyImage(info.device, image, nullptr);
+    for (auto memory : resolveImageMemory)
+        vkFreeMemory(info.device, memory, nullptr);
     for (auto imageView : msaaImageViews)
         vkDestroyImageView(info.device, imageView, nullptr);
     for (auto image : msaaImages)
