@@ -65,6 +65,8 @@ BenchmarkEditor::BenchmarkEditor(BenchmarkProcessor& p)
     auto fullBark = juce::ImageFileFormat::loadFrom(BinaryData::bark_png, BinaryData::bark_pngSize);
     barkImage = fullBark.rescaled(48, 48, juce::Graphics::highResamplingQuality);
 
+    setResizable(true, true);
+    setResizeLimits(400, 300, 2560, 1600);
     setSize(800, 600);
 }
 
@@ -822,6 +824,10 @@ void BenchmarkEditor::paint(juce::Graphics& g)
 
 void BenchmarkEditor::resized()
 {
+    // Invalidate pregenerated paths so they're rebuilt for the new size
+    pathsGenerated = false;
+    spritesInitialized = false;
+
     // Backend selector row at top-right
     int beW = 95, beH = 24, beGap = 4;
     int beStartX = getWidth() - (beW + beGap) - 6;
