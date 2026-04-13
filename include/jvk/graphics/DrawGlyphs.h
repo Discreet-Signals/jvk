@@ -42,7 +42,7 @@ inline void drawGlyphs(VulkanGraphicsContext& ctx,
         float hScale = s.font.getHorizontalScale();
 
         // Physical font size: include accumulated transform scale (e.g. window resize)
-        float transformScale = s.transform.getScaleFactor();
+        float transformScale = s.complexTransform.getScaleFactor();
         float physFontHeight = fontHeight * transformScale * ctx.scale;
 
         VkDescriptorSet currentAtlasDescSet = VK_NULL_HANDLE;

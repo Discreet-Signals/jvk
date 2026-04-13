@@ -32,32 +32,25 @@ inline void fillRoundedRectangle(VulkanGraphicsContext& ctx,
     if (isClipEmpty(ctx)) return;
     // SDF rounded rect only works axis-aligned; fall back to path for transforms
     if (hasNonTrivialTransform(ctx)) return; // caller handles fallback
-    auto& s = ctx.state();
-    auto adjusted = r;
-    if (!s.transform.isIdentity())
-        adjusted = adjusted.translated(s.transform.getTranslationX(), s.transform.getTranslationY());
+    auto& ct = ctx.state().complexTransform;
+    auto adjusted = r.translated(ct.getTranslationX(), ct.getTranslationY());
     auto phys = juce::Rectangle<float>(adjusted.getX() * ctx.scale, adjusted.getY() * ctx.scale,
                                         adjusted.getWidth() * ctx.scale, adjusted.getHeight() * ctx.scale);
-    auto tr = phys.translated(static_cast<float>(s.origin.x), static_cast<float>(s.origin.y));
-    float hw = tr.getWidth() * 0.5f, hh = tr.getHeight() * 0.5f;
-    addSDFQuad(ctx, tr.getX(), tr.getY(), tr.getWidth(), tr.getHeight(),
+    float hw = phys.getWidth() * 0.5f, hh = phys.getHeight() * 0.5f;
+    addSDFQuad(ctx, phys.getX(), phys.getY(), phys.getWidth(), phys.getHeight(),
                 getColorForFill(ctx), 1.0f, hw, hh, cornerSize * ctx.scale);
 }
 
 inline void fillEllipse(VulkanGraphicsContext& ctx, const juce::Rectangle<float>& area)
 {
     if (isClipEmpty(ctx)) return;
-    // SDF ellipse only works axis-aligned; fall back to path for transforms
     if (hasNonTrivialTransform(ctx)) return; // caller handles fallback
-    auto& s = ctx.state();
-    auto adjusted = area;
-    if (!s.transform.isIdentity())
-        adjusted = adjusted.translated(s.transform.getTranslationX(), s.transform.getTranslationY());
+    auto& ct = ctx.state().complexTransform;
+    auto adjusted = area.translated(ct.getTranslationX(), ct.getTranslationY());
     auto phys = juce::Rectangle<float>(adjusted.getX() * ctx.scale, adjusted.getY() * ctx.scale,
                                         adjusted.getWidth() * ctx.scale, adjusted.getHeight() * ctx.scale);
-    auto tr = phys.translated(static_cast<float>(s.origin.x), static_cast<float>(s.origin.y));
-    float hw = tr.getWidth() * 0.5f, hh = tr.getHeight() * 0.5f;
-    addSDFQuad(ctx, tr.getX(), tr.getY(), tr.getWidth(), tr.getHeight(),
+    float hw = phys.getWidth() * 0.5f, hh = phys.getHeight() * 0.5f;
+    addSDFQuad(ctx, phys.getX(), phys.getY(), phys.getWidth(), phys.getHeight(),
                 getColorForFill(ctx), 2.0f, hw, hh, 0.0f);
 }
 

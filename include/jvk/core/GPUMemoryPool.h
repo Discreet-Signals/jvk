@@ -179,8 +179,8 @@ struct GPUMemoryPool
         blocks.push_back(std::move(newBlock));
         totalBlocks++;
 
-        DBG("jvk::GPUMemoryPool: Allocated " << (newBlockSize / (1024*1024))
-            << " MB block (type " << memTypeIndex << ", total blocks: " << totalBlocks << ")");
+        DBG("jvk::GPUMemoryPool: Allocated " << (int)(newBlockSize / (1024*1024))
+            << " MB block (type " << (int)memTypeIndex << ", total blocks: " << (int)totalBlocks << ")");
 
         // Recurse to allocate from the new block (guaranteed to fit)
         return allocate(req, properties);

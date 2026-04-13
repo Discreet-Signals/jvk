@@ -38,32 +38,21 @@ inline glm::vec4 convertColor(VulkanGraphicsContext& ctx, const glm::vec4& c)
     return c; // UNORM: pass sRGB values through (matches JUCE)
 }
 
-// Scale a logical-point int rect to physical pixels
-inline juce::Rectangle<int> scaleRect(VulkanGraphicsContext& ctx, const juce::Rectangle<int>& r)
-{
-    return juce::Rectangle<int>(
-        static_cast<int>(r.getX() * ctx.scale), static_cast<int>(r.getY() * ctx.scale),
-        static_cast<int>(r.getWidth() * ctx.scale), static_cast<int>(r.getHeight() * ctx.scale));
-}
-
-// Compose the accumulated addTransform() state with a local transform,
-// then apply logical→physical scaling and origin translation.
-// This is the single source of truth for coordinate mapping.
+// Compose a local (per-call) transform with the accumulated context transform,
+// then apply DPI scaling. This is the single source of truth for coordinate mapping.
+// Matches JUCE's getTransformWith(): local is innermost (applied first to points).
 inline juce::AffineTransform getFullTransform(VulkanGraphicsContext& ctx,
                                                const juce::AffineTransform& local = {})
 {
-    auto& s = ctx.state();
-    return local.followedBy(s.transform)
-                .scaled(ctx.scale)
-                .translated(static_cast<float>(s.origin.x),
-                            static_cast<float>(s.origin.y));
+    return local.followedBy(ctx.state().complexTransform)
+                .scaled(ctx.scale);
 }
 
 // Check if the accumulated transform is non-trivial (rotation/skew/non-uniform-scale).
 // SDF shapes (rounded rect, ellipse) only work axis-aligned.
 inline bool hasNonTrivialTransform(VulkanGraphicsContext& ctx)
 {
-    auto& t = ctx.state().transform;
+    auto& t = ctx.state().complexTransform;
     return !t.isIdentity() && !t.isOnlyTranslation();
 }
 

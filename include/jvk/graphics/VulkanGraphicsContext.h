@@ -61,8 +61,7 @@ public:
     // ==== State ====
     struct SavedState
     {
-        juce::Point<int> origin;     // physical pixels
-        juce::AffineTransform transform;
+        juce::AffineTransform complexTransform;  // maps current-space → screen-logical-space (like JUCE)
         juce::FillType fillType { juce::Colours::black };
         float opacity = 1.0f;
         juce::Font font { juce::FontOptions {} };

@@ -44,9 +44,7 @@ inline void emitGradientQuad(VulkanGraphicsContext& ctx, float x, float y, float
 
             // Compute UV coordinates in gradient space for each corner.
             // Map gradient endpoints from logical to physical space through full transform.
-            auto physT = s.transform.scaled(ctx.scale)
-                         .translated(static_cast<float>(s.origin.x),
-                                     static_cast<float>(s.origin.y));
+            auto physT = s.complexTransform.scaled(ctx.scale);
             glm::vec4 color(1.0f, 1.0f, 1.0f, s.opacity);
             float shapeType = g.isRadial ? 6.0f : 5.0f;
             glm::vec4 shape(shapeType, 0, 0, 0);
@@ -139,6 +137,63 @@ inline void fillRect(VulkanGraphicsContext& ctx, const juce::Rectangle<float>& r
         auto p10 = juce::Point<float>(r.getRight(), r.getY()).transformedBy(t);
         auto p11 = juce::Point<float>(r.getRight(), r.getBottom()).transformedBy(t);
         auto p01 = juce::Point<float>(r.getX(), r.getBottom()).transformedBy(t);
+
+        if (s.fillType.isGradient() && s.fillType.gradient && ctx.gradientCache)
+        {
+            auto& g = *s.fillType.gradient;
+            VkDescriptorSet gradDescSet = ctx.gradientCache->getOrCreate(g);
+            if (gradDescSet != VK_NULL_HANDLE)
+            {
+                flush(ctx);
+                ensureDescriptorSet(ctx, ctx.pipelineLayout, gradDescSet);
+
+                // Transform gradient endpoints to physical space
+                float gx1 = g.point1.x, gy1 = g.point1.y;
+                float gx2 = g.point2.x, gy2 = g.point2.y;
+                t.transformPoint(gx1, gy1);
+                t.transformPoint(gx2, gy2);
+
+                glm::vec4 color(1.0f, 1.0f, 1.0f, s.opacity);
+                float shapeType = g.isRadial ? 6.0f : 5.0f;
+                glm::vec4 shape(shapeType, 0, 0, 0);
+
+                if (g.isRadial)
+                {
+                    float cx = gx1, cy = gy1;
+                    float radius = std::sqrt((gx2-gx1)*(gx2-gx1) + (gy2-gy1)*(gy2-gy1));
+                    float invR = (radius > 0) ? 1.0f / radius : 0.0f;
+                    auto uv = [&](float px, float py) { return std::pair{(px-cx)*invR, (py-cy)*invR}; };
+                    auto [u00,v00] = uv(p00.x, p00.y); auto [u10,v10] = uv(p10.x, p10.y);
+                    auto [u11,v11] = uv(p11.x, p11.y); auto [u01,v01] = uv(p01.x, p01.y);
+                    addVertex(ctx, p00.x, p00.y, color, u00, v00, shape);
+                    addVertex(ctx, p10.x, p10.y, color, u10, v10, shape);
+                    addVertex(ctx, p11.x, p11.y, color, u11, v11, shape);
+                    addVertex(ctx, p00.x, p00.y, color, u00, v00, shape);
+                    addVertex(ctx, p11.x, p11.y, color, u11, v11, shape);
+                    addVertex(ctx, p01.x, p01.y, color, u01, v01, shape);
+                }
+                else
+                {
+                    float dx = gx2-gx1, dy = gy2-gy1;
+                    float len2 = dx*dx + dy*dy;
+                    float invLen2 = (len2 > 0) ? 1.0f / len2 : 0.0f;
+                    auto tAt = [&](float px, float py) { return ((px-gx1)*dx+(py-gy1)*dy)*invLen2; };
+                    float t00 = tAt(p00.x, p00.y), t10 = tAt(p10.x, p10.y);
+                    float t11 = tAt(p11.x, p11.y), t01 = tAt(p01.x, p01.y);
+                    addVertex(ctx, p00.x, p00.y, color, t00, 0, shape);
+                    addVertex(ctx, p10.x, p10.y, color, t10, 0, shape);
+                    addVertex(ctx, p11.x, p11.y, color, t11, 0, shape);
+                    addVertex(ctx, p00.x, p00.y, color, t00, 0, shape);
+                    addVertex(ctx, p11.x, p11.y, color, t11, 0, shape);
+                    addVertex(ctx, p01.x, p01.y, color, t01, 0, shape);
+                }
+
+                flush(ctx);
+                ensureDescriptorSet(ctx, ctx.pipelineLayout, ctx.defaultDescriptorSet);
+                return;
+            }
+        }
+
         auto c = getColorForFill(ctx);
         glm::vec4 flat(0);
         addVertex(ctx, p00.x, p00.y, c, 0, 0, flat);
@@ -150,25 +205,23 @@ inline void fillRect(VulkanGraphicsContext& ctx, const juce::Rectangle<float>& r
         return;
     }
 
-    // Fast path: identity or translation-only transform. Apply any translation before DPI scale.
-    auto adjusted = r;
-    if (!s.transform.isIdentity())
-        adjusted = adjusted.translated(s.transform.getTranslationX(), s.transform.getTranslationY());
+    // Fast path: identity or translation-only transform.
+    // complexTransform holds the full accumulated translation in mat02/mat12.
+    auto& ct = s.complexTransform;
+    auto adjusted = r.translated(ct.getTranslationX(), ct.getTranslationY());
 
     auto phys = juce::Rectangle<float>(adjusted.getX() * ctx.scale, adjusted.getY() * ctx.scale,
                                         adjusted.getWidth() * ctx.scale, adjusted.getHeight() * ctx.scale);
-    auto translated = phys.translated(static_cast<float>(s.origin.x),
-                                       static_cast<float>(s.origin.y));
 
     if (s.fillType.isGradient())
     {
-        emitGradientQuad(ctx, translated.getX(), translated.getY(),
-                         translated.getWidth(), translated.getHeight());
+        emitGradientQuad(ctx, phys.getX(), phys.getY(),
+                         phys.getWidth(), phys.getHeight());
     }
     else
     {
-        addQuad(ctx, translated.getX(), translated.getY(),
-                translated.getWidth(), translated.getHeight(), getColorForFill(ctx));
+        addQuad(ctx, phys.getX(), phys.getY(),
+                phys.getWidth(), phys.getHeight(), getColorForFill(ctx));
     }
 }
 

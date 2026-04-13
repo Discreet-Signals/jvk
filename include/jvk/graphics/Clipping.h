@@ -25,46 +25,37 @@ namespace jvk::graphics
 {
 
 // ==== Transform ====
-// JUCE's setOrigin(P) appends translate(P) to the transform, equivalent to
-// shifting every subsequent point by P before the accumulated transform.
-// Only the LINEAR part of the transform (scale/rotation) affects the physical
-// offset — the translation component must NOT be included, otherwise offsets
-// from prior addTransform calls (like SVG fitting translations) get double-counted.
+// Matches JUCE's TranslationOrTransform semantics exactly.
+// JUCE's followedBy(B) computes B*A — B is outermost. So:
+//   setOrigin(P):    translate(P) is innermost (applied first to points)
+//   addTransform(t): t is innermost (applied first to points)
+
 inline void setOrigin(VulkanGraphicsContext& ctx, juce::Point<int> o)
 {
-    auto& s = ctx.state();
-    float fx = static_cast<float>(o.x);
-    float fy = static_cast<float>(o.y);
-    float ox = s.transform.mat00 * fx + s.transform.mat01 * fy;
-    float oy = s.transform.mat10 * fx + s.transform.mat11 * fy;
-    s.origin += juce::Point<int>(
-        static_cast<int>(ox * ctx.scale),
-        static_cast<int>(oy * ctx.scale));
+    auto& ct = ctx.state().complexTransform;
+    ct = juce::AffineTransform::translation(static_cast<float>(o.x),
+                                             static_cast<float>(o.y))
+             .followedBy(ct);
 }
 
-// JUCE appends: A.followedBy(B) applies B to the point first, then A.
-// So the newest transform (t) is applied to the point first, then accumulated.
 inline void addTransform(VulkanGraphicsContext& ctx, const juce::AffineTransform& t)
 {
-    ctx.state().transform = ctx.state().transform.followedBy(t);
+    ctx.state().complexTransform = t.followedBy(ctx.state().complexTransform);
 }
 
 // ==== Clipping ====
-// JUCE passes logical point rects. Transform through accumulated state + DPI scale.
+// Physical transform = complexTransform scaled by DPI. No separate origin.
 inline bool clipToRectangle(VulkanGraphicsContext& ctx, const juce::Rectangle<int>& r)
 {
     flush(ctx);
     auto& s = ctx.state();
-    auto physTransform = s.transform.scaled(ctx.scale)
-                         .translated(static_cast<float>(s.origin.x),
-                                     static_cast<float>(s.origin.y));
+    auto physTransform = s.complexTransform.scaled(ctx.scale);
     auto physRect = r.toFloat().transformedBy(physTransform).getSmallestIntegerContainer();
     s.clipBounds = s.clipBounds.getIntersection(physRect);
     return !s.clipBounds.isEmpty();
 }
 
 // Clips to bounding box of the rectangle list.
-// This is the standard GPU approach (matches JUCE's OpenGL renderer).
 inline bool clipToRectangleList(VulkanGraphicsContext& ctx, const juce::RectangleList<int>& r)
 {
     return clipToRectangle(ctx, r.getBounds());
@@ -74,20 +65,15 @@ inline void excludeClipRectangle(VulkanGraphicsContext& ctx, const juce::Rectang
 {
     flush(ctx);
     auto& s = ctx.state();
-    auto physTransform = s.transform.scaled(ctx.scale)
-                         .translated(static_cast<float>(s.origin.x),
-                                     static_cast<float>(s.origin.y));
+    auto physTransform = s.complexTransform.scaled(ctx.scale);
     auto excluded = r.toFloat().transformedBy(physTransform).getSmallestIntegerContainer();
     if (!s.clipBounds.intersects(excluded)) return;
 
-    // With a single scissor rect, we can only exclude regions that touch
-    // an edge of the clip bounds. Pick the largest remaining rectangle.
     bool spansWidth  = excluded.getX() <= s.clipBounds.getX() && excluded.getRight() >= s.clipBounds.getRight();
     bool spansHeight = excluded.getY() <= s.clipBounds.getY() && excluded.getBottom() >= s.clipBounds.getBottom();
 
     if (spansWidth)
     {
-        // Exclusion spans full width — shrink vertically
         if (excluded.getY() <= s.clipBounds.getY())
             s.clipBounds.setTop(excluded.getBottom());
         else if (excluded.getBottom() >= s.clipBounds.getBottom())
@@ -95,21 +81,17 @@ inline void excludeClipRectangle(VulkanGraphicsContext& ctx, const juce::Rectang
     }
     else if (spansHeight)
     {
-        // Exclusion spans full height — shrink horizontally
         if (excluded.getX() <= s.clipBounds.getX())
             s.clipBounds.setLeft(excluded.getRight());
         else if (excluded.getRight() >= s.clipBounds.getRight())
             s.clipBounds.setRight(excluded.getX());
     }
-    // For arbitrary interior exclusions, we'd need stencil clipping.
-    // The remaining visible area is approximated by the unchanged clip bounds.
 }
 
 // clipToPath — defined after FillPath.h include (needs writeStencilClip)
 inline void clipToPath(VulkanGraphicsContext& ctx, const juce::Path& path, const juce::AffineTransform& t);
 
-// Image-based alpha clipping is not supported in the GPU pipeline.
-// Falls back to bounding-box clip (matches JUCE's OpenGL renderer behavior).
+// Image-based alpha clipping: bounding-box fallback (matches JUCE's OpenGL renderer).
 inline void clipToImageAlpha(VulkanGraphicsContext& ctx, const juce::Image& img, const juce::AffineTransform& t)
 {
     if (img.isValid())
@@ -124,21 +106,16 @@ inline void clipToImageAlpha(VulkanGraphicsContext& ctx, const juce::Image& img,
 inline bool clipRegionIntersects(VulkanGraphicsContext& ctx, const juce::Rectangle<int>& r)
 {
     auto& s = ctx.state();
-    auto physTransform = s.transform.scaled(ctx.scale)
-                         .translated(static_cast<float>(s.origin.x),
-                                     static_cast<float>(s.origin.y));
+    auto physTransform = s.complexTransform.scaled(ctx.scale);
     auto physRect = r.toFloat().transformedBy(physTransform).getSmallestIntegerContainer();
     return s.clipBounds.intersects(physRect);
 }
 
 // Return logical point bounds (JUCE expects this).
-// Invert the full transform (accumulated + DPI + origin) to map physical clip back to logical.
 inline juce::Rectangle<int> getClipBounds(const VulkanGraphicsContext& ctx)
 {
     auto& s = ctx.state();
-    auto physTransform = s.transform.scaled(ctx.scale)
-                         .translated(static_cast<float>(s.origin.x),
-                                     static_cast<float>(s.origin.y));
+    auto physTransform = s.complexTransform.scaled(ctx.scale);
     auto inv = physTransform.inverted();
     return s.clipBounds.toFloat().transformedBy(inv).getSmallestIntegerContainer();
 }
@@ -149,13 +126,10 @@ inline bool isClipEmpty(const VulkanGraphicsContext& ctx)
 }
 
 // ==== State stack ====
-// Flush pending vertices before state changes so they use the correct scissor.
 inline void saveState(VulkanGraphicsContext& ctx)
 {
     flush(ctx);
     ctx.stateStack.push_back(ctx.stateStack.back());
-    // Clear clip fan verts on the new state — only the state that
-    // called clipToPath should unstencil on restore.
     ctx.stateStack.back().clipFanVerts.clear();
 }
 
