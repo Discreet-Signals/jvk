@@ -69,7 +69,7 @@ enum class VulkanStatus
 
 struct VulkanRendererSettings
 {
-    VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_4_BIT;
+    VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_2_BIT;
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
     // Frame rate is controlled by present mode (FIFO = vsync, IMMEDIATE = uncapped)
     bool srgbPipeline = false; // true = physically correct blending, false = JUCE-identical
