@@ -55,7 +55,7 @@ struct SwapChainInfo
     uint32_t graphicsQueueFamilyIndex;
     uint32_t presentQueueFamilyIndex;
     VkRenderPass renderPass = VK_NULL_HANDLE;
-    VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_4_BIT;
+    VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_2_BIT;
     VkPresentModeKHR preferredPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     bool useSRGBFormat = false;
 };

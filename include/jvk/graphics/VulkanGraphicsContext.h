@@ -70,6 +70,7 @@ public:
         // Stencil-based path clipping
         uint8_t stencilClipDepth = 0;    // current nesting depth (0 = no clip)
         std::vector<UIVertex> clipFanVerts; // fan verts to unstencil on restore
+        juce::Rectangle<int> clipFanBounds; // bounding box for tight scissor on unstencil
     };
 
     SavedState& state() { return stateStack.back(); }
@@ -207,6 +208,7 @@ inline void clipToPath(VulkanGraphicsContext& ctx, const juce::Path& path, const
         auto& s = ctx.state();
         s.stencilClipDepth++;
         s.clipFanVerts = std::move(fanVerts);
+        s.clipFanBounds = pathBounds;
         vkCmdSetStencilReference(ctx.cmd, VK_STENCIL_FACE_FRONT_AND_BACK, s.stencilClipDepth);
         // Force rebind to the clip-testing pipeline now that depth > 0.
         // writeStencilClip called ensureMainPipeline while depth was still 0,
@@ -231,9 +233,16 @@ inline void restoreState(VulkanGraphicsContext& ctx)
         for (size_t i = 0; i + 2 < reversed.size(); i += 3)
             std::swap(reversed[i + 1], reversed[i + 2]);
 
-        VkRect2D fullScissor = { { 0, 0 }, { static_cast<uint32_t>(ctx.vpWidth),
-                                              static_cast<uint32_t>(ctx.vpHeight) } };
-        vkCmdSetScissor(ctx.cmd, 0, 1, &fullScissor);
+        // Tight scissor from stored clip bounds
+        auto& cb = popped.clipFanBounds;
+        int sx  = std::max(0, cb.getX() - 1);
+        int sy  = std::max(0, cb.getY() - 1);
+        int sx2 = std::min(static_cast<int>(ctx.vpWidth),  cb.getRight() + 1);
+        int sy2 = std::min(static_cast<int>(ctx.vpHeight), cb.getBottom() + 1);
+        VkRect2D fanScissor = { { sx, sy },
+            { static_cast<uint32_t>(std::max(0, sx2 - sx)),
+              static_cast<uint32_t>(std::max(0, sy2 - sy)) } };
+        vkCmdSetScissor(ctx.cmd, 0, 1, &fanScissor);
         ensurePipeline(ctx, ctx.stencilPipeline->getInternal(), ctx.stencilPipeline->getLayout());
         uploadAndDraw(ctx, reversed.data(), static_cast<uint32_t>(reversed.size()));
         ensureMainPipeline(ctx);

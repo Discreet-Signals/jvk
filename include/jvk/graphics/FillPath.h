@@ -211,10 +211,17 @@ inline void fillPathStencil(VulkanGraphicsContext& ctx, const juce::Path& path,
     // Flush pending main-pipeline vertices
     flush(ctx);
 
-    // Stencil write pass — full viewport scissor
+    // Stencil write pass — tight scissor from fan bounding box.
+    // On Apple Silicon's TBDR, tiles outside the scissor are skipped entirely.
     {
-        VkRect2D fullScissor = { { 0, 0 }, { static_cast<uint32_t>(ctx.vpWidth), static_cast<uint32_t>(ctx.vpHeight) } };
-        vkCmdSetScissor(ctx.cmd, 0, 1, &fullScissor);
+        int sx  = std::max(0, static_cast<int>(std::floor(fanMinX)) - 1);
+        int sy  = std::max(0, static_cast<int>(std::floor(fanMinY)) - 1);
+        int sx2 = std::min(static_cast<int>(ctx.vpWidth),  static_cast<int>(std::ceil(fanMaxX)) + 1);
+        int sy2 = std::min(static_cast<int>(ctx.vpHeight), static_cast<int>(std::ceil(fanMaxY)) + 1);
+        VkRect2D fanScissor = { { sx, sy },
+            { static_cast<uint32_t>(std::max(0, sx2 - sx)),
+              static_cast<uint32_t>(std::max(0, sy2 - sy)) } };
+        vkCmdSetScissor(ctx.cmd, 0, 1, &fanScissor);
     }
 
     ensurePipeline(ctx, ctx.stencilPipeline->getInternal(), ctx.stencilPipeline->getLayout());
@@ -313,6 +320,9 @@ inline std::vector<UIVertex> writeStencilClip(VulkanGraphicsContext& ctx,
     ctx.scratchFanVerts.clear();
     ctx.scratchPoints.clear();
 
+    float clipMinX = std::numeric_limits<float>::max(), clipMinY = clipMinX;
+    float clipMaxX = -clipMinX, clipMaxY = -clipMinY;
+
     {
         const float SUBPATH_MARKER = -std::numeric_limits<float>::infinity();
         constexpr float flatTol = 0.5f;
@@ -397,16 +407,22 @@ inline std::vector<UIVertex> writeStencilClip(VulkanGraphicsContext& ctx,
         glm::vec4 dummy(0);
         glm::vec2 fanCenter(0), prevPt2(0);
         bool inSubpath = false;
+
         for (size_t i = 0; i < ctx.scratchPoints.size(); i++)
         {
             if (ctx.scratchPoints[i].x == SUBPATH_MARKER)
             {
                 if (++i >= ctx.scratchPoints.size()) break;
                 fanCenter = ctx.scratchPoints[i]; prevPt2 = fanCenter;
-                inSubpath = true; continue;
+                inSubpath = true;
+                clipMinX = std::min(clipMinX, fanCenter.x); clipMinY = std::min(clipMinY, fanCenter.y);
+                clipMaxX = std::max(clipMaxX, fanCenter.x); clipMaxY = std::max(clipMaxY, fanCenter.y);
+                continue;
             }
             if (!inSubpath) continue;
             glm::vec2 pt = ctx.scratchPoints[i];
+            clipMinX = std::min(clipMinX, pt.x); clipMinY = std::min(clipMinY, pt.y);
+            clipMaxX = std::max(clipMaxX, pt.x); clipMaxY = std::max(clipMaxY, pt.y);
             ctx.scratchFanVerts.push_back({ fanCenter, dummy, {}, dummy });
             ctx.scratchFanVerts.push_back({ prevPt2,   dummy, {}, dummy });
             ctx.scratchFanVerts.push_back({ pt,        dummy, {}, dummy });
@@ -418,9 +434,17 @@ inline std::vector<UIVertex> writeStencilClip(VulkanGraphicsContext& ctx,
 
     flush(ctx);
 
-    // Stencil write — full viewport scissor, increment on front, decrement on back (non-zero winding)
-    VkRect2D fullScissor = { { 0, 0 }, { static_cast<uint32_t>(ctx.vpWidth), static_cast<uint32_t>(ctx.vpHeight) } };
-    vkCmdSetScissor(ctx.cmd, 0, 1, &fullScissor);
+    // Stencil write — tight scissor from fan bounding box
+    {
+        int sx  = std::max(0, static_cast<int>(std::floor(clipMinX)) - 1);
+        int sy  = std::max(0, static_cast<int>(std::floor(clipMinY)) - 1);
+        int sx2 = std::min(static_cast<int>(ctx.vpWidth),  static_cast<int>(std::ceil(clipMaxX)) + 1);
+        int sy2 = std::min(static_cast<int>(ctx.vpHeight), static_cast<int>(std::ceil(clipMaxY)) + 1);
+        VkRect2D fanScissor = { { sx, sy },
+            { static_cast<uint32_t>(std::max(0, sx2 - sx)),
+              static_cast<uint32_t>(std::max(0, sy2 - sy)) } };
+        vkCmdSetScissor(ctx.cmd, 0, 1, &fanScissor);
+    }
     ensurePipeline(ctx, ctx.stencilPipeline->getInternal(), ctx.stencilPipeline->getLayout());
     uploadAndDraw(ctx, ctx.scratchFanVerts.data(), static_cast<uint32_t>(ctx.scratchFanVerts.size()));
     ensureMainPipeline(ctx);
