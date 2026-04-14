@@ -1,24 +1,3 @@
-cmake_minimum_required(VERSION 3.20)
-project(jvkWaveform VERSION 1.0)
-
-# --- Fetch JUCE if not already available ---
-if (NOT COMMAND juce_add_plugin)
-    include(FetchContent)
-    FetchContent_Declare(
-        JUCE
-        GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
-        GIT_TAG        master
-        GIT_SHALLOW    TRUE
-    )
-    FetchContent_MakeAvailable(JUCE)
-endif()
-
-# --- Add the jvk module ---
-if (NOT TARGET jvk)
-    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../.. ${CMAKE_CURRENT_BINARY_DIR}/jvk)
-endif()
-
-# --- Plugin target ---
 juce_add_plugin(jvkWaveform
     PRODUCT_NAME "jvkWaveform"
     COMPANY_NAME "DiscreetSignals"

@@ -50,13 +50,16 @@ public:
 
     Buffer(Buffer&& other) noexcept
         : device(other.device), buffer(other.buffer), memory(other.memory),
-          bufferSize(other.bufferSize), mapped(other.mapped)
+          bufferSize(other.bufferSize), mapped(other.mapped),
+          pool(other.pool), poolAlloc(other.poolAlloc)
     {
         other.device = VK_NULL_HANDLE;
         other.buffer = VK_NULL_HANDLE;
         other.memory = VK_NULL_HANDLE;
         other.bufferSize = 0;
         other.mapped = nullptr;
+        other.pool = nullptr;
+        other.poolAlloc = {};
     }
 
     Buffer& operator=(Buffer&& other) noexcept
@@ -69,11 +72,15 @@ public:
             memory = other.memory;
             bufferSize = other.bufferSize;
             mapped = other.mapped;
+            pool = other.pool;
+            poolAlloc = other.poolAlloc;
             other.device = VK_NULL_HANDLE;
             other.buffer = VK_NULL_HANDLE;
             other.memory = VK_NULL_HANDLE;
             other.bufferSize = 0;
             other.mapped = nullptr;
+            other.pool = nullptr;
+            other.poolAlloc = {};
         }
         return *this;
     }
@@ -81,6 +88,7 @@ public:
     Buffer(const Buffer&) = delete;
     Buffer& operator=(const Buffer&) = delete;
 
+    // Standalone allocation (original path — one vkAllocateMemory per buffer)
     bool create(const BufferInfo& info)
     {
         destroy();
@@ -121,31 +129,89 @@ public:
         return true;
     }
 
+    // Pool-backed allocation — sub-allocates from a GPUMemoryPool block.
+    // Reduces vkAllocateMemory count from O(resources) to O(1).
+    bool create(const BufferInfo& info, GPUMemoryPool& memPool)
+    {
+        destroy();
+        device = info.device;
+        bufferSize = info.size;
+        pool = &memPool;
+
+        VkBufferCreateInfo bufferInfo = {};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = info.size;
+        bufferInfo.usage = info.usage;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS)
+        {
+            DBG("jvk: Failed to create buffer!");
+            pool = nullptr;
+            return false;
+        }
+
+        VkMemoryRequirements memReq;
+        vkGetBufferMemoryRequirements(device, buffer, &memReq);
+
+        poolAlloc = memPool.allocate(memReq, info.properties);
+        if (poolAlloc.memory == VK_NULL_HANDLE)
+        {
+            DBG("jvk: Pool allocation failed for buffer!");
+            vkDestroyBuffer(device, buffer, nullptr);
+            buffer = VK_NULL_HANDLE;
+            pool = nullptr;
+            return false;
+        }
+
+        memory = poolAlloc.memory;
+        vkBindBufferMemory(device, buffer, memory, poolAlloc.offset);
+        return true;
+    }
+
     void destroy()
     {
         if (mapped)
             unmap();
         if (buffer != VK_NULL_HANDLE && device != VK_NULL_HANDLE)
             vkDestroyBuffer(device, buffer, nullptr);
-        if (memory != VK_NULL_HANDLE && device != VK_NULL_HANDLE)
+        if (pool)
+            pool->free(poolAlloc);
+        else if (memory != VK_NULL_HANDLE && device != VK_NULL_HANDLE)
             vkFreeMemory(device, memory, nullptr);
         buffer = VK_NULL_HANDLE;
         memory = VK_NULL_HANDLE;
         bufferSize = 0;
+        pool = nullptr;
+        poolAlloc = {};
     }
 
     void upload(const void* data, VkDeviceSize size, VkDeviceSize offset = 0)
     {
-        void* dest;
-        vkMapMemory(device, memory, offset, size, 0, &dest);
-        memcpy(dest, data, static_cast<size_t>(size));
-        vkUnmapMemory(device, memory);
+        if (pool)
+        {
+            // Pool-backed: use the block's persistent mapping
+            void* dest = static_cast<char*>(poolAlloc.mappedBase) + poolAlloc.offset + offset;
+            memcpy(dest, data, static_cast<size_t>(size));
+        }
+        else
+        {
+            void* dest;
+            vkMapMemory(device, memory, offset, size, 0, &dest);
+            memcpy(dest, data, static_cast<size_t>(size));
+            vkUnmapMemory(device, memory);
+        }
     }
 
     void* map()
     {
         if (!mapped)
-            vkMapMemory(device, memory, 0, bufferSize, 0, &mapped);
+        {
+            if (pool)
+                mapped = static_cast<char*>(poolAlloc.mappedBase) + poolAlloc.offset;
+            else
+                vkMapMemory(device, memory, 0, bufferSize, 0, &mapped);
+        }
         return mapped;
     }
 
@@ -153,7 +219,8 @@ public:
     {
         if (mapped)
         {
-            vkUnmapMemory(device, memory);
+            if (!pool)
+                vkUnmapMemory(device, memory);
             mapped = nullptr;
         }
     }
@@ -162,6 +229,7 @@ public:
     VkDeviceMemory getMemory() const { return memory; }
     VkDeviceSize getSize() const { return bufferSize; }
     bool isValid() const { return buffer != VK_NULL_HANDLE; }
+    bool isPoolBacked() const { return pool != nullptr; }
 
 private:
     VkDevice device = VK_NULL_HANDLE;
@@ -169,6 +237,8 @@ private:
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize bufferSize = 0;
     void* mapped = nullptr;
+    GPUMemoryPool* pool = nullptr;
+    SubAllocation poolAlloc {};
 };
 
 } // jvk::core

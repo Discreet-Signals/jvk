@@ -1,17 +1,17 @@
 /*
  ----------------------------------------------------------------------------
  Copyright (c) 2026 Discreet Signals LLC
- 
+
  ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
  ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
  ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
  ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
  ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
  ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
- 
+
  Licensed under the MIT License. See LICENSE file in the project root
  for full license text.
- 
+
  For questions, contact gavin@discreetsignals.com
  ------------------------------------------------------------------------------
  File: SwapChain.h
@@ -36,7 +36,7 @@ static inline uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t 
     }
     // Handle Error
     return 0;
-};
+}
 
 
 struct SwapChainSupportDetails
@@ -55,7 +55,7 @@ struct SwapChainInfo
     uint32_t graphicsQueueFamilyIndex;
     uint32_t presentQueueFamilyIndex;
     VkRenderPass renderPass = VK_NULL_HANDLE;
-    VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_4_BIT;
+    VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_2_BIT;
     VkPresentModeKHR preferredPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     bool useSRGBFormat = false;
 };
@@ -66,15 +66,17 @@ public:
     SwapChain(SwapChainInfo sc_info, VkSwapchainKHR previous);
     ~SwapChain();
 
-    VkSwapchainKHR getInternal() const { return swapChain; };
-    VkFormat getFormat() const { return format; };
-    VkExtent2D getExtent() const { return extent; };
+    VkSwapchainKHR getInternal() const { return swapChain; }
+    VkFormat getFormat() const { return format; }
+    VkExtent2D getExtent() const { return extent; }
     int getNumImages() const { return static_cast<int>(images.size()); }
-    int getWidth() const { return info.size.x; };
-    int getHeight() const { return info.size.y; };
+    int getWidth() const { return info.size.x; }
+    int getHeight() const { return info.size.y; }
 
     void createFrameBuffers(VkRenderPass renderPass);
-    VkFramebuffer getFrameBuffer(int i) { return frameBuffers[i]; };
+    VkFramebuffer getFrameBuffer(int i) { return frameBuffers[i]; }
+    VkImage getResolveImage(int i) const { return resolveImages[i]; }
+    VkImage getSwapchainImage(int i) const { return images[i]; }
 private:
     SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device);
     VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& availableFormats);
@@ -82,6 +84,7 @@ private:
     VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities);
 
     void createMsaaImages();
+    void createResolveImages();
     void createDepthImages();
     void createImageViews();
 
@@ -93,6 +96,9 @@ private:
     std::vector<VkImage> msaaImages;
     std::vector<VkDeviceMemory> msaaImageMemory;
     std::vector<VkImageView> msaaImageViews;
+    std::vector<VkImage> resolveImages;
+    std::vector<VkDeviceMemory> resolveImageMemory;
+    std::vector<VkImageView> resolveImageViews;
     std::vector<VkImage> depthImages;
     std::vector<VkDeviceMemory> depthImageMemory;
     std::vector<VkImageView> depthImageViews;

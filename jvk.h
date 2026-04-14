@@ -37,6 +37,8 @@
 
 #pragma once
 
+#include <chrono>
+#include <deque>
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
 #include <juce_data_structures/juce_data_structures.h>
@@ -55,9 +57,13 @@
 // Core
 #include "include/jvk/core/PipelineConfig.h"
 #include "include/jvk/core/wrapper/SwapChain.h"
+#include "include/jvk/core/GPUMemoryPool.h"
 #include "include/jvk/core/Buffer.h"
 #include "include/jvk/core/DescriptorHelper.h"
 #include "include/jvk/core/Image.h"
+#include "include/jvk/core/StagingBelt.h"
+#include "include/jvk/core/DeletionQueue.h"
+#include "include/jvk/core/VertexRingBuffer.h"
 #include "include/jvk/core/wrapper/Shader.h"
 #include "include/jvk/core/wrapper/Pipeline.h"
 #include "include/jvk/core/wrapper/Wrapper.h"
@@ -94,18 +100,17 @@
 #include "include/jvk/FIFO.h"
 #include "include/jvk/components/VulkanComponent.h"
 #include "include/jvk/components/ShaderComponent.h"
-#include "include/jvk/components/Components.h"
 
 // Scene integration (after VulkanComponent and Scene)
 #include "include/jvk/ecs/ForwardRenderer.h"
 #include "include/jvk/components/SceneComponent.h"
 
-// UI (Vulkan-backed juce::Graphics)
-#include "include/jvk/ui/UI2DShaders.h"
-#include "include/jvk/ui/GlyphAtlas.h"
-#include "include/jvk/ui/VulkanGraphicsContext.h"
-#include "include/jvk/ui/Graphics.h"
-#include "include/jvk/ui/AudioProcessorEditor.h"
+// Graphics (Vulkan-backed juce::Graphics)
+#include "include/jvk/graphics/UI2DShaders.h"
+#include "include/jvk/graphics/GlyphAtlas.h"
+#include "include/jvk/graphics/VulkanGraphicsContext.h"
+#include "include/jvk/graphics/Graphics.h"
+#include "include/jvk/graphics/AudioProcessorEditor.h"
 
 // Offscreen rendering
 #include "include/jvk/offscreen/FullscreenShaders.h"

@@ -53,7 +53,8 @@ public:
 
     Image(Image&& other) noexcept
         : device(other.device), image(other.image), memory(other.memory),
-          view(other.view), sampler(other.sampler), w(other.w), h(other.h)
+          view(other.view), sampler(other.sampler), w(other.w), h(other.h),
+          pool(other.pool), poolAlloc(other.poolAlloc)
     {
         other.device = VK_NULL_HANDLE;
         other.image = VK_NULL_HANDLE;
@@ -62,6 +63,8 @@ public:
         other.sampler = VK_NULL_HANDLE;
         other.w = 0;
         other.h = 0;
+        other.pool = nullptr;
+        other.poolAlloc = {};
     }
 
     Image& operator=(Image&& other) noexcept
@@ -76,6 +79,8 @@ public:
             sampler = other.sampler;
             w = other.w;
             h = other.h;
+            pool = other.pool;
+            poolAlloc = other.poolAlloc;
             other.device = VK_NULL_HANDLE;
             other.image = VK_NULL_HANDLE;
             other.memory = VK_NULL_HANDLE;
@@ -83,6 +88,8 @@ public:
             other.sampler = VK_NULL_HANDLE;
             other.w = 0;
             other.h = 0;
+            other.pool = nullptr;
+            other.poolAlloc = {};
         }
         return *this;
     }
@@ -90,6 +97,7 @@ public:
     Image(const Image&) = delete;
     Image& operator=(const Image&) = delete;
 
+    // Standalone allocation (original path — one vkAllocateMemory per image)
     bool create(const ImageInfo& info)
     {
         destroy();
@@ -139,6 +147,71 @@ public:
         vkBindImageMemory(device, image, memory, 0);
 
         // Create image view
+        VkImageViewCreateInfo viewInfo = {};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = info.format;
+        viewInfo.subresourceRange.aspectMask = info.aspectMask;
+        viewInfo.subresourceRange.baseMipLevel = 0;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.baseArrayLayer = 0;
+        viewInfo.subresourceRange.layerCount = 1;
+
+        if (vkCreateImageView(device, &viewInfo, nullptr, &view) != VK_SUCCESS)
+        {
+            DBG("jvk: Failed to create image view!");
+            return false;
+        }
+
+        return true;
+    }
+
+    // Pool-backed allocation — sub-allocates from a GPUMemoryPool block.
+    bool create(const ImageInfo& info, GPUMemoryPool& memPool)
+    {
+        destroy();
+        device = info.device;
+        w = info.width;
+        h = info.height;
+        pool = &memPool;
+
+        VkImageCreateInfo imageInfo = {};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = info.format;
+        imageInfo.extent = { info.width, info.height, 1 };
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = info.samples;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = info.usage;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS)
+        {
+            DBG("jvk: Failed to create image!");
+            pool = nullptr;
+            return false;
+        }
+
+        VkMemoryRequirements memReq;
+        vkGetImageMemoryRequirements(device, image, &memReq);
+
+        poolAlloc = memPool.allocate(memReq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (poolAlloc.memory == VK_NULL_HANDLE)
+        {
+            DBG("jvk: Pool allocation failed for image!");
+            vkDestroyImage(device, image, nullptr);
+            image = VK_NULL_HANDLE;
+            pool = nullptr;
+            return false;
+        }
+
+        memory = poolAlloc.memory;
+        vkBindImageMemory(device, image, memory, poolAlloc.offset);
+
         VkImageViewCreateInfo viewInfo = {};
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         viewInfo.image = image;
@@ -279,7 +352,9 @@ public:
             vkDestroyImageView(device, view, nullptr);
         if (image != VK_NULL_HANDLE && device != VK_NULL_HANDLE)
             vkDestroyImage(device, image, nullptr);
-        if (memory != VK_NULL_HANDLE && device != VK_NULL_HANDLE)
+        if (pool)
+            pool->free(poolAlloc);
+        else if (memory != VK_NULL_HANDLE && device != VK_NULL_HANDLE)
             vkFreeMemory(device, memory, nullptr);
         sampler = VK_NULL_HANDLE;
         view = VK_NULL_HANDLE;
@@ -287,6 +362,8 @@ public:
         memory = VK_NULL_HANDLE;
         w = 0;
         h = 0;
+        pool = nullptr;
+        poolAlloc = {};
     }
 
     VkImage getImage() const { return image; }
@@ -295,6 +372,7 @@ public:
     uint32_t getWidth() const { return w; }
     uint32_t getHeight() const { return h; }
     bool isValid() const { return image != VK_NULL_HANDLE; }
+    bool isPoolBacked() const { return pool != nullptr; }
 
 private:
     VkDevice device = VK_NULL_HANDLE;
@@ -303,6 +381,8 @@ private:
     VkImageView view = VK_NULL_HANDLE;
     VkSampler sampler = VK_NULL_HANDLE;
     uint32_t w = 0, h = 0;
+    GPUMemoryPool* pool = nullptr;
+    SubAllocation poolAlloc {};
 };
 
 } // jvk::core

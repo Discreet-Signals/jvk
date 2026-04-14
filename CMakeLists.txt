@@ -1,25 +1,74 @@
 cmake_minimum_required(VERSION 3.20)
 project(jvk_project VERSION 1.0)
 
-option(DS_VULKAN_BUILD_EXAMPLES "Build example projects" OFF)
-
 # ==============================================================================
-# JUCE module
+# JUCE
 # ==============================================================================
 
 if (NOT COMMAND juce_add_module)
-    message(FATAL_ERROR "JUCE must be added to your project before jvk!")
+    include(FetchContent)
+    FetchContent_Declare(
+        JUCE
+        GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+        GIT_TAG        8.0.12
+        GIT_SHALLOW    TRUE
+    )
+    FetchContent_MakeAvailable(JUCE)
 endif()
 
-juce_add_module("${CMAKE_CURRENT_SOURCE_DIR}")
+# ==============================================================================
+# msdfgen — MSDF text rendering (core only, no FreeType dependency)
+# ==============================================================================
+
+FetchContent_Declare(
+    msdfgen
+    GIT_REPOSITORY https://github.com/Chlumsky/msdfgen.git
+    GIT_TAG        v1.12
+    GIT_SHALLOW    TRUE
+)
+set(MSDFGEN_CORE_ONLY ON CACHE BOOL "" FORCE)
+set(MSDFGEN_BUILD_STANDALONE OFF CACHE BOOL "" FORCE)
+set(MSDFGEN_USE_SKIA OFF CACHE BOOL "" FORCE)
+set(MSDFGEN_USE_VCPKG OFF CACHE BOOL "" FORCE)
+set(MSDFGEN_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(msdfgen)
+
+# ==============================================================================
+# jvk module — manual INTERFACE target
+#
+# We cannot use juce_add_module() because it does a GLOB_RECURSE from the
+# module directory. Since the module lives at the repo root alongside
+# examples/, shaders/, and build/, the glob picks up non-module files and
+# triggers infinite reconfigure loops.
+#
+# This creates the same INTERFACE target that juce_add_module would.
+# Consumers link with:  target_link_libraries(MyPlugin PRIVATE jvk)
+# ==============================================================================
+
+if (NOT TARGET jvk)
+    add_library(jvk INTERFACE)
+
+    # Parent dir as include root so #include <jvk/jvk.h> resolves
+    target_include_directories(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/..")
+
+    # Module sources — compiled by each consuming target (standard JUCE module pattern).
+    # On macOS the .mm includes the .cpp; on other platforms compile .cpp directly.
+    if (APPLE)
+        target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk.mm")
+    else()
+        target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk.cpp")
+    endif()
+
+    # Tell JUCE this module is available
+    target_compile_definitions(jvk INTERFACE JUCE_MODULE_AVAILABLE_jvk=1)
+
+    # MSDF text rendering
+    target_link_libraries(jvk INTERFACE msdfgen::msdfgen-core)
+endif()
 
 # ==============================================================================
 # Vulkan SDK discovery
 # ==============================================================================
-# On macOS, setup-env.sh sets VULKAN_SDK to ~/VulkanSDK/<version>/macOS.
-# IDEs often don't inherit shell env vars, so auto-detect when missing.
-# On Windows/Linux the SDK installer registers itself system-wide and
-# find_package(Vulkan) works without VULKAN_SDK being set.
 
 if (APPLE AND NOT DEFINED ENV{VULKAN_SDK})
     file(GLOB _DS_VK_SDK_CANDIDATES "$ENV{HOME}/VulkanSDK/*/macOS")
@@ -39,41 +88,23 @@ target_link_libraries(jvk INTERFACE Vulkan::Vulkan)
 # ==============================================================================
 
 if (APPLE)
-    # --- macOS / MoltenVK ---
     target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_MACOS_MVK)
     target_link_libraries(jvk INTERFACE "-framework QuartzCore")
     target_link_options(jvk INTERFACE "LINKER:-rpath,@loader_path/../Frameworks")
 
-    # Locate MoltenVK from the SDK
     if (DEFINED ENV{VULKAN_SDK})
         set(_DS_VK_MVK_LIB "$ENV{VULKAN_SDK}/lib/libMoltenVK.dylib")
         set(_DS_VK_LOADER   "$ENV{VULKAN_SDK}/lib/libvulkan.1.dylib")
     endif()
 
-    # Link MoltenVK
     if (_DS_VK_MVK_LIB AND EXISTS "${_DS_VK_MVK_LIB}")
         target_link_libraries(jvk INTERFACE "${_DS_VK_MVK_LIB}")
     endif()
 
-    # ------------------------------------------------------------------
-    # jvk_bundle(TARGET)
-    #
-    # Call this on each JUCE format target (e.g. MyPlugin_Standalone) to
-    # copy the Vulkan loader + MoltenVK + ICD manifest into the .app/.vst3
-    # bundle so the plugin works without VULKAN_SDK at runtime.
-    #
-    # Example:
-    #   foreach(fmt Standalone VST3 AU)
-    #       if (TARGET MyPlugin_${fmt})
-    #           jvk_bundle(MyPlugin_${fmt})
-    #       endif()
-    #   endforeach()
-    # ------------------------------------------------------------------
     if (_DS_VK_MVK_LIB AND EXISTS "${_DS_VK_MVK_LIB}")
         set(DS_VULKAN_MVK_LIB "${_DS_VK_MVK_LIB}" CACHE INTERNAL "Path to libMoltenVK.dylib")
         set(DS_VULKAN_LOADER  "${_DS_VK_LOADER}"   CACHE INTERNAL "Path to libvulkan.1.dylib")
 
-        # Write the ICD manifest once at configure time
         set(_DS_VK_ICD_JSON "${CMAKE_CURRENT_BINARY_DIR}/MoltenVK_icd.json")
         file(WRITE "${_DS_VK_ICD_JSON}" [=[{
     "file_format_version": "1.0.0",
@@ -86,7 +117,6 @@ if (APPLE)
         set(DS_VULKAN_ICD_JSON "${_DS_VK_ICD_JSON}" CACHE INTERNAL "Path to bundled ICD manifest")
 
         function(jvk_bundle TARGET)
-            # Copy MoltenVK into Frameworks/
             add_custom_command(TARGET ${TARGET} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory
                     "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks"
@@ -95,7 +125,6 @@ if (APPLE)
                     "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks/libMoltenVK.dylib"
                 COMMENT "jvk: Bundling MoltenVK into ${TARGET}"
             )
-            # Copy Vulkan loader into Frameworks/
             if (EXISTS "${DS_VULKAN_LOADER}")
                 add_custom_command(TARGET ${TARGET} POST_BUILD
                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -103,7 +132,6 @@ if (APPLE)
                         "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks/libvulkan.1.dylib"
                 )
             endif()
-            # Install ICD manifest so the loader finds MoltenVK without env vars
             add_custom_command(TARGET ${TARGET} POST_BUILD
                 COMMAND ${CMAKE_COMMAND} -E make_directory
                     "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Resources/vulkan/icd.d"
@@ -115,15 +143,9 @@ if (APPLE)
     endif()
 
 elseif (WIN32)
-    # --- Windows ---
-    # The Vulkan SDK installs a system-wide loader (vulkan-1.dll) and GPU
-    # vendors ship ICD drivers, so no bundling is needed.
     target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_WIN32_KHR)
 
 elseif (UNIX)
-    # --- Linux (X11 / Wayland) ---
-    # Vulkan loader and Mesa/proprietary ICDs are system packages.
-    # Surface extension is selected at compile time.
     find_package(X11 QUIET)
     if (X11_FOUND)
         target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_XLIB_KHR)
@@ -131,9 +153,12 @@ elseif (UNIX)
 endif()
 
 # ==============================================================================
-# Examples
+# Examples — EXCLUDE_FROM_ALL: show up as IDE targets, don't build by default.
+# Build a specific one with: cmake --build build --target VulkanCompressor_Standalone
 # ==============================================================================
 
-if (DS_VULKAN_BUILD_EXAMPLES)
-    add_subdirectory(examples)
-endif()
+add_subdirectory(examples/benchmark          EXCLUDE_FROM_ALL)
+add_subdirectory(examples/compressor        EXCLUDE_FROM_ALL)
+add_subdirectory(examples/triangles         EXCLUDE_FROM_ALL)
+add_subdirectory(examples/waveform          EXCLUDE_FROM_ALL)
+add_subdirectory(examples/shader_background EXCLUDE_FROM_ALL)

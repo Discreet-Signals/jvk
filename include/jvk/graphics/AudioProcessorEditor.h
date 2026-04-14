@@ -32,16 +32,22 @@ public:
         : juce::AudioProcessorEditor(p), paintBridge(*this)
     {
         addAndMakeVisible(vulkanRenderer);
+        vulkanRenderer.setInterceptsMouseClicks(false, false);
         vulkanRenderer.addChildComponent(&paintBridge);
         addComponentListener(this);
+        setCachedComponentImage(new NullCachedImage());
+        vulkanRenderer.setRendering(true);
     }
 
     explicit AudioProcessorEditor(juce::AudioProcessor* p)
         : juce::AudioProcessorEditor(p), paintBridge(*this)
     {
         addAndMakeVisible(vulkanRenderer);
+        vulkanRenderer.setInterceptsMouseClicks(false, false);
         vulkanRenderer.addChildComponent(&paintBridge);
         addComponentListener(this);
+        setCachedComponentImage(new NullCachedImage());
+        vulkanRenderer.setRendering(true);
     }
 
     ~AudioProcessorEditor() override
@@ -49,11 +55,24 @@ public:
         removeComponentListener(this);
     }
 
-    // Toggle between Vulkan and JUCE software rendering
+    // Toggle between Vulkan and JUCE software rendering.
+    // When Vulkan is enabled, JUCE's software repaint is disabled via
+    // setCachedComponentImage — only the Vulkan render loop calls paint().
+    // When disabled, normal JUCE software rendering resumes.
     void setVulkanEnabled(bool enabled)
     {
         vulkanEnabled = enabled;
         vulkanRenderer.setVisible(enabled);
+        if (enabled)
+        {
+            setCachedComponentImage(new NullCachedImage());
+            vulkanRenderer.setRendering(true);
+        }
+        else
+        {
+            vulkanRenderer.setRendering(false);
+            setCachedComponentImage(nullptr);
+        }
         repaint();
     }
 
@@ -64,6 +83,10 @@ public:
         return vulkanRenderer.getStatus() == core::VulkanStatus::Ready;
     }
 
+    bool isInVulkanRender() const { return inVulkanRender; }
+
+    VulkanRenderer& getVulkanRenderer() { return vulkanRenderer; }
+
     // Physically correct sRGB blending (brighter semi-transparent content)
     // vs JUCE-identical UNORM blending (default). Requires rebuild.
     void setSRGBPipeline(bool enabled)
@@ -73,11 +96,32 @@ public:
     }
     bool isSRGBPipeline() const { return srgbPipelineMode; }
 
+    int getVulkanFps() const { return vulkanFps; }
+
 private:
+    // Tells JUCE's repaint manager to skip software rendering for this component.
+    // paintWithinParentContext() sees this and calls paint() on it (no-op) instead
+    // of paintEntireComponent(). The Vulkan render path calls paintEntireComponent()
+    // directly, bypassing this entirely.
+    struct NullCachedImage : public juce::CachedComponentImage
+    {
+        void paint(juce::Graphics&) override {}
+        bool invalidateAll() override { return false; }
+        bool invalidate(const juce::Rectangle<int>&) override { return false; }
+        void releaseResources() override {}
+    };
+
     void componentMovedOrResized(juce::Component&, bool, bool wasResized) override
     {
         if (wasResized)
         {
+            if (auto* c = getConstrainer())
+            {
+                constexpr float pixelScale = 2.0f;
+                vulkanRenderer.setMaxSize(
+                    static_cast<int>(c->getMaximumWidth()  * pixelScale),
+                    static_cast<int>(c->getMaximumHeight() * pixelScale));
+            }
             vulkanRenderer.setBounds(getLocalBounds());
             // PaintBridge bounds must match the 2x swapchain resolution
             auto b = getLocalBounds().toFloat();
@@ -119,7 +163,7 @@ private:
             descriptorHelper->addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                           VK_SHADER_STAGE_FRAGMENT_BIT);
             auto dsLayout = descriptorHelper->buildLayout();
-            descriptorHelper->createPool(128); // descriptor sets for textures + effects
+            descriptorHelper->createPool(512); // descriptor sets for textures, atlas pages, gradients
 
             // --- Main SDF+textured pipeline ---
             {
@@ -141,6 +185,45 @@ private:
                     device, renderer.getRenderPass(),
                     std::move(sg), renderer.getMSAASamples(),
                     std::move(vertLayout), std::move(config));
+            }
+
+            // --- Main pipeline with stencil clip test ---
+            // Same as main pipeline, but only draws where stencil != 0.
+            // Used when a path clip is active (stencilClipDepth > 0).
+            {
+                VertexLayout clipVertLayout;
+                clipVertLayout.binding = { 0, sizeof(UIVertex), VK_VERTEX_INPUT_RATE_VERTEX };
+                clipVertLayout.attributes = {
+                    { 0, 0, VK_FORMAT_R32G32_SFLOAT,       offsetof(UIVertex, position) },
+                    { 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, color) },
+                    { 2, 0, VK_FORMAT_R32G32_SFLOAT,        offsetof(UIVertex, uv) },
+                    { 3, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, shapeInfo) }
+                };
+
+                shaders::ShaderGroup clipSg;
+                clipSg.addShader(VK_SHADER_STAGE_VERTEX_BIT,
+                                  shaders::ui2d::vert_spv, shaders::ui2d::vert_spvSize);
+                clipSg.addShader(VK_SHADER_STAGE_FRAGMENT_BIT,
+                                  shaders::ui2d::frag_spv, shaders::ui2d::frag_spvSize);
+                clipSg.addDescriptorSetLayout(dsLayout);
+
+                PipelineConfig clipConfig;
+                clipConfig.cullMode = VK_CULL_MODE_NONE;
+                clipConfig.depthTestEnable = false;
+                clipConfig.depthWriteEnable = false;
+                clipConfig.blendMode = BlendMode::AlphaBlend;
+                clipConfig.pushConstantRanges = pushRanges;
+                // Stencil test: only draw where stencil >= ref (ref set dynamically)
+                clipConfig.stencilTestEnable = true;
+                clipConfig.stencilCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+                clipConfig.stencilPassOp = VK_STENCIL_OP_KEEP;
+                clipConfig.stencilFailOp = VK_STENCIL_OP_KEEP;
+                clipConfig.stencilWriteMask = 0x00; // don't modify stencil during drawing
+
+                mainClipPipeline = std::make_unique<Pipeline>(
+                    device, renderer.getRenderPass(),
+                    std::move(clipSg), renderer.getMSAASamples(),
+                    std::move(clipVertLayout), std::move(clipConfig));
             }
 
             // --- Stencil write pipeline ---
@@ -218,6 +301,8 @@ private:
                     std::move(coverVertLayout), std::move(coverConfig));
             }
 
+
+
             // --- Multiply blend pipeline (for color grading effects) ---
             {
                 shaders::ShaderGroup mulSg;
@@ -249,45 +334,12 @@ private:
                     std::move(mulVertLayout), std::move(mulConfig));
             }
 
-            // --- HSV effect pipeline (reads framebuffer via input attachment) ---
-            {
-                // Separate descriptor set layout for input attachment (set 0, binding 1)
-                hsvDescriptorHelper = std::make_unique<core::DescriptorHelper>(device);
-                hsvDescriptorHelper->addBinding(0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                                                  VK_SHADER_STAGE_FRAGMENT_BIT);
-                hsvDescriptorHelper->addBinding(1, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,
-                                                  VK_SHADER_STAGE_FRAGMENT_BIT);
-                auto hsvDsLayout = hsvDescriptorHelper->buildLayout();
-                hsvDescriptorHelper->createPool(4);
-
-                shaders::ShaderGroup hsvSg;
-                hsvSg.addShader(VK_SHADER_STAGE_VERTEX_BIT,
-                                 shaders::ui2d::vert_spv, shaders::ui2d::vert_spvSize);
-                hsvSg.addShader(VK_SHADER_STAGE_FRAGMENT_BIT,
-                                 shaders::ui2d::hsv_frag_spv, shaders::ui2d::hsv_frag_spvSize);
-                hsvSg.addDescriptorSetLayout(hsvDsLayout);
-
-                VertexLayout hsvVertLayout;
-                hsvVertLayout.binding = { 0, sizeof(UIVertex), VK_VERTEX_INPUT_RATE_VERTEX };
-                hsvVertLayout.attributes = {
-                    { 0, 0, VK_FORMAT_R32G32_SFLOAT,       offsetof(UIVertex, position) },
-                    { 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, color) },
-                    { 2, 0, VK_FORMAT_R32G32_SFLOAT,        offsetof(UIVertex, uv) },
-                    { 3, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, shapeInfo) }
-                };
-
-                PipelineConfig hsvConfig;
-                hsvConfig.cullMode = VK_CULL_MODE_NONE;
-                hsvConfig.depthTestEnable = false;
-                hsvConfig.depthWriteEnable = false;
-                hsvConfig.blendMode = BlendMode::Opaque; // overwrite with HSV result
-                hsvConfig.pushConstantRanges = pushRanges;
-
-                hsvPipeline = std::make_unique<Pipeline>(
-                    device, renderer.getRenderPass(),
-                    std::move(hsvSg), renderer.getMSAASamples(),
-                    std::move(hsvVertLayout), std::move(hsvConfig));
-            }
+            // --- HSV effect pipeline ---
+            // TODO: HSV needs framebuffer read-back. Requires either:
+            //   1. Copy framebuffer to temp texture (like blur does), or
+            //   2. Proper subpassInput with MoltenVK resource type annotations.
+            // Disabled for now — drawEffectQuad null-checks the pipeline pointer.
+            // hsvPipeline remains nullptr.
 
             // --- Blur pipeline (reads from temp texture sampler) ---
             {
@@ -354,13 +406,38 @@ private:
             texCache.commandPool = renderer.getCommandPool();
             texCache.graphicsQueue = renderer.getGraphicsQueue();
 
+            // --- GPU memory pool (sub-allocator) ---
+            memoryPool.init(physDevice, device);
+
+            // --- Vertex ring buffer (zero-alloc dynamic geometry) ---
+            ringBuffer.create(physDevice, device);
+
+            // --- Staging belt for batched texture uploads ---
+            stagingBelt.init(physDevice, device);
+
+            // Wire staging into caches (enables deferred uploads)
+            gradCache.stagingBelt = &stagingBelt;
+            gradCache.pendingUploads = &pendingUploads;
+            gradCache.defaultDescriptorSet = defaultDescriptorSet;
+            texCache.stagingBelt = &stagingBelt;
+            texCache.pendingUploads = &pendingUploads;
+            texCache.defaultDescriptorSet = defaultDescriptorSet;
+
             setPipeline(mainPipeline->getInternal());
         }
 
         void removedFromRenderer(const VulkanRenderer&) override
         {
             if (!device) return;
+            // Free any retired descriptor sets before destroying the pool
+            for (int i = 0; i < MAX_FRAMES; ++i)
+            {
+                for (auto ds : retiredDescriptorSets[i])
+                    descriptorHelper->freeSet(ds);
+                retiredDescriptorSets[i].clear();
+            }
             mainPipeline.reset();
+            mainClipPipeline.reset();
             stencilPipeline.reset();
             stencilCoverPipeline.reset();
             multiplyPipeline.reset();
@@ -370,9 +447,40 @@ private:
             hsvDescriptorHelper.reset();
             defaultTexture.destroy();
             blurTempImage.destroy();
+            ringBuffer.destroy();
+            stagingBelt.destroy();
             texCache.clear();
             gradCache.clear();
             glyphAtlas.clear();
+            memoryPool.destroy();
+        }
+
+        void prepareFrame(VkCommandBuffer& commandBuffer) override
+        {
+            int frameIdx = static_cast<int>(getRenderer()->getCurrentFrame() % MAX_FRAMES);
+
+            // Safe: VulkanInstance waited on inFlightFences[currentFrame]
+            deletionQueues[frameIdx].flush();
+
+            // Free descriptor sets retired during a previous frame on this slot
+            for (auto ds : retiredDescriptorSets[frameIdx])
+                descriptorHelper->freeSet(ds);
+            retiredDescriptorSets[frameIdx].clear();
+
+            stagingBelt.recycle(usedStagingBlocks[frameIdx]);
+
+            // Begin ring buffer frame — resets write head, passes DeletionQueue for growth
+            if (ringBuffer.isValid())
+                ringBuffer.beginFrame(frameIdx, &deletionQueues[frameIdx]);
+
+            // Record upload commands for resources staged during previous frames.
+            // These must execute before the render pass so images are in
+            // SHADER_READ_ONLY_OPTIMAL layout when fragment shaders sample them.
+            core::StagingBelt::recordUploads(commandBuffer, pendingUploads);
+
+            // Move staging blocks used for these uploads to the per-frame list
+            // so they stay alive until this frame's fence signals.
+            stagingBelt.moveActiveTo(usedStagingBlocks[frameIdx]);
         }
 
         void render(VkCommandBuffer& commandBuffer) override
@@ -385,8 +493,14 @@ private:
 
             // Lazy-allocate blur temp image (persistent, reused every frame)
             uint32_t fw = static_cast<uint32_t>(w), fh = static_cast<uint32_t>(h);
+            int frameIdx = static_cast<int>(getRenderer()->getCurrentFrame() % MAX_FRAMES);
             if (blurTempImage.getWidth() != fw || blurTempImage.getHeight() != fh)
             {
+                // Retire old descriptor set — freed once the GPU is done with this frame slot
+                if (blurDescriptorSet != VK_NULL_HANDLE)
+                    retiredDescriptorSets[frameIdx].push_back(blurDescriptorSet);
+                blurDescriptorSet = VK_NULL_HANDLE;
+
                 blurTempImage.destroy();
                 if (fw > 0 && fh > 0)
                 {
@@ -397,8 +511,9 @@ private:
 
                     // Update blur descriptor set
                     blurDescriptorSet = descriptorHelper->allocateSet();
-                    core::DescriptorHelper::writeImage(device, blurDescriptorSet, 0,
-                        blurTempImage.getView(), blurTempImage.getSampler());
+                    if (blurDescriptorSet != VK_NULL_HANDLE)
+                        core::DescriptorHelper::writeImage(device, blurDescriptorSet, 0,
+                            blurTempImage.getView(), blurTempImage.getSampler());
                 }
             }
 
@@ -409,9 +524,6 @@ private:
             // Note: these are set by VulkanInstance before calling render
             rpInfo.extent = { fw, fh };
 
-            // Upload any dirty glyph atlas pages before rendering
-            glyphAtlas.uploadDirtyPages();
-
             // Update cache frame counters and evict stale entries
             texCache.currentFrame++;
             gradCache.currentFrame++;
@@ -421,8 +533,6 @@ private:
                 gradCache.evict();
             }
 
-            int frameIdx = static_cast<int>(getRenderer()->getCurrentFrame() % MAX_FRAMES);
-
             VulkanGraphicsContext ctx(
                 commandBuffer, mainPipeline->getInternal(), mainPipeline->getLayout(),
                 w, h, physDevice, device, 2.0f,
@@ -431,15 +541,40 @@ private:
                 defaultDescriptorSet,
                 editor.srgbPipelineMode, multiplyPipeline.get(),
                 hsvPipeline.get(), blurPipeline.get(), rpInfo,
-                &blurTempImage, blurDescriptorSet, &texCache, &glyphAtlas, &gradCache);
+                &blurTempImage, blurDescriptorSet, &texCache, &glyphAtlas, &gradCache,
+                &deletionQueues[frameIdx],
+                ringBuffer.isValid() ? &ringBuffer : nullptr);
+            ctx.mainClipPipeline = mainClipPipeline.get();
 
             juce::Graphics g(ctx);
+            editor.inVulkanRender = true;
             editor.paintEntireComponent(g, false);
-            ctx.flush();
+            editor.inVulkanRender = false;
+
+            // FPS tracking — always active
+            {
+                auto now = std::chrono::steady_clock::now();
+                fpsTimestamps.push_back(now);
+                auto cutoff = now - std::chrono::seconds(1);
+                while (!fpsTimestamps.empty() && fpsTimestamps.front() < cutoff)
+                    fpsTimestamps.pop_front();
+                editor.vulkanFps = static_cast<int>(fpsTimestamps.size());
+            }
+
+            // Stage dirty atlas pages for upload in the next frame's prepareFrame().
+            // New glyphs render as invisible (white atlas background) for one frame.
+            glyphAtlas.stageDirtyPages(stagingBelt, pendingUploads);
+
+            graphics::flush(ctx);
+
+            // End ring buffer frame — record end position
+            if (ringBuffer.isValid())
+                ringBuffer.endFrame();
         }
 
         AudioProcessorEditor& editor;
         std::unique_ptr<Pipeline> mainPipeline;
+        std::unique_ptr<Pipeline> mainClipPipeline;
         std::unique_ptr<Pipeline> stencilPipeline;
         std::unique_ptr<Pipeline> stencilCoverPipeline;
         std::unique_ptr<Pipeline> multiplyPipeline;
@@ -452,10 +587,18 @@ private:
         VkPhysicalDevice physDevice = VK_NULL_HANDLE;
         VkDevice device = VK_NULL_HANDLE;
         static constexpr int MAX_FRAMES = 2;
-        core::Buffer persistentBuffers[MAX_FRAMES];
+        core::GPUMemoryPool memoryPool;             // sub-allocator (reduces vkAllocateMemory to ~3 calls)
+        core::VertexRingBuffer ringBuffer;           // zero-alloc per-frame vertex uploads
+        core::Buffer persistentBuffers[MAX_FRAMES]; // legacy fallback (used if ring buffer unavailable)
         void* mappedPtrs[MAX_FRAMES] = {};
+        core::DeletionQueue deletionQueues[MAX_FRAMES];
+        core::StagingBelt stagingBelt;
+        std::vector<core::StagingBelt::Block> usedStagingBlocks[MAX_FRAMES];
+        std::vector<core::PendingUpload> pendingUploads;
         core::Image blurTempImage;      // lazy persistent — allocated on first blur, reused
         VkDescriptorSet blurDescriptorSet = VK_NULL_HANDLE;
+        std::vector<VkDescriptorSet> retiredDescriptorSets[MAX_FRAMES]; // freed after fence
+        std::deque<std::chrono::steady_clock::time_point> fpsTimestamps;
         TextureCache texCache;          // GPU texture cache for drawImage
         GradientCache gradCache;        // GPU gradient LUT cache
         GlyphAtlas glyphAtlas;          // GPU glyph atlas for text rendering
@@ -465,6 +608,8 @@ private:
     PaintBridge paintBridge;
     bool vulkanEnabled = true;
     bool srgbPipelineMode = false;
+    bool inVulkanRender = false;
+    int vulkanFps = 0;
 };
 
 } // jvk

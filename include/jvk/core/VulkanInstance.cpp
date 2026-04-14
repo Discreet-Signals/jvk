@@ -370,7 +370,10 @@ bool VulkanInstance::createSwapChain()
     info.physicalDevice = physicalDevice;
     info.device = device;
     info.surface = surface;
-    info.size = { width.load(), height.load() };
+    if (settings.maxWidth > 0 && settings.maxHeight > 0)
+        info.size = { settings.maxWidth, settings.maxHeight };
+    else
+        info.size = { width.load(), height.load() };
     info.graphicsQueueFamilyIndex = graphicsQueueFamilyIndex;
     info.presentQueueFamilyIndex = presentQueueFamilyIndex;
     info.renderPass = renderPass;
@@ -407,9 +410,20 @@ bool VulkanInstance::createSwapChain()
     // Reset per-image fence tracking
     imagesInFlight.assign(newImageCount, VK_NULL_HANDLE);
 
-    viewport.width = (float) swapChain->getWidth();
-    viewport.height = (float) swapChain->getHeight();
-    scissor.extent = swapChain->getExtent();
+    int w = width.load();
+    int h = height.load();
+    if (settings.maxWidth > 0 && settings.maxHeight > 0 && w > 0 && h > 0)
+    {
+        viewport.width = static_cast<float>(w);
+        viewport.height = static_cast<float>(h);
+        scissor.extent = { static_cast<uint32_t>(w), static_cast<uint32_t>(h) };
+    }
+    else
+    {
+        viewport.width = (float) swapChain->getWidth();
+        viewport.height = (float) swapChain->getHeight();
+        scissor.extent = swapChain->getExtent();
+    }
     return true;
 }
 
@@ -421,7 +435,7 @@ bool VulkanInstance::createRenderPass()
 {
     DBG("Creating Render Pass...");
 
-    // Attachment 0: MSAA color
+    // Attachment 0: MSAA color (4x multisampled — render target)
     VkAttachmentDescription colorAttachment = {};
     colorAttachment.format = swapChain->getFormat();
     colorAttachment.samples = settings.msaaSamples;
@@ -433,7 +447,7 @@ bool VulkanInstance::createRenderPass()
     colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     VkAttachmentReference colorAttachmentRef = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
 
-    // Attachment 1: Resolve (1x)
+    // Attachment 1: Resolve (1x swapchain image — MSAA resolves here)
     VkAttachmentDescription resolveAttachment = {};
     resolveAttachment.format = swapChain->getFormat();
     resolveAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -445,9 +459,9 @@ bool VulkanInstance::createRenderPass()
     resolveAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     VkAttachmentReference resolveAttachmentRef = { 1, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
 
-    // Attachment 2: Depth
+    // Attachment 2: Depth/Stencil (multisampled to match MSAA)
     VkAttachmentDescription depthAttachment = {};
-    depthAttachment.format = VK_FORMAT_D24_UNORM_S8_UINT;
+    depthAttachment.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
     depthAttachment.samples = settings.msaaSamples;
     depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -457,28 +471,12 @@ bool VulkanInstance::createRenderPass()
     depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     VkAttachmentReference depthAttachmentRef = { 2, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
 
-    // Input attachment ref — allows fragment shader to read the MSAA color attachment
-    VkAttachmentReference inputAttachmentRef = { 0, VK_IMAGE_LAYOUT_GENERAL };
-
     VkSubpassDescription subpass = {};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &colorAttachmentRef;
     subpass.pResolveAttachments = &resolveAttachmentRef;
     subpass.pDepthStencilAttachment = &depthAttachmentRef;
-    subpass.inputAttachmentCount = 1;
-    subpass.pInputAttachments = &inputAttachmentRef;
-
-    // Self-dependency: allows reading the color attachment we're writing to
-    // (for post-processing effects like HSV, blur that need framebuffer read)
-    VkSubpassDependency selfDep = {};
-    selfDep.srcSubpass = 0;
-    selfDep.dstSubpass = 0;
-    selfDep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    selfDep.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    selfDep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    selfDep.dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
-    selfDep.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
 
     VkAttachmentDescription attachments[3] = { colorAttachment, resolveAttachment, depthAttachment };
     VkRenderPassCreateInfo renderPassInfo = {};
@@ -487,8 +485,6 @@ bool VulkanInstance::createRenderPass()
     renderPassInfo.pAttachments = attachments;
     renderPassInfo.subpassCount = 1;
     renderPassInfo.pSubpasses = &subpass;
-    renderPassInfo.dependencyCount = 1;
-    renderPassInfo.pDependencies = &selfDep;
 
     if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS)
     {
@@ -650,6 +646,10 @@ void VulkanInstance::submitCommandBuffer(int i)
     renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
     renderPassInfo.pClearValues = clearValues.data();
 
+    // Pre-render-pass phase: record deferred uploads (staging → image transfers).
+    // Must happen before the render pass so images are in SHADER_READ_ONLY layout.
+    prepareComponents(commandBuffers[i]);
+
     vkCmdBeginRenderPass(commandBuffers[i], &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
 
     vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, defaultPipeline->getInternal());
@@ -657,6 +657,72 @@ void VulkanInstance::submitCommandBuffer(int i)
     renderComponents(commandBuffers[i]);
 
     vkCmdEndRenderPass(commandBuffers[i]);
+
+    // In max-size mode, the render pass resolved MSAA → resolve image (1x)
+    // at the viewport size in the top-left corner.  Blit NEAREST from the
+    // resolve image to the swapchain image, filling it completely.
+    // NEAREST duplicates pixels into identical blocks; the compositor's
+    // downsample averages them back — lossless round-trip.
+    if (settings.maxWidth > 0 && settings.maxHeight > 0)
+    {
+        VkImage resolveImg = swapChain->getResolveImage(i);
+        VkImage scImg      = swapChain->getSwapchainImage(i);
+        VkExtent2D scExtent = swapChain->getExtent();
+
+        VkImageMemoryBarrier barriers[2] = {};
+        barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barriers[0].image = resolveImg;
+        barriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+        barriers[1] = barriers[0];
+        barriers[1].image = scImg;
+        barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barriers[1].srcAccessMask = 0;
+        barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+        vkCmdPipelineBarrier(commandBuffers[i],
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 2, barriers);
+
+        VkImageBlit blitRegion = {};
+        blitRegion.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blitRegion.srcOffsets[0] = { 0, 0, 0 };
+        blitRegion.srcOffsets[1] = { static_cast<int32_t>(scissor.extent.width),
+                                     static_cast<int32_t>(scissor.extent.height), 1 };
+        blitRegion.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        blitRegion.dstOffsets[0] = { 0, 0, 0 };
+        blitRegion.dstOffsets[1] = { static_cast<int32_t>(scExtent.width),
+                                     static_cast<int32_t>(scExtent.height), 1 };
+
+        vkCmdBlitImage(commandBuffers[i],
+            resolveImg, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            scImg,      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1, &blitRegion, VK_FILTER_NEAREST);
+
+        VkImageMemoryBarrier presentBarrier = {};
+        presentBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        presentBarrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        presentBarrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        presentBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        presentBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        presentBarrier.image = scImg;
+        presentBarrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        presentBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        presentBarrier.dstAccessMask = 0;
+
+        vkCmdPipelineBarrier(commandBuffers[i],
+            VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &presentBarrier);
+    }
 
     if (vkEndCommandBuffer(commandBuffers[i]) != VK_SUCCESS)
         DBG("Failed to Edit Command Buffer " << i << "!");
@@ -672,7 +738,20 @@ void VulkanInstance::checkForResize()
         return;
 
     windowResized.store(false);
-    needsSwapchainRecreation = true;
+
+    if (settings.maxWidth > 0 && settings.maxHeight > 0)
+    {
+        int w = width.load();
+        int h = height.load();
+        if (w > 0 && h > 0)
+        {
+            viewport.width = static_cast<float>(w);
+            viewport.height = static_cast<float>(h);
+            scissor.extent = { static_cast<uint32_t>(w), static_cast<uint32_t>(h) };
+        }
+    }
+    else
+        needsSwapchainRecreation = true;
 }
 
 void VulkanInstance::execute()
@@ -747,8 +826,10 @@ void VulkanInstance::execute()
     presentInfo.pImageIndices = &imageIndex;
 
     result = vkQueuePresentKHR(presentQueue, &presentInfo);
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
-        needsSwapchainRecreation = true; // Recreate next frame, don't stall now
+    if (result == VK_ERROR_OUT_OF_DATE_KHR)
+        needsSwapchainRecreation = true;
+    else if (result == VK_SUBOPTIMAL_KHR && !(settings.maxWidth > 0 && settings.maxHeight > 0))
+        needsSwapchainRecreation = true;
 
     totalFrames++;
     currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;

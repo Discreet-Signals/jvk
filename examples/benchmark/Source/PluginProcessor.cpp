@@ -1,47 +1,33 @@
 /*
  ----------------------------------------------------------------------------
  Copyright (c) 2026 Discreet Signals LLC
- 
+
  ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
  ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
  ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
  ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
  ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
  ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
- 
+
  Licensed under the MIT License. See LICENSE file in the project root
  for full license text.
- 
+
  For questions, contact gavin@discreetsignals.com
  ------------------------------------------------------------------------------
- File: PluginEditor.h
+ File: PluginProcessor.cpp
  Author: Gavin Payne
  ------------------------------------------------------------------------------
 */
 
-#pragma once
 #include "PluginProcessor.h"
-#include <jvk/jvk.h>
+#include "PluginEditor.h"
 
-class CompressorEditor : public jvk::AudioProcessorEditor
+juce::AudioProcessorEditor* BenchmarkProcessor::createEditor()
 {
-public:
-    CompressorEditor(CompressorProcessor&);
-    ~CompressorEditor() override = default;
+    return new BenchmarkEditor(*this);
+}
 
-    void paint(juce::Graphics&) override;
-    void resized() override;
-
-private:
-    CompressorProcessor& processor;
-
-    juce::Slider thresholdSlider, ratioSlider, attackSlider, releaseSlider, makeupSlider;
-    juce::Label thresholdLabel, ratioLabel, attackLabel, releaseLabel, makeupLabel;
-
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment>
-        thresholdAttach, ratioAttach, attackAttach, releaseAttach, makeupAttach;
-
-    juce::TextButton vulkanToggle;
-
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(CompressorEditor)
-};
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+{
+    return new BenchmarkProcessor();
+}
