@@ -790,6 +790,9 @@ void VulkanInstance::execute()
 
     imagesInFlight[imageIndex] = inFlightFences[currentFrame];
 
+    // Store for child components that need per-frame swapchain resources
+    currentImageIndex = imageIndex;
+
     // Record command buffer
     submitCommandBuffer(static_cast<int>(imageIndex));
 

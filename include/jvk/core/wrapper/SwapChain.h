@@ -75,6 +75,8 @@ public:
 
     void createFrameBuffers(VkRenderPass renderPass);
     VkFramebuffer getFrameBuffer(int i) { return frameBuffers[i]; }
+    VkImage getMSAAImage(int i) const { return msaaImages[i]; }
+    VkImageView getMSAAImageView(int i) const { return msaaImageViews[i]; }
     VkImage getResolveImage(int i) const { return resolveImages[i]; }
     VkImage getSwapchainImage(int i) const { return images[i]; }
 private:

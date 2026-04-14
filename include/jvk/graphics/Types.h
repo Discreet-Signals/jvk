@@ -32,6 +32,7 @@ struct RenderPassInfo
     VkExtent2D extent = {};
     VkImage msaaImage = VK_NULL_HANDLE;  // source for copy
     VkImageView msaaImageView = VK_NULL_HANDLE;
+    VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_1_BIT;
 };
 
 struct UIVertex

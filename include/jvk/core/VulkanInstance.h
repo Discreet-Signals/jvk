@@ -143,6 +143,8 @@ protected:
     uint32_t graphicsQueueFamilyIndex = UINT32_MAX;
     uint32_t presentQueueFamilyIndex = UINT32_MAX;
 
+    uint32_t currentImageIndex = 0;
+
     // Status and settings
     VulkanStatus status { VulkanStatus::Uninitialized };
     VulkanRendererSettings settings;
