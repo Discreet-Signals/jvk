@@ -110,6 +110,13 @@ inline void drawShader(VulkanGraphicsContext& ctx, Shader& shader,
     ctx.boundPipeline = VK_NULL_HANDLE;
     ctx.boundDescriptorSet = VK_NULL_HANDLE;
     ensureMainPipeline(ctx);
+
+    // Restore scissor to the context's clip bounds
+    auto& cb = ctx.state().clipBounds;
+    VkRect2D restoreScissor = { { cb.getX(), cb.getY() },
+                                { static_cast<uint32_t>(cb.getWidth()),
+                                  static_cast<uint32_t>(cb.getHeight()) } };
+    vkCmdSetScissor(ctx.cmd, 0, 1, &restoreScissor);
 }
 
 } // jvk::graphics
