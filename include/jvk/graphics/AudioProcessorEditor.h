@@ -85,6 +85,8 @@ public:
 
     bool isInVulkanRender() const { return inVulkanRender; }
 
+    int getFps() const { return currentFps; }
+
     VulkanRenderer& getVulkanRenderer() { return vulkanRenderer; }
 
     // Physically correct sRGB blending (brighter semi-transparent content)
@@ -96,9 +98,19 @@ public:
     }
     bool isSRGBPipeline() const { return srgbPipelineMode; }
 
-    int getVulkanFps() const { return vulkanFps; }
+    int getVulkanFps() const { return currentFps; }
 
 private:
+    void paintOverChildren(juce::Graphics&) override
+    {
+        auto now = std::chrono::steady_clock::now();
+        fpsTimestamps.push_back(now);
+        auto cutoff = now - std::chrono::seconds(1);
+        while (!fpsTimestamps.empty() && fpsTimestamps.front() < cutoff)
+            fpsTimestamps.pop_front();
+        currentFps = static_cast<int>(fpsTimestamps.size());
+    }
+
     // Tells JUCE's repaint manager to skip software rendering for this component.
     // paintWithinParentContext() sees this and calls paint() on it (no-op) instead
     // of paintEntireComponent(). The Vulkan render path calls paintEntireComponent()
@@ -520,9 +532,11 @@ private:
             // Build render pass info for blur
             RenderPassInfo rpInfo;
             rpInfo.renderPass = getRenderer()->getRenderPass();
-            // We need the current framebuffer and MSAA image — get from swapchain via renderer
-            // Note: these are set by VulkanInstance before calling render
+            rpInfo.framebuffer = getRenderer()->getCurrentFramebuffer();
             rpInfo.extent = { fw, fh };
+            rpInfo.msaaImage = getRenderer()->getCurrentMSAAImage();
+            rpInfo.msaaImageView = getRenderer()->getCurrentMSAAImageView();
+            rpInfo.msaaSamples = getRenderer()->getMSAASamples();
 
             // Update cache frame counters and evict stale entries
             texCache.currentFrame++;
@@ -550,16 +564,6 @@ private:
             editor.inVulkanRender = true;
             editor.paintEntireComponent(g, false);
             editor.inVulkanRender = false;
-
-            // FPS tracking — always active
-            {
-                auto now = std::chrono::steady_clock::now();
-                fpsTimestamps.push_back(now);
-                auto cutoff = now - std::chrono::seconds(1);
-                while (!fpsTimestamps.empty() && fpsTimestamps.front() < cutoff)
-                    fpsTimestamps.pop_front();
-                editor.vulkanFps = static_cast<int>(fpsTimestamps.size());
-            }
 
             // Stage dirty atlas pages for upload in the next frame's prepareFrame().
             // New glyphs render as invisible (white atlas background) for one frame.
@@ -598,7 +602,6 @@ private:
         core::Image blurTempImage;      // lazy persistent — allocated on first blur, reused
         VkDescriptorSet blurDescriptorSet = VK_NULL_HANDLE;
         std::vector<VkDescriptorSet> retiredDescriptorSets[MAX_FRAMES]; // freed after fence
-        std::deque<std::chrono::steady_clock::time_point> fpsTimestamps;
         TextureCache texCache;          // GPU texture cache for drawImage
         GradientCache gradCache;        // GPU gradient LUT cache
         GlyphAtlas glyphAtlas;          // GPU glyph atlas for text rendering
@@ -609,7 +612,8 @@ private:
     bool vulkanEnabled = true;
     bool srgbPipelineMode = false;
     bool inVulkanRender = false;
-    int vulkanFps = 0;
+    int currentFps = 0;
+    std::deque<std::chrono::steady_clock::time_point> fpsTimestamps;
 };
 
 } // jvk

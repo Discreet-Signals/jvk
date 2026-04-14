@@ -106,6 +106,10 @@ public:
     VkCommandPool getCommandPool() const { return commandPool; }
     VkQueue getGraphicsQueue() const { return graphicsQueue; }
     size_t getCurrentFrame() const { return currentFrame; }
+    uint32_t getCurrentImageIndex() const { return currentImageIndex; }
+    VkFramebuffer getCurrentFramebuffer() const { return swapChain ? swapChain->getFrameBuffer(currentImageIndex) : VK_NULL_HANDLE; }
+    VkImage getCurrentMSAAImage() const { return swapChain ? swapChain->getMSAAImage(currentImageIndex) : VK_NULL_HANDLE; }
+    VkImageView getCurrentMSAAImageView() const { return swapChain ? swapChain->getMSAAImageView(currentImageIndex) : VK_NULL_HANDLE; }
     const core::VulkanRendererSettings& getSettings() const { return settings; }
 
     // --- Runtime settings changes ---

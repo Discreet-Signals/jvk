@@ -27,7 +27,7 @@ inline void drawShader(VulkanGraphicsContext& ctx, Shader& shader,
     // Lazy-init the shader's Vulkan resources using the current context
     shader.ensureCreated(ctx.physDevice, ctx.device,
                          ctx.rpInfo.renderPass,
-                         VK_SAMPLE_COUNT_4_BIT); // match PaintBridge MSAA
+                         ctx.rpInfo.msaaSamples);
     if (!shader.isReady()) return;
 
     // Flush pending UI geometry before switching pipelines
