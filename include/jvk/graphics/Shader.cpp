@@ -137,11 +137,10 @@ void Shader::ensureCreated(VkPhysicalDevice physDevice, VkDevice device,
 
     createDescriptors(physDevice, device);
     createPipeline(device, renderPass, msaa);
+    created = true;
 
     // Upload any textures that were deferred before Vulkan resources existed
     uploadPendingTextures();
-
-    created = true;
 }
 
 void Shader::uploadPendingTextures()
@@ -309,11 +308,12 @@ void Shader::createPipeline(VkDevice device, VkRenderPass renderPass, VkSampleCo
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
-    // Dynamic viewport and scissor
-    VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    // Dynamic viewport, scissor, and stencil reference (for path clipping)
+    VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                       VK_DYNAMIC_STATE_STENCIL_REFERENCE };
     VkPipelineDynamicStateCreateInfo dynamicState = {};
     dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamicState.dynamicStateCount = 2;
+    dynamicState.dynamicStateCount = 3;
     dynamicState.pDynamicStates = dynamicStates;
 
     VkPipelineViewportStateCreateInfo viewportState = {};
@@ -331,12 +331,20 @@ void Shader::createPipeline(VkDevice device, VkRenderPass renderPass, VkSampleCo
     multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisampling.rasterizationSamples = msaa;
 
-    // Depth/stencil — disabled, no stencil interaction
+    // Depth/stencil — stencil test enabled to respect JUCE path clipping
     VkPipelineDepthStencilStateCreateInfo depthStencil = {};
     depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
     depthStencil.depthTestEnable = VK_FALSE;
     depthStencil.depthWriteEnable = VK_FALSE;
-    depthStencil.stencilTestEnable = VK_FALSE;
+    depthStencil.stencilTestEnable = VK_TRUE;
+    depthStencil.front.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+    depthStencil.front.passOp = VK_STENCIL_OP_KEEP;
+    depthStencil.front.failOp = VK_STENCIL_OP_KEEP;
+    depthStencil.front.depthFailOp = VK_STENCIL_OP_KEEP;
+    depthStencil.front.compareMask = 0xFF;
+    depthStencil.front.writeMask = 0x00;
+    depthStencil.front.reference = 0;
+    depthStencil.back = depthStencil.front;
 
     // Opaque blend — shader output replaces framebuffer content
     VkPipelineColorBlendAttachmentState blendAtt = {};
