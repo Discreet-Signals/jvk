@@ -18,7 +18,7 @@ namespace jvk::graphics
 {
 
 // Draw a user's custom fragment shader into the active render pass.
-// The shader pipeline is created lazily on first call using the context's device/render pass.
+// Respects the JUCE transform stack and stencil-based path clipping.
 inline void drawShader(VulkanGraphicsContext& ctx, Shader& shader,
                        juce::Rectangle<float> region = {})
 {
@@ -41,14 +41,24 @@ inline void drawShader(VulkanGraphicsContext& ctx, Shader& shader,
                         sizeof(float) * shader.storageSize);
     }
 
+    // Apply the accumulated JUCE transform (component → physical pixels)
+    auto transform = getFullTransform(ctx);
+    float x1 = region.getX(), y1 = region.getY();
+    float x2 = region.getRight(), y2 = region.getBottom();
+    transform.transformPoint(x1, y1);
+    transform.transformPoint(x2, y2);
+
+    float x = std::min(x1, x2);
+    float y = std::min(y1, y2);
+    float w = std::abs(x2 - x1);
+    float h = std::abs(y2 - y1);
+
     // Bind the shader's pipeline
     vkCmdBindPipeline(ctx.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shader.pipeline);
 
-    // Compute region in physical pixels
-    float x = region.isEmpty() ? 0 : region.getX() * ctx.scale;
-    float y = region.isEmpty() ? 0 : region.getY() * ctx.scale;
-    float w = region.isEmpty() ? ctx.vpWidth : region.getWidth() * ctx.scale;
-    float h = region.isEmpty() ? ctx.vpHeight : region.getHeight() * ctx.scale;
+    // Set stencil reference to match current clip depth (for path clipping)
+    vkCmdSetStencilReference(ctx.cmd, VK_STENCIL_FACE_FRONT_AND_BACK,
+                              ctx.state().stencilClipDepth);
 
     // Push constants: [resX, resY, time, vpW, vpH, regX, regY]
     struct PushConstants {
@@ -72,10 +82,17 @@ inline void drawShader(VulkanGraphicsContext& ctx, Shader& shader,
     vp.maxDepth = 1.0f;
     vkCmdSetViewport(ctx.cmd, 0, 1, &vp);
 
-    // Scissor to region
+    // Scissor to the intersection of the transformed region and the context's clip bounds
+    auto& clipBounds = ctx.state().clipBounds;
+    int sx = std::max(static_cast<int>(x), clipBounds.getX());
+    int sy = std::max(static_cast<int>(y), clipBounds.getY());
+    int sx2 = std::min(static_cast<int>(x + w), clipBounds.getRight());
+    int sy2 = std::min(static_cast<int>(y + h), clipBounds.getBottom());
+
     VkRect2D scissor = {};
-    scissor.offset = { static_cast<int32_t>(x), static_cast<int32_t>(y) };
-    scissor.extent = { static_cast<uint32_t>(w), static_cast<uint32_t>(h) };
+    scissor.offset = { sx, sy };
+    scissor.extent = { static_cast<uint32_t>(std::max(0, sx2 - sx)),
+                       static_cast<uint32_t>(std::max(0, sy2 - sy)) };
     vkCmdSetScissor(ctx.cmd, 0, 1, &scissor);
 
     // Bind descriptor sets
@@ -93,11 +110,6 @@ inline void drawShader(VulkanGraphicsContext& ctx, Shader& shader,
     ctx.boundPipeline = VK_NULL_HANDLE;
     ctx.boundDescriptorSet = VK_NULL_HANDLE;
     ensureMainPipeline(ctx);
-
-    // Restore full viewport scissor
-    VkRect2D fullScissor = { {0, 0}, { static_cast<uint32_t>(ctx.vpWidth),
-                                        static_cast<uint32_t>(ctx.vpHeight) } };
-    vkCmdSetScissor(ctx.cmd, 0, 1, &fullScissor);
 }
 
 } // jvk::graphics
