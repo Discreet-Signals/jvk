@@ -186,8 +186,10 @@ public:
         graphics::executeBlur(ctx, {}, radius);
     }
 
-    void applyShader(VkPipeline shader, juce::Rectangle<float> region = {})
-    { juce::ignoreUnused(shader, region); }
+    void drawShader(Shader& shader, juce::Rectangle<float> region = {})
+    {
+        graphics::drawShader(ctx, shader, region);
+    }
 
     // =========================================================================
     // Direct GPU Access

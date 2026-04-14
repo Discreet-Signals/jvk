@@ -39,5 +39,8 @@ extern "C" {
 #include "include/jvk/reflect/spirv_reflect.c"
 }
 
+// Graphics
+#include "include/jvk/graphics/Shader.cpp"
+
 // Offscreen
 #include "include/jvk/offscreen/ShaderImage.cpp"

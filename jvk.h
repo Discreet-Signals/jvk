@@ -108,6 +108,7 @@
 // Graphics (Vulkan-backed juce::Graphics)
 #include "include/jvk/graphics/UI2DShaders.h"
 #include "include/jvk/graphics/GlyphAtlas.h"
+#include "include/jvk/graphics/Shader.h"
 #include "include/jvk/graphics/VulkanGraphicsContext.h"
 #include "include/jvk/graphics/Graphics.h"
 #include "include/jvk/graphics/AudioProcessorEditor.h"

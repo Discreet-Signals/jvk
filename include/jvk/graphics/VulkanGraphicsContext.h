@@ -186,6 +186,7 @@ public:
 #include "DrawLine.h"
 #include "DrawGlyphs.h"
 #include "Effects.h"
+#include "DrawShader.h"
 
 // ============================================================================
 // Deferred Clipping implementations (need FillPath.h for writeStencilClip)
