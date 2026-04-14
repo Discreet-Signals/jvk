@@ -274,6 +274,8 @@ ShaderImage::~ShaderImage()
     destroyDescriptors();
     destroyRenderTarget();
 
+    if (renderPass) { vkDestroyRenderPass(ctx.device, renderPass, nullptr); renderPass = VK_NULL_HANDLE; }
+
     if (ctx.refCount.fetch_sub(1) == 1)
         ctx.destroy();
 }
@@ -318,29 +320,33 @@ void ShaderImage::createRenderTarget()
     ivci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
     vkCreateImageView(dev, &ivci, nullptr, &colorImageView);
 
-    VkAttachmentDescription att = {};
-    att.format = VK_FORMAT_B8G8R8A8_UNORM;
-    att.samples = VK_SAMPLE_COUNT_1_BIT;
-    att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    att.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    // Render pass is format-dependent, not size-dependent — create once
+    if (renderPass == VK_NULL_HANDLE)
+    {
+        VkAttachmentDescription att = {};
+        att.format = VK_FORMAT_B8G8R8A8_UNORM;
+        att.samples = VK_SAMPLE_COUNT_1_BIT;
+        att.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        att.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        att.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        att.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        att.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        att.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
-    VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
-    VkSubpassDescription sub = {};
-    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount = 1;
-    sub.pColorAttachments = &ref;
+        VkAttachmentReference ref = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+        VkSubpassDescription sub = {};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1;
+        sub.pColorAttachments = &ref;
 
-    VkRenderPassCreateInfo rpci = {};
-    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    rpci.attachmentCount = 1;
-    rpci.pAttachments = &att;
-    rpci.subpassCount = 1;
-    rpci.pSubpasses = &sub;
-    vkCreateRenderPass(dev, &rpci, nullptr, &renderPass);
+        VkRenderPassCreateInfo rpci = {};
+        rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        rpci.attachmentCount = 1;
+        rpci.pAttachments = &att;
+        rpci.subpassCount = 1;
+        rpci.pSubpasses = &sub;
+        vkCreateRenderPass(dev, &rpci, nullptr, &renderPass);
+    }
 
     VkFramebufferCreateInfo fbci = {};
     fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
@@ -388,7 +394,6 @@ void ShaderImage::destroyRenderTarget()
         if (stagingMemory[i])    { vkFreeMemory(dev, stagingMemory[i], nullptr); stagingMemory[i] = VK_NULL_HANDLE; }
     }
     if (framebuffer)      { vkDestroyFramebuffer(dev, framebuffer, nullptr); framebuffer = VK_NULL_HANDLE; }
-    if (renderPass)       { vkDestroyRenderPass(dev, renderPass, nullptr); renderPass = VK_NULL_HANDLE; }
     if (colorImageView)   { vkDestroyImageView(dev, colorImageView, nullptr); colorImageView = VK_NULL_HANDLE; }
     if (colorImage)       { vkDestroyImage(dev, colorImage, nullptr); colorImage = VK_NULL_HANDLE; }
     if (colorImageMemory) { vkFreeMemory(dev, colorImageMemory, nullptr); colorImageMemory = VK_NULL_HANDLE; }
@@ -738,14 +743,10 @@ void ShaderImage::createPipeline()
     inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
     inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
-    VkViewport vp = { 0, 0, (float)w, (float)h, 0, 1 };
-    VkRect2D sc = { {0, 0}, {(uint32_t)w, (uint32_t)h} };
     VkPipelineViewportStateCreateInfo viewportState = {};
     viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     viewportState.viewportCount = 1;
-    viewportState.pViewports = &vp;
     viewportState.scissorCount = 1;
-    viewportState.pScissors = &sc;
 
     VkPipelineRasterizationStateCreateInfo rasterizer = {};
     rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -784,6 +785,12 @@ void ShaderImage::createPipeline()
     plci.pPushConstantRanges = &pcRange;
     vkCreatePipelineLayout(dev, &plci, nullptr, &pipelineLayout);
 
+    VkDynamicState dynamicStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dynamicState = {};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount = 2;
+    dynamicState.pDynamicStates = dynamicStates;
+
     VkGraphicsPipelineCreateInfo gpci = {};
     gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     gpci.stageCount = 2;
@@ -794,6 +801,7 @@ void ShaderImage::createPipeline()
     gpci.pRasterizationState = &rasterizer;
     gpci.pMultisampleState = &multisampling;
     gpci.pColorBlendState = &colorBlending;
+    gpci.pDynamicState = &dynamicState;
     gpci.layout = pipelineLayout;
     gpci.renderPass = renderPass;
 
@@ -823,20 +831,24 @@ void ShaderImage::setSize(int width, int height)
     if (width <= 0 || height <= 0) return;
 
     auto& ctx = getContext();
-    vkDeviceWaitIdle(ctx.device);
+    vkWaitForFences(ctx.device, 2, fence, VK_TRUE, UINT64_MAX);
 
     int savedFps = isTimerRunning() ? (1000 / getTimerInterval()) : 0;
     stopTimer();
     w = width;
     h = height;
 
-    destroyPipeline();
     destroyRenderTarget();
 
-    displayImage = juce::Image(juce::Image::ARGB, w, h, true);
+    displayImage = displayImage.rescaled(w, h);
 
     createRenderTarget();
-    createPipeline();
+
+    // Submit a render at the new size immediately so the next
+    // render() call can copy real content. Skip the staging->display
+    // copy on that first call since the staging buffers are zeroed.
+    skipNextStagingCopy = true;
+    render();
 
     if (savedFps > 0) startTimerHz(savedFps);
 }
@@ -865,6 +877,10 @@ void ShaderImage::render()
     vkWaitForFences(dev, 1, &fence[prev], VK_TRUE, UINT64_MAX);
 
     // Copy previous frame's staging buffer to display image
+    // (skip after resize — staging is zeroed, displayImage has rescaled content)
+    if (skipNextStagingCopy)
+        skipNextStagingCopy = false;
+    else
     {
         juce::Image::BitmapData bd(displayImage, juce::Image::BitmapData::writeOnly);
         const auto* src = static_cast<const uint8_t*>(mappedStagingPtr[prev]);
@@ -907,6 +923,11 @@ void ShaderImage::render()
 
     vkCmdBeginRenderPass(commandBuffer[curr], &rpbi, VK_SUBPASS_CONTENTS_INLINE);
     vkCmdBindPipeline(commandBuffer[curr], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+
+    VkViewport vp = { 0, 0, (float)w, (float)h, 0, 1 };
+    vkCmdSetViewport(commandBuffer[curr], 0, 1, &vp);
+    VkRect2D sc = { {0, 0}, {(uint32_t)w, (uint32_t)h} };
+    vkCmdSetScissor(commandBuffer[curr], 0, 1, &sc);
 
     // Push constants
     PushConstants pc;

@@ -68,6 +68,7 @@ private:
     // Dimensions
     int w = 0, h = 0;
     bool ready = false;
+    bool skipNextStagingCopy = false;
 
     // Shader source (kept for rebuild on resize)
     std::vector<char> fragShaderCode;
