@@ -2,13 +2,6 @@
  ----------------------------------------------------------------------------
  Copyright (c) 2026 Discreet Signals LLC
 
- ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
- ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
- ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
- ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
- ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
- ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
-
  Licensed under the MIT License. See LICENSE file in the project root
  for full license text.
 
@@ -36,7 +29,22 @@ public:
 private:
     void timerCallback() override;
 
-    enum class Mode { All, Text, TextStatic, ComplexPaths, Fills, Images, BackendComparison };
+    // Each mode exercises a specific pipeline or group of pipelines.
+    // Modes marked (Vulkan-only) compare effect-on vs effect-off, both in Vulkan.
+    enum class Mode {
+        All,              // Mixed workload — all pipelines
+        Fills,            // mainPipeline — flat rects, SDF rounded rects, ellipses
+        Text,             // mainPipeline — MSDF text via glyph atlas
+        Paths,            // stencilPipeline + stencilCoverPipeline — complex filled paths
+        Images,           // mainPipeline — textured quads via texture cache
+        Gradients,        // mainPipeline — gradient LUT descriptor set switching
+        Effects,          // multiplyPipeline — hardware blend darken/tint (Vulkan-only)
+        Blur,             // postProcess blurPipeline — 2-pass Gaussian (Vulkan-only)
+        TextStatic        // mainPipeline — 20K static text volume stress test
+    };
+
+    // Returns true if this mode compares Vulkan-on vs Vulkan-off (not vs JUCE)
+    static bool isVulkanOnlyMode(Mode m) { return m == Mode::Effects || m == Mode::Blur; }
 
     void runBenchmark(Mode mode);
     void paintBenchmarkScene(juce::Graphics& g, int frame);
@@ -49,16 +57,19 @@ private:
     void sceneComplexPaths(juce::Graphics& g, float w, float h, float t, float phase);
     void sceneFills(juce::Graphics& g, float w, float h, float t, float phase);
     void sceneImages(juce::Graphics& g, float w, float h);
+    void sceneGradients(juce::Graphics& g, float w, float h, float t, float phase);
+    void sceneEffects(juce::Graphics& g, float w, float h, float t, float phase);
+    void sceneBlur(juce::Graphics& g, float w, float h, float t, float phase);
 
-    juce::TextButton btnAll, btnText, btnTextStatic, btnPaths, btnFills, btnImages, btnBackends;
-
-    juce::TextButton btnStencil;
+    // Buttons — Row 1: primary pipeline benchmarks, Row 2: specialized benchmarks
+    juce::TextButton btnAll, btnFills, btnText, btnPaths;
+    juce::TextButton btnImages, btnGradients, btnEffects, btnBlur;
+    juce::TextButton btnTextStatic;
 
     // Pregenerated complex paths (built once at startup)
     std::vector<juce::Path> waveformPaths;
     std::vector<juce::Path> spectrumPaths;
     std::vector<juce::Path> gearPaths;
-
     void generatePaths(float w, float h);
     bool pathsGenerated = false;
 
@@ -69,51 +80,18 @@ private:
     void initSprites(float w, float h);
     bool spritesInitialized = false;
 
-    // --- Backend comparison test ---
-    std::vector<juce::Path> testPaths;
-    std::vector<int> testPathSegCounts;
-    void generateTestPaths();
-    bool testPathsGenerated = false;
-
-    struct BackendTestState
-    {
-        bool running = false;
-        bool complete = false;
-        int currentBackendIdx = 0;
-        int currentComplexityIdx = 0;
-        int framesRendered = 0;
-        static constexpr int framesPerTest = 10;
-        static constexpr int pathsPerFrame = 10;
-
-        std::vector<int> complexities;
-
-        struct BackendResult
-        {
-            juce::String name;
-            juce::Colour color;
-            std::vector<double> frameTimes;
-        };
-        std::vector<BackendResult> backends;
-
-        double frameTimeAccum = 0;
-        int globalFrame = 0;
-    };
-    BackendTestState backendTest;
-
-    void startBackendComparison();
-    void advanceBackendTest();
-    void paintBackendResults(juce::Graphics& g);
-
     // Benchmark state
     Mode activeMode = Mode::All;
     bool benchmarking = false;
     bool showResults = false;
-    bool benchVulkanPhase = false;
+    bool benchVulkanPhase = false;  // true = phase 1, false = phase 2
+    bool effectEnabled = true;      // for Vulkan-only modes: true in phase 1, false in phase 2
     int benchFrame = 0;
     double benchPhaseStart = 0;
     static constexpr double benchDurationMs = 5000.0;
     int vulkanRenderedFrames = 0, juceRenderedFrames = 0;
     double vulkanFPS = 0, juceFPS = 0;
+    juce::String phase1Label, phase2Label;  // "Vulkan"/"JUCE" or "Effect ON"/"Effect OFF"
     std::vector<double> vulkanFrameTimes, juceFrameTimes;
     double lastPaintTime = 0;
     VkPresentModeKHR savedPresentMode = VK_PRESENT_MODE_FIFO_KHR;

@@ -1,0 +1,50 @@
+#pragma once
+
+namespace jvk {
+
+class Pipeline {
+public:
+    Pipeline(Device& device) : device_(device) {}
+    virtual ~Pipeline();
+
+    Pipeline(Pipeline&&) noexcept;
+    Pipeline(const Pipeline&) = delete;
+    Pipeline& operator=(const Pipeline&) = delete;
+
+    virtual PipelineConfig config() const = 0;
+    virtual std::optional<PipelineConfig> clipConfig() const { return std::nullopt; }
+    virtual std::span<const DrawOp> supportedOps() const = 0;
+    virtual void execute(Renderer& r, const Arena& arena, const DrawCommand& cmd) = 0;
+
+    // Called once per frame before the render pass. Pipelines stage pending
+    // uploads (atlas pages, deferred textures) here. Default is no-op.
+    virtual void prepare() {}
+
+    void loadVertexShader(std::span<const uint32_t> spirv);
+    void loadFragmentShader(std::span<const uint32_t> spirv);
+
+    virtual void defineLayout(Memory::M& bindings);
+
+    void build(VkRenderPass renderPass, VkSampleCountFlagBits msaa);
+    bool isBuilt() const { return built_; }
+
+    VkPipeline       handle()     const { return pipeline_; }
+    VkPipeline       clipHandle() const { return clipPipeline_ ? clipPipeline_ : pipeline_; }
+    VkPipelineLayout layout()     const { return layout_; }
+
+protected:
+    Device& device_;
+
+private:
+    VkPipeline       pipeline_     = VK_NULL_HANDLE;
+    VkPipeline       clipPipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout layout_       = VK_NULL_HANDLE;
+    std::vector<uint32_t> vertSpirv_;
+    std::vector<uint32_t> fragSpirv_;
+    bool built_ = false;
+
+    VkPipeline buildVariant(const PipelineConfig& cfg, VkRenderPass renderPass,
+                            VkSampleCountFlagBits msaa, VkPipelineLayout layout);
+};
+
+} // namespace jvk

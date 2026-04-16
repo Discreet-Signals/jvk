@@ -1,17 +1,10 @@
 /*
  ----------------------------------------------------------------------------
  Copyright (c) 2026 Discreet Signals LLC
- 
- ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
- ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
- ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
- ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
- ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
- ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
- 
+
  Licensed under the MIT License. See LICENSE file in the project root
  for full license text.
- 
+
  For questions, contact gavin@discreetsignals.com
  ------------------------------------------------------------------------------
  File: jvk.cpp
@@ -21,26 +14,13 @@
 
 #include "jvk.h"
 
-// Core
-#include "include/jvk/core/wrapper/SwapChain.cpp"
-#include "include/jvk/core/wrapper/Pipeline.cpp"
-#include "include/jvk/core/VulkanInstance.cpp"
-#if JUCE_MAC
-#include "include/jvk/core/macos/VulkanNSViewComponent.cpp"
-#elif JUCE_WINDOWS
-#include "include/jvk/core/windows/VulkanHWNDComponent.cpp"
-#endif
+// Core implementations
+#include "include/jvk/core/Device.cpp"
+#include "include/jvk/core/Renderer.cpp"
+#include "include/jvk/core/Pipeline.cpp"
+#include "include/jvk/core/RenderTarget.cpp"
 
-// Components
-#include "include/jvk/components/VulkanComponent.cpp"
-
-// Reflect (SPIRV-Reflect, C source)
+// SPIRV-Reflect (C source)
 extern "C" {
 #include "include/jvk/reflect/spirv_reflect.c"
 }
-
-// Graphics
-#include "include/jvk/graphics/Shader.cpp"
-
-// Offscreen
-#include "include/jvk/offscreen/ShaderImage.cpp"

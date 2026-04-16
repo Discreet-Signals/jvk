@@ -59,6 +59,9 @@ if (NOT TARGET jvk)
         target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk.cpp")
     endif()
 
+    # C++20 required for std::span, std::optional
+    target_compile_features(jvk INTERFACE cxx_std_20)
+
     # Tell JUCE this module is available
     target_compile_definitions(jvk INTERFACE JUCE_MODULE_AVAILABLE_jvk=1)
 

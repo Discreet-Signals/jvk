@@ -1,144 +1,66 @@
-/*
- ----------------------------------------------------------------------------
- Copyright (c) 2026 Discreet Signals LLC
-
- ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
- ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
- ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
- ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
- ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
- ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
-
- Licensed under the MIT License. See LICENSE file in the project root
- for full license text.
-
- For questions, contact gavin@discreetsignals.com
- ------------------------------------------------------------------------------
- File: ShaderImage.h
- Author: Gavin Payne
- ------------------------------------------------------------------------------
-*/
-
 #pragma once
 
-namespace jvk
-{
+namespace jvk {
 
-class ShaderImage : private juce::Timer
-{
+class ShaderImage {
 public:
-    // storageBufferSize: number of floats for the storage buffer (0 = no storage buffer).
-    // The shader's descriptor bindings (samplers, storage buffers) are auto-discovered
-    // from the SPIR-V bytecode via reflection.
-    ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
-                int width, int height, int storageBufferSize = 0);
-    ~ShaderImage();
+    ShaderImage(std::shared_ptr<Device> device, uint32_t width, uint32_t height,
+                VkFormat format = VK_FORMAT_R8G8B8A8_UNORM)
+        : device_(std::move(device)),
+          target_(*device_, width, height, format),
+          renderer_(*device_, target_)
+    {
+        // Register color pipeline for offscreen drawing
+        auto spv = [](const char* d, int s) { return std::span<const uint32_t>{reinterpret_cast<const uint32_t*>(d), static_cast<size_t>(s/4)}; };
+        colorPipeline_ = std::make_unique<pipelines::ColorPipeline>(
+            *device_,
+            spv(shaders::ui2d::vert_spv, shaders::ui2d::vert_spvSize),
+            spv(shaders::ui2d::frag_spv, shaders::ui2d::frag_spvSize));
+        renderer_.registerPipeline(*colorPipeline_);
+    }
 
-    const juce::Image& getImage() const { return displayImage; }
+    void resize(uint32_t width, uint32_t height)
+    {
+        target_.resize(width, height);
+    }
 
-    void setSize(int width, int height);
-    juce::Point<int> getSize() const { return { w, h }; }
+    // Record commands and execute
+    void render(std::function<void(Graphics&)> paintFn, float scale = 1.0f)
+    {
+        renderer_.reset();
+        Graphics graphics(renderer_, scale);
+        paintFn(graphics);
+        renderer_.execute();
+    }
 
-    // Push float data to the storage buffer (consumed each frame via FIFO)
-    void pushData(const float* data, int count);
+    // Push raw commands
+    template <typename Params>
+    void push(DrawOp op, float z, const juce::Rectangle<int>& clip, const Params& params)
+    {
+        renderer_.push(op, z, clip, 0, 0, params);
+    }
 
-    // Load a texture into a specific binding slot (set/binding discovered from SPIR-V)
-    void loadTexture(int binding, const juce::Image& image);
+    void execute()
+    {
+        renderer_.execute();
+    }
 
-    void setFrameRate(int fps);
-    void render();
+    void reset()
+    {
+        renderer_.reset();
+    }
 
-    bool isReady() const { return ready; }
+    // Result image — can be sampled by the main renderer
+    Image& getImage() { return target_.getImage(); }
+
+    Renderer&  renderer() { return renderer_; }
+    Device&    device()   { return *device_; }
 
 private:
-    void timerCallback() override { render(); }
-
-    void reflectShader();
-    void createRenderTarget();
-    void destroyRenderTarget();
-    void createPipeline();
-    void destroyPipeline();
-    void createDescriptors();
-    void destroyDescriptors();
-
-    // Shared context
-    struct Context;
-    static Context& getContext();
-
-    // Dimensions
-    int w = 0, h = 0;
-    bool ready = false;
-    bool skipNextStagingCopy = false;
-
-    // Shader source (kept for rebuild on resize)
-    std::vector<char> fragShaderCode;
-
-    // Render target
-    VkImage colorImage = VK_NULL_HANDLE;
-    VkDeviceMemory colorImageMemory = VK_NULL_HANDLE;
-    VkImageView colorImageView = VK_NULL_HANDLE;
-    VkFramebuffer framebuffer = VK_NULL_HANDLE;
-    VkRenderPass renderPass = VK_NULL_HANDLE;
-
-    // Staging buffers (double-buffered, persistently mapped)
-    VkBuffer stagingBuffer[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkDeviceMemory stagingMemory[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    void* mappedStagingPtr[2] = { nullptr, nullptr };
-
-    // Pipeline
-    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
-    VkPipeline graphicsPipeline = VK_NULL_HANDLE;
-
-    // --- Reflected descriptor bindings ---
-    struct TextureSlot
-    {
-        int binding = -1;
-        VkImage image = VK_NULL_HANDLE;
-        VkDeviceMemory memory = VK_NULL_HANDLE;
-        VkImageView view = VK_NULL_HANDLE;
-        VkSampler sampler = VK_NULL_HANDLE;
-        bool loaded = false;
-    };
-
-    struct DescriptorSetInfo
-    {
-        uint32_t set = 0;
-        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
-        VkDescriptorPool pool = VK_NULL_HANDLE;
-        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
-
-        // Storage buffer (if this set has one)
-        bool hasStorageBuffer = false;
-        int storageBinding = -1;
-        VkBuffer storageBuffer = VK_NULL_HANDLE;
-        VkDeviceMemory storageBufferMemory = VK_NULL_HANDLE;
-        void* mappedStoragePtr = nullptr;
-
-        // Textures in this set
-        std::vector<TextureSlot> textures;
-    };
-
-    std::vector<DescriptorSetInfo> descriptorSets;
-    int storageSize = 0;
-
-    // Command buffer + sync (double-buffered)
-    VkCommandBuffer commandBuffer[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    VkFence fence[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
-    int frameIndex = 0;
-
-    // Push constants
-    struct PushConstants {
-        float resolutionX, resolutionY;
-        float time;
-    };
-    double startTime = 0.0;
-
-    // Data streaming
-    std::unique_ptr<FIFO<float>> fifo;
-    std::vector<float> storageData;
-
-    // Output image
-    juce::Image displayImage;
+    std::shared_ptr<Device> device_;
+    OffscreenTarget         target_;
+    Renderer                renderer_;
+    std::unique_ptr<pipelines::ColorPipeline> colorPipeline_;
 };
 
 } // namespace jvk

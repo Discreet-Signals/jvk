@@ -60,15 +60,9 @@ public:
         float boundsX, boundsY, boundsW, boundsH;
     };
 
-    void init(VkPhysicalDevice pd, VkDevice d,
-              VkCommandPool cp, VkQueue gq,
-              core::DescriptorHelper* dh)
+    void init(Device& dev)
     {
-        physDevice = pd;
-        device = d;
-        commandPool = cp;
-        graphicsQueue = gq;
-        descriptorHelper = dh;
+        device = &dev;
     }
 
     const AtlasEntry* getGlyph(const GlyphKey& key, const juce::Font& font)
@@ -86,17 +80,19 @@ public:
         return atlasPages[static_cast<size_t>(atlasIndex)].descriptorSet;
     }
 
-    // Stage dirty atlas pages for deferred upload via StagingBelt.
+    // Stage dirty atlas pages for deferred upload via Device staging.
     // Pixels are copied to staging memory; actual GPU transfer commands
-    // are recorded in the next frame's prepareFrame() before the render pass.
-    void stageDirtyPages(core::StagingBelt& belt, std::vector<core::PendingUpload>& uploads)
+    // are recorded in the next frame's flushUploads() before the render pass.
+    void stageDirtyPages()
     {
         for (auto& page : atlasPages)
         {
             if (page.needsUpload)
             {
-                belt.stageImageUpload(page.texture, uploads,
-                    page.pixels.data(),
+                auto byteSize = static_cast<VkDeviceSize>(ATLAS_SIZE * ATLAS_SIZE * 4);
+                auto staging = device->staging().alloc(byteSize);
+                memcpy(staging.mappedPtr, page.pixels.data(), static_cast<size_t>(byteSize));
+                device->upload(staging, page.texture.image(),
                     static_cast<uint32_t>(ATLAS_SIZE), static_cast<uint32_t>(ATLAS_SIZE));
                 page.needsUpload = false;
             }
@@ -107,14 +103,17 @@ public:
     {
         entries.clear();
         for (auto& page : atlasPages)
-            page.texture.destroy();
+        {
+            if (page.descriptorSet != VK_NULL_HANDLE)
+                device->bindings().free(page.descriptorSet);
+        }
         atlasPages.clear();
     }
 
 private:
     struct AtlasPage
     {
-        core::Image texture;
+        Image texture;
         VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
         std::vector<uint32_t> pixels;
         int cursorX = 0;
@@ -230,7 +229,7 @@ private:
             -static_cast<double>(pathBounds.getX()) + GLYPH_PADDING / texelScale,
             -static_cast<double>(pathBounds.getY()) + GLYPH_PADDING / texelScale);
 
-        // Generate MSDF: Projection maps shape coords → pixel coords.
+        // Generate MSDF: Projection maps shape coords -> pixel coords.
         // Range must be in shape units — convert pixel range by dividing by scale.
         // msdfgen computes distances in shape space, so Range(px/scale) ensures
         // MSDF_PIXEL_RANGE pixels of distance map to the full [0,1] output.
@@ -312,29 +311,37 @@ private:
 
     AtlasPage* createPage()
     {
-        if (!device || !descriptorHelper) return nullptr;
+        if (!device) return nullptr;
 
         AtlasPage page;
         // Initialize to white (sd=1.0 per channel = "far outside glyph") so that
         // linear filtering near quad edges doesn't bleed opaque border artifacts.
         page.pixels.resize(static_cast<size_t>(ATLAS_SIZE * ATLAS_SIZE), 0xFFFFFFFF);
 
-        page.texture.create({ physDevice, device,
+        page.texture = Image(device->pool(), device->device(),
             static_cast<uint32_t>(ATLAS_SIZE), static_cast<uint32_t>(ATLAS_SIZE),
             VK_FORMAT_R8G8B8A8_UNORM,
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT });
-        page.texture.createSampler(VK_FILTER_LINEAR);
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            VK_SAMPLE_COUNT_1_BIT,
+            VK_IMAGE_ASPECT_COLOR_BIT,
+            VK_FILTER_LINEAR);
+
+        if (!page.texture.valid())
+            return nullptr;
 
         // Don't upload here — createPage() may be called during command buffer
         // recording (inside paintEntireComponent). Uploading would submit a
         // separate command buffer from the same pool/queue, which conflicts
-        // with MoltenVK. Instead, mark as dirty and let uploadDirtyPages()
+        // with MoltenVK. Instead, mark as dirty and let stageDirtyPages()
         // handle it after painting completes.
         page.needsUpload = true;
 
-        page.descriptorSet = descriptorHelper->allocateSet();
-        core::DescriptorHelper::writeImage(device, page.descriptorSet, 0,
-            page.texture.getView(), page.texture.getSampler());
+        page.descriptorSet = device->bindings().alloc();
+        if (page.descriptorSet == VK_NULL_HANDLE)
+            return nullptr;
+
+        Memory::M::writeImage(device->device(), page.descriptorSet, 0,
+            page.texture.view(), page.texture.sampler());
 
         atlasPages.push_back(std::move(page));
         return &atlasPages.back();
@@ -343,11 +350,7 @@ private:
     std::unordered_map<GlyphKey, AtlasEntry, GlyphKeyHash> entries;
     std::vector<AtlasPage> atlasPages;
 
-    VkPhysicalDevice physDevice = VK_NULL_HANDLE;
-    VkDevice device = VK_NULL_HANDLE;
-    VkCommandPool commandPool = VK_NULL_HANDLE;
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    core::DescriptorHelper* descriptorHelper = nullptr;
+    Device* device = nullptr;
 };
 
 } // jvk
