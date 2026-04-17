@@ -89,20 +89,24 @@ struct PushClipRectParams {
     juce::Rectangle<int>   rect;
 };
 
+// Forward decl for the cached-mesh fast path.
+struct CachedPathMesh;
+
 struct PushClipPathParams {
     uint32_t               vertexCount;
+    uint32_t               vertexArenaOffset = 0; // where fan verts live in arena
+                                                  // (ignored when cachedMesh != nullptr)
+    const CachedPathMesh*  cachedMesh = nullptr;  // non-null → bind cached VkBuffer
+    float                  transform[6];          // affine: m00 m10 m01 m11 m02 m12
     juce::Rectangle<int>   pathBounds;
-    // followed in arena by: UIVertex[vertexCount] (triangulated path)
 };
 
 struct PopClipParams {
-    uint32_t             vertexCount       = 0; // 0 for rect clips
-    uint32_t             vertexArenaOffset = 0; // points to PushClipPath's fan verts
-    juce::Rectangle<int> fanBounds;
-    // Vertices are NOT inlined after params — we reference the same fan the
-    // matching PushClipPath already pushed. Both draws use the same verts:
-    // PushClip writes stencil via INVERT, PopClip re-runs the same triangles
-    // with INVERT to toggle bits back off. No winding reversal needed.
+    uint32_t               vertexCount       = 0; // 0 for rect clips
+    uint32_t               vertexArenaOffset = 0; // same fan verts as paired PushClipPath
+    const CachedPathMesh*  cachedMesh        = nullptr;
+    float                  transform[6];          // same transform as paired push
+    juce::Rectangle<int>   fanBounds;
 };
 
 struct EffectBlendParams {

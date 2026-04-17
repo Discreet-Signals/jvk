@@ -26,6 +26,10 @@ public:
     Memory::M&  bindings() { return bindings_; }
 
     void upload(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height);
+    // Buffer-to-buffer staged upload. Queues a copy that flushUploads issues
+    // before the render pass begins. Used by path-mesh cache inserts.
+    void upload(Memory::L2::Allocation src, VkBuffer dst,
+                VkDeviceSize size, VkDeviceSize dstOffset = 0);
     void flushUploads(VkCommandBuffer cmd);
 
     void submitImmediate(std::function<void(VkCommandBuffer)> fn);
@@ -74,6 +78,15 @@ private:
         VkDeviceSize srcOffset;
     };
     std::vector<PendingUpload> pendingUploads_;
+
+    struct PendingBufferUpload {
+        VkBuffer     dstBuffer;
+        VkDeviceSize dstOffset;
+        VkDeviceSize size;
+        VkBuffer     srcBuffer;
+        VkDeviceSize srcOffset;
+    };
+    std::vector<PendingBufferUpload> pendingBufferUploads_;
 
     static constexpr int MAX_FRAMES = 2;
     struct RetiredResources {

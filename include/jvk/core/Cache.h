@@ -199,6 +199,31 @@ struct CachedBuffer {
     }
 };
 
+// =============================================================================
+// CachedPathMesh — local-space flattened triangle fan for a juce::Path.
+// Lives in a device-local Buffer sub-allocation. Same mesh reusable under any
+// affine transform (applied in the stencil vertex shader).
+// =============================================================================
+
+struct CachedPathMesh {
+    Buffer                 buffer;        // device-local vertex buffer
+    uint32_t               vertexCount = 0;
+    juce::Rectangle<float> localBounds;   // in path-local coords
+
+    CachedPathMesh() = default;
+    CachedPathMesh(CachedPathMesh&& o) noexcept
+        : buffer(std::move(o.buffer)), vertexCount(o.vertexCount), localBounds(o.localBounds)
+    { o.vertexCount = 0; }
+    CachedPathMesh& operator=(CachedPathMesh&& o) noexcept {
+        if (this != &o) {
+            buffer = std::move(o.buffer);
+            vertexCount = o.vertexCount; o.vertexCount = 0;
+            localBounds = o.localBounds;
+        }
+        return *this;
+    }
+};
+
 
 // =============================================================================
 // ResourceCaches — shared across all plugin instances
@@ -209,7 +234,8 @@ class ResourceCaches {
 public:
     explicit ResourceCaches(Device& dev)
         : device_(dev),
-          textures_(120)
+          textures_(120),
+          pathMeshes_(300)
     {
         createBlackPixel();
         gradientAtlas_.init(dev);
@@ -217,8 +243,49 @@ public:
 
     ~ResourceCaches() = default;
 
-    GradientAtlas&                gradientAtlas() { return gradientAtlas_; }
-    Cache<uint64_t, CachedImage>& textures()       { return textures_; }
+    GradientAtlas&                     gradientAtlas() { return gradientAtlas_; }
+    Cache<uint64_t, CachedImage>&      textures()      { return textures_; }
+    Cache<uint64_t, CachedPathMesh>&   pathMeshes()    { return pathMeshes_; }
+
+    // Stable 64-bit hash of a juce::Path's geometry — same path shape produces
+    // the same key regardless of transform / position.
+    static uint64_t hashPath(const juce::Path& p)
+    {
+        uint64_t h = 0xcbf29ce484222325ULL;
+        auto mix = [&](uint32_t v) {
+            h ^= v; h *= 0x100000001b3ULL;
+        };
+        auto mixFloat = [&](float f) {
+            uint32_t bits; memcpy(&bits, &f, sizeof(bits)); mix(bits);
+        };
+        juce::Path::Iterator it(p);
+        while (it.next()) {
+            mix(static_cast<uint32_t>(it.elementType));
+            switch (it.elementType) {
+                case juce::Path::Iterator::startNewSubPath:
+                case juce::Path::Iterator::lineTo:
+                    mixFloat(it.x1); mixFloat(it.y1); break;
+                case juce::Path::Iterator::quadraticTo:
+                    mixFloat(it.x1); mixFloat(it.y1);
+                    mixFloat(it.x2); mixFloat(it.y2); break;
+                case juce::Path::Iterator::cubicTo:
+                    mixFloat(it.x1); mixFloat(it.y1);
+                    mixFloat(it.x2); mixFloat(it.y2);
+                    mixFloat(it.x3); mixFloat(it.y3); break;
+                case juce::Path::Iterator::closePath: break;
+            }
+        }
+        return h;
+    }
+
+    // Two-set memory of recently-seen path hashes. A path hash that appears
+    // in `pathHashesPrev_` was seen on the previous frame — promote to the
+    // mesh cache on its second appearance, so one-shot paths never incur
+    // cache-upload cost.
+    bool pathWasSeenLastFrame(uint64_t hash) const {
+        return pathHashesPrev_.count(hash) > 0;
+    }
+    void markPathSeen(uint64_t hash) { pathHashesCurr_.insert(hash); }
 
     VkDescriptorSet getTexture(uint64_t hash, const juce::Image& img)
     {
@@ -291,17 +358,26 @@ public:
     {
         currentFrame_ = frameId;
         textures_.evict(frameId);
+        pathMeshes_.evict(frameId);
         gradientAtlas_.beginFrame();
+        // Rotate path-hash memory: what was seen last frame becomes the
+        // reference for "promote on second sight," current frame starts empty.
+        std::swap(pathHashesPrev_, pathHashesCurr_);
+        pathHashesCurr_.clear();
     }
 
     Device& device() { return device_; }
 
 private:
     Device& device_;
-    GradientAtlas                gradientAtlas_;
-    Cache<uint64_t, CachedImage> textures_;
-    CachedImage                  blackPixel_;
+    GradientAtlas                   gradientAtlas_;
+    Cache<uint64_t, CachedImage>    textures_;
+    Cache<uint64_t, CachedPathMesh> pathMeshes_;
+    CachedImage                     blackPixel_;
     uint64_t currentFrame_ = 0;
+    // Two-frame hash memory for path-cache promotion heuristic.
+    std::unordered_set<uint64_t> pathHashesPrev_;
+    std::unordered_set<uint64_t> pathHashesCurr_;
 
     void createBlackPixel()
     {

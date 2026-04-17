@@ -84,12 +84,12 @@ void BenchmarkEditor::generatePaths(float w, float h)
     if (pathsGenerated) return;
     pathsGenerated = true;
 
-    // 100 waveform paths — sine waves with harmonics
-    waveformPaths.resize(100);
-    for (int i = 0; i < 100; i++)
+    // 300 waveform paths — sine waves with harmonics
+    waveformPaths.resize(300);
+    for (int i = 0; i < 300; i++)
     {
         auto& p = waveformPaths[static_cast<size_t>(i)];
-        float baseY = h * (static_cast<float>(i) + 0.5f) / 100.0f;
+        float baseY = h * (static_cast<float>(i) + 0.5f) / 300.0f;
         float amp = 8.0f + static_cast<float>(i) * 0.5f;
         float freq = 2.0f + static_cast<float>(i % 8) * 0.5f;
         p.startNewSubPath(0, baseY);
@@ -106,13 +106,13 @@ void BenchmarkEditor::generatePaths(float w, float h)
         p.closeSubPath();
     }
 
-    // 80 spectrum analyzer paths — jagged peaks
-    spectrumPaths.resize(80);
-    for (int i = 0; i < 80; i++)
+    // 300 spectrum analyzer paths — jagged peaks (static shape, animated transforms)
+    spectrumPaths.resize(300);
+    for (int i = 0; i < 300; i++)
     {
         auto& p = spectrumPaths[static_cast<size_t>(i)];
         float baseY = h * 0.8f;
-        int numBins = 64 + i * 4;
+        int numBins = 64 + (i % 16) * 4;
         float binW = w / static_cast<float>(numBins);
         p.startNewSubPath(0, baseY);
         for (int b = 0; b < numBins; b++)
@@ -128,15 +128,16 @@ void BenchmarkEditor::generatePaths(float w, float h)
         p.closeSubPath();
     }
 
-    // 50 gear/mechanical shapes — concentric paths with teeth
-    gearPaths.resize(50);
-    for (int i = 0; i < 50; i++)
+    // 300 gear/mechanical shapes — concentric paths with teeth
+    gearPaths.resize(300);
+    for (int i = 0; i < 300; i++)
     {
         auto& p = gearPaths[static_cast<size_t>(i)];
-        float cx = w * (0.05f + static_cast<float>(i % 10) * 0.1f);
-        float cy = h * (0.1f + static_cast<float>(i / 10) * 0.2f);
-        int teeth = 8 + i * 2;
-        float outerR = 20.0f + static_cast<float>(i) * 3.0f;
+        // Local coords — gear lives at origin, positioned via transform at draw time.
+        float cx = 0.0f;
+        float cy = 0.0f;
+        int teeth = 8 + (i % 12) * 2;
+        float outerR = 20.0f + static_cast<float>(i % 20) * 3.0f;
         float innerR = outerR * 0.7f;
         float toothH = outerR * 0.25f;
 
@@ -432,31 +433,47 @@ void BenchmarkEditor::sceneComplexPaths(juce::Graphics& g, float w, float h, flo
     for (size_t i = 0; i < gearPaths.size(); i++)
     {
         float fi = static_cast<float>(i);
-        float cx = w * (0.05f + static_cast<float>(i % 10) * 0.1f);
-        float cy = h * (0.1f + static_cast<float>(i / 10) * 0.2f);
+        int   cols = 20;
+        float cx = w * (0.05f + static_cast<float>(i % cols) / static_cast<float>(cols) * 0.95f);
+        float cy = h * (0.05f + static_cast<float>(static_cast<int>(i) / cols) / 15.0f * 0.95f);
         float angle = phase * (0.5f + fi * 0.1f) * ((i % 2 == 0) ? 1.0f : -1.0f);
-        g.setColour(juce::Colour::fromHSV(std::fmod(fi / 50.0f + t * 0.3f, 1.0f), 0.6f, 0.85f, 0.5f));
-        g.fillPath(gearPaths[i], juce::AffineTransform::rotation(angle, cx, cy));
+        g.setColour(juce::Colour::fromHSV(std::fmod(fi / 300.0f + t * 0.3f, 1.0f), 0.6f, 0.85f, 0.5f));
+        g.fillPath(gearPaths[i], juce::AffineTransform::rotation(angle).translated(cx, cy));
     }
 
-    for (int i = 0; i < 700; i++)
+    // 100 dynamic spectrum-analyzer paths — recomputed per frame with bin
+    // heights driven by `phase`. Simulates audio-visualiser workloads where
+    // geometry genuinely changes every frame (cache always misses).
+    constexpr int kDynSpectrumCount = 100;
+    constexpr int kDynBins          = 48;
+    for (int i = 0; i < kDynSpectrumCount; i++)
     {
-        float fi = static_cast<float>(i);
+        float fi    = static_cast<float>(i);
+        int   cols  = 10;
+        float cellW = w / static_cast<float>(cols);
+        float cellH = h / 10.0f;
+        float x0    = cellW * static_cast<float>(i % cols);
+        float y0    = cellH * static_cast<float>(i / cols);
+        float baseY = y0 + cellH;
+        float binW  = cellW / static_cast<float>(kDynBins);
+
         juce::Path p;
-        float sx = std::fmod(fi * 47.0f + t * 150.0f, w);
-        float sy = std::fmod(fi * 31.0f + t * 80.0f, h);
-        p.startNewSubPath(sx, sy);
-        for (int seg = 0; seg < 8; seg++)
+        p.startNewSubPath(x0, baseY);
+        for (int b = 0; b < kDynBins; b++)
         {
-            float fs = static_cast<float>(seg);
-            p.cubicTo(sx + (20.0f + fs * 15.0f) * std::sin(phase * 1.5f + fi + fs),
-                      sy + (30.0f + fs * 10.0f) * std::cos(phase * 1.2f + fi + fs * 0.8f),
-                      sx + (50.0f + fs * 20.0f) * std::cos(phase * 0.8f + fi + fs),
-                      sy + (15.0f + fs * 25.0f) * std::sin(phase * 0.6f + fi + fs),
-                      sx + (70.0f + fs * 25.0f), sy + (25.0f + fs * 15.0f));
+            float fb   = static_cast<float>(b);
+            float amp  = 0.5f + 0.5f * std::sin(phase * 2.0f + fi * 0.2f + fb * 0.35f);
+            float decay = std::exp(-fb / static_cast<float>(kDynBins) * 1.5f);
+            float binH = amp * decay * cellH * 0.9f;
+            float bx   = x0 + fb * binW;
+            p.lineTo(bx,              baseY - binH);
+            p.lineTo(bx + binW * 0.8f, baseY - binH);
+            p.lineTo(bx + binW * 0.9f, baseY);
         }
+        p.lineTo(x0 + cellW, baseY);
         p.closeSubPath();
-        g.setColour(juce::Colour::fromHSV(std::fmod(fi / 700.0f + t * 2.0f, 1.0f), 0.8f, 0.95f, 0.25f));
+
+        g.setColour(juce::Colour::fromHSV(std::fmod(fi / 100.0f + t, 1.0f), 0.9f, 1.0f, 0.35f));
         g.fillPath(p);
     }
 }
@@ -666,18 +683,24 @@ void BenchmarkEditor::sceneBlur(juce::Graphics& g, float w, float h, float t, fl
         g.fillRoundedRectangle(x, y, 30.0f, 20.0f, 4.0f);
     }
 
-    // Apply blur if enabled
+    // Apply blur if enabled — radius pulses 0..128..0 on a cosine, 4 cycles per scene loop.
+    constexpr float maxRadius = 128.0f;
+    const float blurRadius = (1.0f - std::cos(t * juce::MathConstants<float>::twoPi * 4.0f)) * 0.5f * maxRadius;
+
     if (effectEnabled)
     {
         auto vk = jvk::Graphics::create(g);
         if (vk)
-            vk->blur(3.0f);
+            vk->blur(blurRadius);
     }
 
     // Draw text on top (to show that post-blur drawing works)
     g.setColour(juce::Colours::white);
     g.setFont(juce::FontOptions(20.0f));
-    g.drawText(effectEnabled ? "Blur ON" : "Blur OFF",
+    juce::String label = effectEnabled
+        ? juce::String::formatted("Blur ON — radius %.1f", blurRadius)
+        : juce::String("Blur OFF");
+    g.drawText(label,
                0, static_cast<int>(h * 0.5f) - 15, static_cast<int>(w), 30,
                juce::Justification::centred);
 }

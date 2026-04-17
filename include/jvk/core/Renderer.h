@@ -126,6 +126,14 @@ public:
     void setShapeResource(VkDescriptorSet shapeSet);
     void setColorResource(VkDescriptorSet colorSet);
     void draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count);
+    // Draw using a pre-uploaded device-local vertex buffer (e.g. a
+    // CachedPathMesh) instead of streaming verts through the per-frame ring.
+    // Caller is responsible for push-constant state (transform, viewport).
+    void drawCached(const DrawCommand& cmd, VkBuffer vbuf, uint32_t vertexCount);
+    // Push a payload to the vertex-stage push-constant range at the given
+    // byte offset. Used by stencil pipelines to push the affine transform
+    // alongside the viewport size already written by setPipeline().
+    void pushConstants(uint32_t offset, uint32_t size, const void* data);
 
     void pushClipRect(const juce::Rectangle<int>& rect);
     void pushClipPath(const juce::Path& path, const juce::AffineTransform& transform);

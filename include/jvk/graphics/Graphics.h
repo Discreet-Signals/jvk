@@ -74,31 +74,86 @@ public:
         auto& s = state();
         auto combined = t.followedBy(s.transform).scaled(displayScale_);
 
-        // Flatten into the reusable scratch buffer — zero heap allocations on
-        // the steady state.
-        juce::Rectangle<int> fanBounds;
-        flattenPathToFan(path, combined, scratchFanVerts_, fanBounds);
+        // Pack affine into the 6-float form the stencil shader consumes.
+        // Shader: pos = col0*x + col1*y + col2, where
+        //   col0 = (m00, m10), col1 = (m01, m11), col2 = (m02, m12)
+        float xform[6] = {
+            combined.mat00, combined.mat10,   // col0
+            combined.mat01, combined.mat11,   // col1
+            combined.mat02, combined.mat12,   // col2
+        };
+
+        auto& caches = renderer_.caches();
+        uint64_t hash = ResourceCaches::hashPath(path);
+        caches.markPathSeen(hash);
+
+        const CachedPathMesh* cached  = caches.pathMeshes().find(hash);
+        uint32_t              vCount  = 0;
+        uint32_t              fanOff  = 0;
+        juce::Rectangle<int>  fanBounds;
+
+        if (cached) {
+            // Cache hit — skip flatten + skip arena push. Bounds come from
+            // the cached local bounds transformed into pixel space.
+            vCount    = cached->vertexCount;
+            fanBounds = cached->localBounds.transformedBy(combined)
+                               .getSmallestIntegerContainer();
+        } else {
+            // Miss — flatten in LOCAL space so the mesh is transform-independent
+            // if we later promote it to the cache.
+            juce::AffineTransform identity;
+            juce::Rectangle<int> localInt;
+            flattenPathToFan(path, identity, scratchFanVerts_, localInt);
+            vCount = static_cast<uint32_t>(scratchFanVerts_.size());
+            fanBounds = juce::Rectangle<float>(localInt.toFloat())
+                               .transformedBy(combined)
+                               .getSmallestIntegerContainer();
+
+            // Push local verts into the arena for this frame's draw.
+            fanOff = renderer_.arena_offset();
+            if (!scratchFanVerts_.empty())
+                renderer_.arena_pushSpan(std::span<const UIVertex>(
+                    scratchFanVerts_.data(), scratchFanVerts_.size()));
+
+            // Promote to the mesh cache only on the second sighting — avoids
+            // caching one-shot animated paths whose hash changes each frame.
+            if (caches.pathWasSeenLastFrame(hash) && vCount > 0) {
+                VkDeviceSize size = static_cast<VkDeviceSize>(vCount) * sizeof(UIVertex);
+                CachedPathMesh entry;
+                entry.buffer = Buffer(renderer_.device().pool(),
+                                      renderer_.device().device(),
+                                      size,
+                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+                                    | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                entry.vertexCount = vCount;
+                entry.localBounds = localInt.toFloat();
+
+                auto staging = renderer_.device().staging().alloc(size);
+                memcpy(staging.mappedPtr, scratchFanVerts_.data(), static_cast<size_t>(size));
+                renderer_.device().upload(staging, entry.buffer.buffer(), size);
+
+                auto& inserted = caches.pathMeshes().insert(hash, std::move(entry));
+                cached = &inserted; // rest of this frame can already use the cached entry
+            }
+        }
 
         s.clipBounds = s.clipBounds.getIntersection(fanBounds);
 
-        PushClipPathParams params;
-        params.vertexCount = static_cast<uint32_t>(scratchFanVerts_.size());
-        params.pathBounds  = fanBounds;
+        PushClipPathParams params {};
+        params.vertexCount       = vCount;
+        params.vertexArenaOffset = fanOff;
+        params.cachedMesh        = cached;
+        params.pathBounds        = fanBounds;
+        memcpy(params.transform, xform, sizeof(xform));
         renderer_.push(DrawOp::PushClipPath, s.zOrder, s.clipBounds,
                        s.stencilDepth, s.scopeDepth, params);
 
-        // Capture the arena offset where the fan lands. PopClip will reuse
-        // this same vertex range — second INVERT stencil pass toggles bits
-        // back to zero, no reversed winding required.
-        uint32_t fanOffset = renderer_.arena_offset();
-        if (!scratchFanVerts_.empty())
-            renderer_.arena_pushSpan(std::span<const UIVertex>(
-                scratchFanVerts_.data(), scratchFanVerts_.size()));
-
         PathClipFan clip;
         clip.fanBounds      = fanBounds;
-        clip.fanArenaOffset = fanOffset;
-        clip.vertexCount    = params.vertexCount;
+        clip.fanArenaOffset = fanOff;
+        clip.vertexCount    = vCount;
+        clip.cachedMesh     = cached;
+        memcpy(clip.transform, xform, sizeof(xform));
         s.pathClipStack.push_back(clip);
 
         s.stencilDepth++;
@@ -349,13 +404,15 @@ public:
     Renderer& getRenderer() { return renderer_; }
 
 private:
-    // Per-path-clip fan bookkeeping. The vertex data itself lives in the
-    // renderer's arena (pushed by PushClipPath); we just remember where it
-    // starts so the matching PopClip can reference the same span.
+    // Per-path-clip fan bookkeeping. Either `cachedMesh` holds a stable GPU
+    // buffer (cache hit / freshly promoted) or `fanArenaOffset` points at the
+    // per-frame arena range from PushClipPath.
     struct PathClipFan {
-        uint32_t             fanArenaOffset = 0;
-        uint32_t             vertexCount    = 0;
-        juce::Rectangle<int> fanBounds;
+        uint32_t               fanArenaOffset = 0;
+        uint32_t               vertexCount    = 0;
+        const CachedPathMesh*  cachedMesh     = nullptr;
+        float                  transform[6]   = {1,0,0,1,0,0};
+        juce::Rectangle<int>   fanBounds;
     };
 
     struct RecordState {
@@ -373,18 +430,19 @@ private:
     RecordState& state() { return stateStack_.back(); }
     const RecordState& state() const { return stateStack_.back(); }
 
-    // Record a PopClip for the most recent path clip. References the same
-    // arena vertex data PushClipPath stored — no duplicate vertices, no
-    // winding reversal. StencilCoverPipeline runs the same triangles with
-    // INVERT which toggles the stencil bit back to zero.
+    // Record a PopClip for the most recent path clip. Uses the same cached
+    // mesh (or arena vertex range) and transform as the paired PushClipPath —
+    // second INVERT stencil pass toggles the bit back to zero.
     void recordPopClip()
     {
         auto& s = state();
-        PopClipParams params;
+        PopClipParams params {};
         if (!s.pathClipStack.empty()) {
             auto& fan = s.pathClipStack.back();
             params.vertexCount       = fan.vertexCount;
             params.vertexArenaOffset = fan.fanArenaOffset;
+            params.cachedMesh        = fan.cachedMesh;
+            memcpy(params.transform, fan.transform, sizeof(fan.transform));
             params.fanBounds         = fan.fanBounds;
             renderer_.push(DrawOp::PopClip, s.zOrder, s.clipBounds,
                            s.stencilDepth, s.scopeDepth, params);
@@ -517,8 +575,11 @@ private:
         if (fanVerts.empty()) {
             bounds = {};
         } else {
-            int bx = std::max(0, static_cast<int>(std::floor(minX)) - 1);
-            int by = std::max(0, static_cast<int>(std::floor(minY)) - 1);
+            // Don't clamp to 0 — local-space meshes are centred at the origin
+            // and have negative coordinates. Clamping here corrupts the cached
+            // localBounds so the transformed scissor cuts the path.
+            int bx = static_cast<int>(std::floor(minX)) - 1;
+            int by = static_cast<int>(std::floor(minY)) - 1;
             int bx2 = static_cast<int>(std::ceil(maxX)) + 1;
             int by2 = static_cast<int>(std::ceil(maxY)) + 1;
             bounds = { bx, by, bx2 - bx, by2 - by };

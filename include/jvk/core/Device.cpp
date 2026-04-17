@@ -319,6 +319,12 @@ void Device::upload(Memory::L2::Allocation src, VkImage dst, uint32_t width, uin
     pendingUploads_.push_back({ dst, width, height, src.buffer, src.offset });
 }
 
+void Device::upload(Memory::L2::Allocation src, VkBuffer dst,
+                    VkDeviceSize size, VkDeviceSize dstOffset)
+{
+    pendingBufferUploads_.push_back({ dst, dstOffset, size, src.buffer, src.offset });
+}
+
 void Device::flushUploads(VkCommandBuffer cmd)
 {
     for (auto& u : pendingUploads_) {
@@ -355,6 +361,31 @@ void Device::flushUploads(VkCommandBuffer cmd)
             0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
     pendingUploads_.clear();
+
+    // Buffer-to-buffer copies (path-mesh cache inserts, etc.)
+    for (auto& u : pendingBufferUploads_) {
+        VkBufferCopy region {};
+        region.srcOffset = u.srcOffset;
+        region.dstOffset = u.dstOffset;
+        region.size      = u.size;
+        vkCmdCopyBuffer(cmd, u.srcBuffer, u.dstBuffer, 1, &region);
+
+        // Make the write visible to vertex-input reads (downstream path
+        // stencil draws sample this buffer as a vertex attribute source).
+        VkBufferMemoryBarrier bb {};
+        bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+        bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.buffer = u.dstBuffer;
+        bb.offset = u.dstOffset;
+        bb.size   = u.size;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+            0, 0, nullptr, 1, &bb, 0, nullptr);
+    }
+    pendingBufferUploads_.clear();
 }
 
 // =============================================================================

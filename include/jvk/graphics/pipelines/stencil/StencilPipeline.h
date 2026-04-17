@@ -23,7 +23,8 @@ public:
         cfg.stencilPassOp = VK_STENCIL_OP_INVERT;
         cfg.stencilFailOp = VK_STENCIL_OP_KEEP;
         cfg.stencilWriteMask = 0xFF;
-        cfg.pushConstantRanges = {{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float) * 2 }};
+        // viewportSize (2f) + affine transform packed as 3 × vec2 (6f) = 32 bytes.
+        cfg.pushConstantRanges = {{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float) * 8 }};
         return cfg;
     }
 
@@ -38,15 +39,20 @@ public:
         auto& state = r.state();
         auto& p = arena.read<PushClipPathParams>(cmd.dataOffset);
         if (p.vertexCount > 0) {
-            // Set write mask to this level's bit (depth is N before push, write bit N)
             state.setStencilWriteMask(1u << state.stencilDepth());
-            uint32_t after = cmd.dataOffset + static_cast<uint32_t>(sizeof(PushClipPathParams));
-            auto verts = arena.readSpan<UIVertex>(after, p.vertexCount);
-            // Stencil-only writes don't read textures, but the pipeline layout
-            // still has two sets — bind the default to both.
             auto def = r.caches().defaultDescriptor();
             state.setResources(def, def);
-            state.draw(cmd, verts.data(), p.vertexCount);
+
+            // Affine transform → stencil vert shader (lives in push-const
+            // range at byte offset 8, right after the viewport).
+            state.pushConstants(sizeof(float) * 2, sizeof(float) * 6, p.transform);
+
+            if (p.cachedMesh) {
+                state.drawCached(cmd, p.cachedMesh->buffer.buffer(), p.vertexCount);
+            } else {
+                auto verts = arena.readSpan<UIVertex>(p.vertexArenaOffset, p.vertexCount);
+                state.draw(cmd, verts.data(), p.vertexCount);
+            }
         }
         state.pushClipPath(juce::Path(), juce::AffineTransform());
     }
@@ -74,7 +80,8 @@ public:
         cfg.stencilPassOp = VK_STENCIL_OP_INVERT;
         cfg.stencilFailOp = VK_STENCIL_OP_KEEP;
         cfg.stencilWriteMask = 0xFF;
-        cfg.pushConstantRanges = {{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float) * 2 }};
+        // viewportSize (2f) + affine transform packed as 3 × vec2 (6f) = 32 bytes.
+        cfg.pushConstantRanges = {{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float) * 8 }};
         return cfg;
     }
 
@@ -89,17 +96,19 @@ public:
         auto& state = r.state();
         auto& p = arena.read<PopClipParams>(cmd.dataOffset);
         if (p.vertexCount > 0) {
-            // Set write mask to the level being popped (depth is N, clean bit N-1)
             uint8_t depth = state.stencilDepth();
             if (depth > 0)
                 state.setStencilWriteMask(1u << (depth - 1));
-            // Read verts from the SAME offset PushClipPath used. Second INVERT
-            // pass over identical triangles toggles the stencil bit back off —
-            // no reversed fan needed.
-            auto verts = arena.readSpan<UIVertex>(p.vertexArenaOffset, p.vertexCount);
             auto def = r.caches().defaultDescriptor();
             state.setResources(def, def);
-            state.draw(cmd, verts.data(), p.vertexCount);
+            state.pushConstants(sizeof(float) * 2, sizeof(float) * 6, p.transform);
+
+            if (p.cachedMesh) {
+                state.drawCached(cmd, p.cachedMesh->buffer.buffer(), p.vertexCount);
+            } else {
+                auto verts = arena.readSpan<UIVertex>(p.vertexArenaOffset, p.vertexCount);
+                state.draw(cmd, verts.data(), p.vertexCount);
+            }
         }
         state.popClip();
     }

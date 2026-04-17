@@ -278,6 +278,35 @@ void State::setShapeResource(VkDescriptorSet set)
     }
 }
 
+void State::pushConstants(uint32_t offset, uint32_t size, const void* data)
+{
+    vkCmdPushConstants(cmd_, boundLayout_, VK_SHADER_STAGE_VERTEX_BIT,
+        offset, size, data);
+}
+
+void State::drawCached(const DrawCommand& cmd, VkBuffer vbuf, uint32_t vertexCount)
+{
+    if (vertexCount == 0) return;
+
+    // Same scissor logic as draw() — command clip intersected with current stack.
+    juce::Rectangle<int> clip = cmd.clipBounds;
+    if (!currentClipBounds_.isEmpty())
+        clip = clip.getIntersection(currentClipBounds_);
+
+    if (clip != boundScissor_) {
+        VkRect2D sc;
+        sc.offset = { std::max(0, clip.getX()), std::max(0, clip.getY()) };
+        sc.extent = { static_cast<uint32_t>(std::max(0, clip.getWidth())),
+                      static_cast<uint32_t>(std::max(0, clip.getHeight())) };
+        vkCmdSetScissor(cmd_, 0, 1, &sc);
+        boundScissor_ = clip;
+    }
+
+    VkDeviceSize zero = 0;
+    vkCmdBindVertexBuffers(cmd_, 0, 1, &vbuf, &zero);
+    vkCmdDraw(cmd_, vertexCount, 1, 0, 0);
+}
+
 void State::draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count)
 {
     if (count == 0) return;
