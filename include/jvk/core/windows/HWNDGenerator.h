@@ -1,17 +1,10 @@
 /*
  ----------------------------------------------------------------------------
  Copyright (c) 2026 Discreet Signals LLC
- 
- ██████╗  ██╗ ███████╗  ██████╗ ██████╗  ███████╗ ███████╗ ████████╗
- ██╔══██╗ ██║ ██╔════╝ ██╔════╝ ██╔══██╗ ██╔════╝ ██╔════╝ ╚══██╔══╝
- ██║  ██║ ██║ ███████╗ ██║      ██████╔╝ █████╗   █████╗      ██║
- ██║  ██║ ██║ ╚════██║ ██║      ██╔══██╗ ██╔══╝   ██╔══╝      ██║
- ██████╔╝ ██║ ███████║ ╚██████╗ ██║  ██║ ███████╗ ███████╗    ██║
- ╚═════╝  ╚═╝ ╚══════╝  ╚═════╝ ╚═╝  ╚═╝ ╚══════╝ ╚══════╝    ╚═╝
- 
+
  Licensed under the MIT License. See LICENSE file in the project root
  for full license text.
- 
+
  For questions, contact gavin@discreetsignals.com
  ------------------------------------------------------------------------------
  File: HWNDGenerator.h
@@ -25,84 +18,84 @@
 namespace jvk::core::windows
 {
 
+// Creates a child HWND that Vulkan renders into. The HWND is handed to
+// juce::HWNDComponent::setHWND — JUCE re-parents it to the plugin window
+// and flips the style to WS_CHILD|WS_VISIBLE. Mouse events pass through
+// (HTTRANSPARENT) so JUCE's component tree owns input.
 class HWNDGenerator
 {
 public:
-    HWNDGenerator() : hwnd(nullptr) { }
+    HWNDGenerator() = default;
     ~HWNDGenerator() { release(); }
 
-    HWND& get() { return hwnd; }
-    HWND& create()
-    {
-        DBG("Creating HWND...");
-        HINSTANCE hInstance = GetModuleHandle(nullptr);
-        const char* className = "jvk";
-        WNDCLASSEX wc = {};
-        wc.cbSize = sizeof(WNDCLASSEX);
-        wc.style = CS_HREDRAW | CS_VREDRAW;
-        wc.lpfnWndProc = &WindowProc;
-        wc.hInstance = hInstance;
-        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-        wc.lpszClassName = className;
+    HWNDGenerator(const HWNDGenerator&) = delete;
+    HWNDGenerator& operator=(const HWNDGenerator&) = delete;
 
-        if (!RegisterClassEx(&wc))
-            DBG("Failed to Create Window!");
+    HWND create()
+    {
+        if (hwnd) return hwnd;
+        HINSTANCE hInst = moduleHInstance();
+        registerClassOnce(hInst);
         hwnd = CreateWindowEx(
-            WS_EX_TRANSPARENT | WS_EX_LAYERED,
-            className,
-            className,
+            WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            className(),
+            TEXT("jvk"),
             WS_POPUP,
-            0, 0, 800, 600,
+            0, 0, 1, 1,
             nullptr, nullptr,
-            GetModuleHandle(nullptr),
-            nullptr
-        );
-        if (hwnd)
-            DBG("Created HWND!");
-        else
-            DBG("Failed To Create Window");
+            hInst,
+            nullptr);
         return hwnd;
     }
-    void setSize(int width, int height)
-    {
-        SetWindowPos(hwnd, NULL, 0, 0, width, height, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOMOVE);
-    }
+
+    HWND get() const { return hwnd; }
+
     void release()
     {
-        DestroyWindow(hwnd);
-        MSG msg;
-        while (GetMessage(&msg, nullptr, 0, 0)) {
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        }
-        UnregisterClass("jvk", GetModuleHandle(nullptr));
-    }
-private:
-    HWND hwnd;
-
-    static LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-        switch (uMsg) {
-        case WM_DESTROY:
-            PostQuitMessage(0);
-            return 0;
-        // Forward all mouse messages to the parent (JUCE's HWND)
-        case WM_NCHITTEST:
-            return HTTRANSPARENT;
-        case WM_MOUSEMOVE:
-        case WM_LBUTTONDOWN: case WM_LBUTTONUP:
-        case WM_RBUTTONDOWN: case WM_RBUTTONUP:
-        case WM_MBUTTONDOWN: case WM_MBUTTONUP:
-        case WM_MOUSEWHEEL:  case WM_MOUSEHWHEEL:
-        case WM_MOUSELEAVE:
+        if (hwnd)
         {
-            HWND parent = GetParent(hwnd);
-            if (parent)
-                return SendMessage(parent, uMsg, wParam, lParam);
-            break;
+            DestroyWindow(hwnd);
+            hwnd = nullptr;
         }
-        }
-        return DefWindowProc(hwnd, uMsg, wParam, lParam);
+    }
+
+private:
+    HWND hwnd = nullptr;
+
+    static LPCTSTR className() { return TEXT("jvk_vulkan_surface"); }
+
+    // Returns the HINSTANCE of the module containing this function — the
+    // plugin DLL, not the host process. RegisterClassEx ties the class to
+    // this hInstance, so the WndProc stays valid for the plugin's lifetime.
+    static HINSTANCE moduleHInstance()
+    {
+        HMODULE hm = nullptr;
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+            | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(&moduleHInstance),
+            &hm);
+        return reinterpret_cast<HINSTANCE>(hm);
+    }
+
+    static void registerClassOnce(HINSTANCE hInst)
+    {
+        WNDCLASSEX wc {};
+        wc.cbSize = sizeof(wc);
+        wc.style = CS_HREDRAW | CS_VREDRAW | CS_OWNDC;
+        wc.lpfnWndProc = &WindowProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = nullptr;
+        wc.lpszClassName = className();
+        if (!RegisterClassEx(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            DBG("jvk: RegisterClassEx failed, err=" << (int)GetLastError());
+    }
+
+    static LRESULT CALLBACK WindowProc(HWND h, UINT m, WPARAM w, LPARAM l)
+    {
+        if (m == WM_NCHITTEST) return HTTRANSPARENT;
+        return DefWindowProc(h, m, w, l);
     }
 };
 

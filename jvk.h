@@ -78,6 +78,8 @@
 // Platform surface creation (must come before AudioProcessorEditor)
 #if JUCE_MAC
 #include "include/jvk/core/macos/NSViewGenerator.h"
+#elif JUCE_WINDOWS
+#include "include/jvk/core/windows/HWNDGenerator.h"
 #endif
 
 // User-facing

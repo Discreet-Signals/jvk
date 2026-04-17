@@ -74,30 +74,32 @@ public:
         auto& s = state();
         auto combined = t.followedBy(s.transform).scaled(displayScale_);
 
-        // Flatten path to triangle fan in physical pixel space
-        std::vector<UIVertex> fanVerts;
+        // Flatten into the reusable scratch buffer — zero heap allocations on
+        // the steady state.
         juce::Rectangle<int> fanBounds;
-        flattenPathToFan(path, combined, fanVerts, fanBounds);
+        flattenPathToFan(path, combined, scratchFanVerts_, fanBounds);
 
         s.clipBounds = s.clipBounds.getIntersection(fanBounds);
 
-        // Push stencil write command with fan vertices
         PushClipPathParams params;
-        params.vertexCount = static_cast<uint32_t>(fanVerts.size());
-        params.pathBounds = fanBounds;
+        params.vertexCount = static_cast<uint32_t>(scratchFanVerts_.size());
+        params.pathBounds  = fanBounds;
         renderer_.push(DrawOp::PushClipPath, s.zOrder, s.clipBounds,
                        s.stencilDepth, s.scopeDepth, params);
-        if (!fanVerts.empty())
-            renderer_.arena_pushSpan(std::span<const UIVertex>(fanVerts.data(), fanVerts.size()));
 
-        // Store reversed fan for the matching PopClip
+        // Capture the arena offset where the fan lands. PopClip will reuse
+        // this same vertex range — second INVERT stencil pass toggles bits
+        // back to zero, no reversed winding required.
+        uint32_t fanOffset = renderer_.arena_offset();
+        if (!scratchFanVerts_.empty())
+            renderer_.arena_pushSpan(std::span<const UIVertex>(
+                scratchFanVerts_.data(), scratchFanVerts_.size()));
+
         PathClipFan clip;
-        clip.fanBounds = fanBounds;
-        clip.reversedFanVerts = std::move(fanVerts);
-        // Reverse winding: swap v1/v2 in each triangle for stencil decrement
-        for (size_t i = 0; i + 2 < clip.reversedFanVerts.size(); i += 3)
-            std::swap(clip.reversedFanVerts[i + 1], clip.reversedFanVerts[i + 2]);
-        s.pathClipStack.push_back(std::move(clip));
+        clip.fanBounds      = fanBounds;
+        clip.fanArenaOffset = fanOffset;
+        clip.vertexCount    = params.vertexCount;
+        s.pathClipStack.push_back(clip);
 
         s.stencilDepth++;
         s.scopeDepth++;
@@ -347,9 +349,12 @@ public:
     Renderer& getRenderer() { return renderer_; }
 
 private:
-    // Per-path-clip fan data stored during recording, consumed by PopClip
+    // Per-path-clip fan bookkeeping. The vertex data itself lives in the
+    // renderer's arena (pushed by PushClipPath); we just remember where it
+    // starts so the matching PopClip can reference the same span.
     struct PathClipFan {
-        std::vector<UIVertex> reversedFanVerts;
+        uint32_t             fanArenaOffset = 0;
+        uint32_t             vertexCount    = 0;
         juce::Rectangle<int> fanBounds;
     };
 
@@ -368,20 +373,21 @@ private:
     RecordState& state() { return stateStack_.back(); }
     const RecordState& state() const { return stateStack_.back(); }
 
-    // Record a PopClip for the most recent path clip, with reversed fan data
+    // Record a PopClip for the most recent path clip. References the same
+    // arena vertex data PushClipPath stored — no duplicate vertices, no
+    // winding reversal. StencilCoverPipeline runs the same triangles with
+    // INVERT which toggles the stencil bit back to zero.
     void recordPopClip()
     {
         auto& s = state();
         PopClipParams params;
         if (!s.pathClipStack.empty()) {
             auto& fan = s.pathClipStack.back();
-            params.vertexCount = static_cast<uint32_t>(fan.reversedFanVerts.size());
-            params.fanBounds = fan.fanBounds;
+            params.vertexCount       = fan.vertexCount;
+            params.vertexArenaOffset = fan.fanArenaOffset;
+            params.fanBounds         = fan.fanBounds;
             renderer_.push(DrawOp::PopClip, s.zOrder, s.clipBounds,
                            s.stencilDepth, s.scopeDepth, params);
-            if (!fan.reversedFanVerts.empty())
-                renderer_.arena_pushSpan(std::span<const UIVertex>(
-                    fan.reversedFanVerts.data(), fan.reversedFanVerts.size()));
             s.pathClipStack.pop_back();
         } else {
             renderer_.push(DrawOp::PopClip, s.zOrder, s.clipBounds,
@@ -392,19 +398,20 @@ private:
     }
 
     // Flatten a path into a triangle fan for stencil rendering.
-    // Adapted from the immediate-mode FillPath.h algorithm.
-    static void flattenPathToFan(const juce::Path& path,
-                                  const juce::AffineTransform& combined,
-                                  std::vector<UIVertex>& fanVerts,
-                                  juce::Rectangle<int>& bounds)
+    // Uses instance-level scratch buffers — no per-call heap allocations on
+    // the steady state.
+    void flattenPathToFan(const juce::Path& path,
+                          const juce::AffineTransform& combined,
+                          std::vector<UIVertex>& fanVerts,
+                          juce::Rectangle<int>& bounds)
     {
         fanVerts.clear();
+        scratchPoints_.clear();
+        // (scratchSegStack_ cleared per curve below)
 
         float minX =  std::numeric_limits<float>::max(), minY = minX;
         float maxX = -std::numeric_limits<float>::max(), maxY = maxX;
 
-        // Phase 1: collect transformed, flattened points with subpath markers
-        std::vector<glm::vec2> points;
         const float SUBPATH_MARKER = -std::numeric_limits<float>::infinity();
         constexpr float flatTol = 0.5f;
 
@@ -417,12 +424,11 @@ private:
         };
 
         auto flattenCubic = [&](glm::vec2 p0, glm::vec2 c1, glm::vec2 c2, glm::vec2 p3) {
-            struct Seg { glm::vec2 a, b, c, d; };
-            std::vector<Seg> stack;
-            stack.push_back({ p0, c1, c2, p3 });
-            while (!stack.empty()) {
-                auto [a, b, c, d] = stack.back();
-                stack.pop_back();
+            scratchSegStack_.clear();
+            scratchSegStack_.push_back({ p0, c1, c2, p3 });
+            while (!scratchSegStack_.empty()) {
+                auto [a, b, c, d] = scratchSegStack_.back();
+                scratchSegStack_.pop_back();
                 float dx = d.x - a.x, dy = d.y - a.y;
                 float len2 = dx * dx + dy * dy;
                 float d1, d2;
@@ -437,13 +443,13 @@ private:
                     d2 = (c.x-a.x)*(c.x-a.x) + (c.y-a.y)*(c.y-a.y);
                 }
                 if (d1 <= flatTol*flatTol && d2 <= flatTol*flatTol) {
-                    points.push_back(d);
+                    scratchPoints_.push_back(d);
                 } else {
                     auto mid = [](glm::vec2 u, glm::vec2 v) { return (u+v)*0.5f; };
                     auto ab = mid(a,b), bc = mid(b,c), cd = mid(c,d);
                     auto abc = mid(ab,bc), bcd = mid(bc,cd), abcd = mid(abc,bcd);
-                    stack.push_back({ abcd, bcd, cd, d });
-                    stack.push_back({ a, ab, abc, abcd });
+                    scratchSegStack_.push_back({ abcd, bcd, cd, d });
+                    scratchSegStack_.push_back({ a, ab, abc, abcd });
                 }
             }
         };
@@ -456,13 +462,13 @@ private:
             switch (iter.elementType) {
                 case juce::Path::Iterator::startNewSubPath: {
                     auto pt = transformPt(iter.x1, iter.y1);
-                    points.push_back({ SUBPATH_MARKER, 0 });
-                    points.push_back(pt);
+                    scratchPoints_.push_back({ SUBPATH_MARKER, 0 });
+                    scratchPoints_.push_back(pt);
                     subpathStart = pt; lastPt = pt; break;
                 }
                 case juce::Path::Iterator::lineTo: {
                     auto pt = transformPt(iter.x1, iter.y1);
-                    points.push_back(pt); lastPt = pt; break;
+                    scratchPoints_.push_back(pt); lastPt = pt; break;
                 }
                 case juce::Path::Iterator::quadraticTo: {
                     auto c = transformPt(iter.x1, iter.y1);
@@ -476,7 +482,7 @@ private:
                     flattenCubic(lastPt, c1, c2, p); lastPt = p; break;
                 }
                 case juce::Path::Iterator::closePath:
-                    points.push_back(subpathStart);
+                    scratchPoints_.push_back(subpathStart);
                     lastPt = subpathStart; break;
             }
         }
@@ -491,16 +497,16 @@ private:
             maxX = std::max(maxX, x); maxY = std::max(maxY, y);
         };
 
-        for (size_t i = 0; i < points.size(); i++) {
-            if (points[i].x == SUBPATH_MARKER) {
-                if (++i >= points.size()) break;
-                fanCenter = points[i]; prevPt = fanCenter;
+        for (size_t i = 0; i < scratchPoints_.size(); i++) {
+            if (scratchPoints_[i].x == SUBPATH_MARKER) {
+                if (++i >= scratchPoints_.size()) break;
+                fanCenter = scratchPoints_[i]; prevPt = fanCenter;
                 inSubpath = true;
                 updateBounds(fanCenter.x, fanCenter.y);
                 continue;
             }
             if (!inSubpath) continue;
-            glm::vec2 pt = points[i];
+            glm::vec2 pt = scratchPoints_[i];
             updateBounds(pt.x, pt.y);
             fanVerts.push_back({ fanCenter, dummy, {}, dummy, dummy });
             fanVerts.push_back({ prevPt,   dummy, {}, dummy, dummy });
@@ -523,6 +529,13 @@ private:
     float     displayScale_;
     std::vector<RecordState> stateStack_;
     mutable uint64_t frameId_ = 0;
+
+    // Flatten scratch buffers — cleared-but-not-freed between paths so the
+    // hot path is allocation-free after the first frame.
+    struct Seg { glm::vec2 a, b, c, d; };
+    std::vector<UIVertex>  scratchFanVerts_;
+    std::vector<glm::vec2> scratchPoints_;
+    std::vector<Seg>       scratchSegStack_;
 };
 
 } // namespace jvk

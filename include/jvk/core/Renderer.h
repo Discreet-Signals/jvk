@@ -212,6 +212,10 @@ public:
     void arena_align(uint32_t alignment) { arena_.align(alignment); }
     template <typename T>
     void arena_pushSpan(std::span<const T> data) { arena_.pushSpan(data); }
+    // Byte offset where the next push will land. Capture before an
+    // arena_pushSpan call to remember that data's location for later
+    // cross-command references (e.g. PopClip reusing PushClipPath's verts).
+    uint32_t arena_offset() const { return arena_.size(); }
 
     void reset()
     {

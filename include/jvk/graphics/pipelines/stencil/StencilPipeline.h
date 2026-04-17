@@ -93,8 +93,10 @@ public:
             uint8_t depth = state.stencilDepth();
             if (depth > 0)
                 state.setStencilWriteMask(1u << (depth - 1));
-            uint32_t after = cmd.dataOffset + static_cast<uint32_t>(sizeof(PopClipParams));
-            auto verts = arena.readSpan<UIVertex>(after, p.vertexCount);
+            // Read verts from the SAME offset PushClipPath used. Second INVERT
+            // pass over identical triangles toggles the stencil bit back off —
+            // no reversed fan needed.
+            auto verts = arena.readSpan<UIVertex>(p.vertexArenaOffset, p.vertexCount);
             auto def = r.caches().defaultDescriptor();
             state.setResources(def, def);
             state.draw(cmd, verts.data(), p.vertexCount);

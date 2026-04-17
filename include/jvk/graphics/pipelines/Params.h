@@ -96,9 +96,13 @@ struct PushClipPathParams {
 };
 
 struct PopClipParams {
-    uint32_t             vertexCount = 0;  // 0 for rect clips
+    uint32_t             vertexCount       = 0; // 0 for rect clips
+    uint32_t             vertexArenaOffset = 0; // points to PushClipPath's fan verts
     juce::Rectangle<int> fanBounds;
-    // followed in arena by: UIVertex[vertexCount] (reversed fan for stencil decrement)
+    // Vertices are NOT inlined after params — we reference the same fan the
+    // matching PushClipPath already pushed. Both draws use the same verts:
+    // PushClip writes stencil via INVERT, PopClip re-runs the same triangles
+    // with INVERT to toggle bits back off. No winding reversal needed.
 };
 
 struct EffectBlendParams {

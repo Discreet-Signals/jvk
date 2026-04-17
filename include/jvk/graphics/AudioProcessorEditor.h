@@ -138,15 +138,18 @@ private:
         if (vkCreateMacOSSurfaceMVK(device_->instance(), &ci, nullptr, &surface) != VK_SUCCESS)
             return;
 #elif JUCE_WINDOWS
+        hwndGen_ = std::make_unique<jvk::core::windows::HWNDGenerator>();
+        HWND childHwnd = hwndGen_->create();
+        if (!childHwnd) return;
+        metalView_.setHWND((void*)childHwnd);
+
         VkSurfaceKHR surface = VK_NULL_HANDLE;
-        if (auto* peer = getPeer()) {
-            auto hwnd = reinterpret_cast<HWND>(peer->getNativeHandle());
-            VkWin32SurfaceCreateInfoKHR ci {};
-            ci.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
-            ci.hwnd = hwnd;
-            ci.hinstance = GetModuleHandle(nullptr);
-            vkCreateWin32SurfaceKHR(device_->instance(), &ci, nullptr, &surface);
-        }
+        VkWin32SurfaceCreateInfoKHR ci {};
+        ci.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+        ci.hwnd = childHwnd;
+        ci.hinstance = GetModuleHandle(nullptr);
+        if (vkCreateWin32SurfaceKHR(device_->instance(), &ci, nullptr, &surface) != VK_SUCCESS)
+            return;
 #else
         VkSurfaceKHR surface = VK_NULL_HANDLE;
 #endif
@@ -213,6 +216,7 @@ private:
     std::unique_ptr<jvk::core::macos::NSViewGenerator> nsViewGen_;
     juce::NSViewComponent metalView_;
 #elif JUCE_WINDOWS
+    std::unique_ptr<jvk::core::windows::HWNDGenerator> hwndGen_;
     juce::HWNDComponent metalView_;
 #else
     juce::Component metalView_;
