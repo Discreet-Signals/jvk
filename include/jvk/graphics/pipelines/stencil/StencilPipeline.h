@@ -48,7 +48,8 @@ public:
             state.pushConstants(sizeof(float) * 2, sizeof(float) * 6, p.transform);
 
             if (p.cachedMesh) {
-                state.drawCached(cmd, p.cachedMesh->buffer.buffer(), p.vertexCount);
+                state.drawCached(cmd, r.caches().pathMeshPool().buffer(),
+                                 p.cachedMesh->firstVertex, p.vertexCount);
             } else {
                 auto verts = arena.readSpan<UIVertex>(p.vertexArenaOffset, p.vertexCount);
                 state.draw(cmd, verts.data(), p.vertexCount);
@@ -104,7 +105,8 @@ public:
             state.pushConstants(sizeof(float) * 2, sizeof(float) * 6, p.transform);
 
             if (p.cachedMesh) {
-                state.drawCached(cmd, p.cachedMesh->buffer.buffer(), p.vertexCount);
+                state.drawCached(cmd, r.caches().pathMeshPool().buffer(),
+                                 p.cachedMesh->firstVertex, p.vertexCount);
             } else {
                 auto verts = arena.readSpan<UIVertex>(p.vertexArenaOffset, p.vertexCount);
                 state.draw(cmd, verts.data(), p.vertexCount);

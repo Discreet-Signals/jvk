@@ -200,28 +200,63 @@ struct CachedBuffer {
 };
 
 // =============================================================================
-// CachedPathMesh — local-space flattened triangle fan for a juce::Path.
-// Lives in a device-local Buffer sub-allocation. Same mesh reusable under any
-// affine transform (applied in the stencil vertex shader).
+// CachedPathMesh — a suballocation inside the shared PathMeshPool buffer.
+// Transform-agnostic local-space verts; the same mesh is reusable under any
+// affine transform (applied in the stencil vertex shader via push constants).
 // =============================================================================
 
 struct CachedPathMesh {
-    Buffer                 buffer;        // device-local vertex buffer
+    uint32_t               firstVertex = 0;  // offset into PathMeshPool, in verts
     uint32_t               vertexCount = 0;
-    juce::Rectangle<float> localBounds;   // in path-local coords
+    juce::Rectangle<float> localBounds;      // in path-local coords
+};
 
-    CachedPathMesh() = default;
-    CachedPathMesh(CachedPathMesh&& o) noexcept
-        : buffer(std::move(o.buffer)), vertexCount(o.vertexCount), localBounds(o.localBounds)
-    { o.vertexCount = 0; }
-    CachedPathMesh& operator=(CachedPathMesh&& o) noexcept {
-        if (this != &o) {
-            buffer = std::move(o.buffer);
-            vertexCount = o.vertexCount; o.vertexCount = 0;
-            localBounds = o.localBounds;
-        }
-        return *this;
+// =============================================================================
+// PathMeshPool — one big device-local VkBuffer that all cached path meshes
+// suballocate into. Lets us bind the vertex buffer once per frame and use
+// firstVertex to select each path — eliminating per-path vkCmdBindVertexBuffers
+// overhead, which dominates once flatten/upload are cached out.
+//
+// Simple bump allocator. When full, `alloc` returns `ok=false` and the caller
+// falls back to streaming the mesh through the per-frame arena.
+// =============================================================================
+
+class PathMeshPool {
+public:
+    static constexpr VkDeviceSize CAPACITY_BYTES = 64ull * 1024 * 1024; // 64 MB
+    static constexpr uint32_t     VERTEX_STRIDE  = sizeof(UIVertex);
+    static constexpr uint32_t     CAPACITY_VERTS =
+        static_cast<uint32_t>(CAPACITY_BYTES / VERTEX_STRIDE);
+
+    struct Allocation { uint32_t firstVertex = 0; bool ok = false; };
+
+    void init(Device& dev)
+    {
+        if (buffer_.valid()) return;
+        buffer_ = Buffer(dev.pool(), dev.device(), CAPACITY_BYTES,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     }
+
+    Allocation alloc(uint32_t vertexCount)
+    {
+        if (vertexCount == 0) return { 0, true };
+        if (head_ + vertexCount > CAPACITY_VERTS) return { 0, false };
+        Allocation a { head_, true };
+        head_ += vertexCount;
+        return a;
+    }
+
+    // Reset the bump cursor (caller must also clear the associated cache).
+    // Used when the pool fills up: we purge the mesh cache and start over.
+    void reset() { head_ = 0; }
+
+    VkBuffer     buffer()    const { return buffer_.buffer(); }
+    uint32_t     used()      const { return head_; }
+    uint32_t     capacity()  const { return CAPACITY_VERTS; }
+
+private:
+    Buffer   buffer_;
+    uint32_t head_ = 0;
 };
 
 
@@ -239,6 +274,7 @@ public:
     {
         createBlackPixel();
         gradientAtlas_.init(dev);
+        pathMeshPool_.init(dev);
     }
 
     ~ResourceCaches() = default;
@@ -246,6 +282,7 @@ public:
     GradientAtlas&                     gradientAtlas() { return gradientAtlas_; }
     Cache<uint64_t, CachedImage>&      textures()      { return textures_; }
     Cache<uint64_t, CachedPathMesh>&   pathMeshes()    { return pathMeshes_; }
+    PathMeshPool&                      pathMeshPool()  { return pathMeshPool_; }
 
     // Stable 64-bit hash of a juce::Path's geometry — same path shape produces
     // the same key regardless of transform / position.
@@ -373,6 +410,7 @@ private:
     GradientAtlas                   gradientAtlas_;
     Cache<uint64_t, CachedImage>    textures_;
     Cache<uint64_t, CachedPathMesh> pathMeshes_;
+    PathMeshPool                    pathMeshPool_;
     CachedImage                     blackPixel_;
     uint64_t currentFrame_ = 0;
     // Two-frame hash memory for path-cache promotion heuristic.

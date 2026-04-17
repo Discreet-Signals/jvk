@@ -117,23 +117,26 @@ public:
 
             // Promote to the mesh cache only on the second sighting — avoids
             // caching one-shot animated paths whose hash changes each frame.
+            // All cached meshes suballocate into one shared PathMeshPool buffer
+            // so the vertex-buffer bind is amortised across the whole frame.
             if (caches.pathWasSeenLastFrame(hash) && vCount > 0) {
-                VkDeviceSize size = static_cast<VkDeviceSize>(vCount) * sizeof(UIVertex);
-                CachedPathMesh entry;
-                entry.buffer = Buffer(renderer_.device().pool(),
-                                      renderer_.device().device(),
-                                      size,
-                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
-                                    | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-                entry.vertexCount = vCount;
-                entry.localBounds = localInt.toFloat();
+                auto slot = caches.pathMeshPool().alloc(vCount);
+                if (slot.ok) {
+                    VkDeviceSize size   = static_cast<VkDeviceSize>(vCount) * sizeof(UIVertex);
+                    VkDeviceSize dstOff = static_cast<VkDeviceSize>(slot.firstVertex) * sizeof(UIVertex);
 
-                auto staging = renderer_.device().staging().alloc(size);
-                memcpy(staging.mappedPtr, scratchFanVerts_.data(), static_cast<size_t>(size));
-                renderer_.device().upload(staging, entry.buffer.buffer(), size);
+                    auto staging = renderer_.device().staging().alloc(size);
+                    memcpy(staging.mappedPtr, scratchFanVerts_.data(), static_cast<size_t>(size));
+                    renderer_.device().upload(staging, caches.pathMeshPool().buffer(), size, dstOff);
 
-                auto& inserted = caches.pathMeshes().insert(hash, std::move(entry));
-                cached = &inserted; // rest of this frame can already use the cached entry
+                    CachedPathMesh entry;
+                    entry.firstVertex = slot.firstVertex;
+                    entry.vertexCount = vCount;
+                    entry.localBounds = localInt.toFloat();
+
+                    auto& inserted = caches.pathMeshes().insert(hash, std::move(entry));
+                    cached = &inserted;
+                }
             }
         }
 

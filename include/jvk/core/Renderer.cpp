@@ -201,6 +201,7 @@ void State::invalidate()
     boundShapeSet_ = VK_NULL_HANDLE;
     boundStencilRef_ = 0;
     boundScissor_ = { -1, -1, 0, 0 };
+    boundVertexBuffer_ = VK_NULL_HANDLE;
 }
 
 void State::setPipeline(Pipeline* pipeline)
@@ -284,11 +285,12 @@ void State::pushConstants(uint32_t offset, uint32_t size, const void* data)
         offset, size, data);
 }
 
-void State::drawCached(const DrawCommand& cmd, VkBuffer vbuf, uint32_t vertexCount)
+void State::drawCached(const DrawCommand& cmd, VkBuffer vbuf,
+                       uint32_t firstVertex, uint32_t vertexCount)
 {
     if (vertexCount == 0) return;
 
-    // Same scissor logic as draw() — command clip intersected with current stack.
+    // Scissor — command clip intersected with the current clip-stack bounds.
     juce::Rectangle<int> clip = cmd.clipBounds;
     if (!currentClipBounds_.isEmpty())
         clip = clip.getIntersection(currentClipBounds_);
@@ -302,9 +304,13 @@ void State::drawCached(const DrawCommand& cmd, VkBuffer vbuf, uint32_t vertexCou
         boundScissor_ = clip;
     }
 
-    VkDeviceSize zero = 0;
-    vkCmdBindVertexBuffers(cmd_, 0, 1, &vbuf, &zero);
-    vkCmdDraw(cmd_, vertexCount, 1, 0, 0);
+    // One big mesh pool — bind once, then firstVertex picks the subrange.
+    if (vbuf != boundVertexBuffer_) {
+        VkDeviceSize zero = 0;
+        vkCmdBindVertexBuffers(cmd_, 0, 1, &vbuf, &zero);
+        boundVertexBuffer_ = vbuf;
+    }
+    vkCmdDraw(cmd_, vertexCount, 1, firstVertex, 0);
 }
 
 void State::draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count)
@@ -325,12 +331,20 @@ void State::draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count)
         boundScissor_ = clip;
     }
 
-    // Write vertices and bind
-    VkDeviceSize byteCount = count * sizeof(UIVertex);
-    VkDeviceSize offset = vertices_->write(verts, byteCount);
-    VkBuffer buf = vertices_->getBuffer();
-    vkCmdBindVertexBuffers(cmd_, 0, 1, &buf, &offset);
-    vkCmdDraw(cmd_, count, 1, 0, 0);
+    // Ring buffer — bind it once at offset 0 and use firstVertex for the
+    // subrange. Each write() returns a vertex-aligned byte offset; we convert
+    // to a vertex index so the bind only changes when the slot grows.
+    VkDeviceSize byteCount  = count * sizeof(UIVertex);
+    VkDeviceSize byteOffset = vertices_->write(verts, byteCount);
+    VkBuffer     buf        = vertices_->getBuffer();
+    uint32_t     firstVert  = static_cast<uint32_t>(byteOffset / sizeof(UIVertex));
+
+    if (buf != boundVertexBuffer_) {
+        VkDeviceSize zero = 0;
+        vkCmdBindVertexBuffers(cmd_, 0, 1, &buf, &zero);
+        boundVertexBuffer_ = buf;
+    }
+    vkCmdDraw(cmd_, count, 1, firstVert, 0);
 }
 
 void State::pushClipRect(const juce::Rectangle<int>& rect)

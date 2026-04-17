@@ -126,10 +126,11 @@ public:
     void setShapeResource(VkDescriptorSet shapeSet);
     void setColorResource(VkDescriptorSet colorSet);
     void draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count);
-    // Draw using a pre-uploaded device-local vertex buffer (e.g. a
-    // CachedPathMesh) instead of streaming verts through the per-frame ring.
-    // Caller is responsible for push-constant state (transform, viewport).
-    void drawCached(const DrawCommand& cmd, VkBuffer vbuf, uint32_t vertexCount);
+    // Draw from a pre-uploaded device-local vertex buffer (PathMeshPool) using
+    // firstVertex to select the mesh — no per-path buffer bind. Caller handles
+    // push-constant state (transform, viewport).
+    void drawCached(const DrawCommand& cmd, VkBuffer vbuf,
+                    uint32_t firstVertex, uint32_t vertexCount);
     // Push a payload to the vertex-stage push-constant range at the given
     // byte offset. Used by stencil pipelines to push the affine transform
     // alongside the viewport size already written by setPipeline().
@@ -163,6 +164,7 @@ private:
     VkDescriptorSet  boundShapeSet_   = VK_NULL_HANDLE;
     uint32_t         boundStencilRef_ = 0;
     juce::Rectangle<int> boundScissor_ { -1, -1, 0, 0 };
+    VkBuffer         boundVertexBuffer_ = VK_NULL_HANDLE;
 
     struct ClipEntry {
         enum Type { Rect, Path };
