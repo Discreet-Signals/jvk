@@ -19,6 +19,7 @@
 #include "include/jvk/core/Renderer.cpp"
 #include "include/jvk/core/Pipeline.cpp"
 #include "include/jvk/core/RenderTarget.cpp"
+#include "include/jvk/offscreen/ShaderImage.cpp"
 
 // SPIRV-Reflect (C source)
 extern "C" {
