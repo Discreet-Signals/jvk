@@ -341,6 +341,35 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
         }
 
         case DrawOp::DrawGlyphs: {
+            // ================================================================
+            // MSDF extensions roadmap (jvk::Graphics surface, beyond juce::Graphics)
+            //
+            // The atlas stores a true multi-channel signed distance field per
+            // glyph, which gives us several rendering knobs for free — no
+            // atlas re-rasterization, just per-draw shader parameters. All
+            // of these currently live in shaders/ui2d.frag (type 4 branch);
+            // exposing them requires extending DrawGlyphsParams + Graphics.h:
+            //
+            //   - Weight / stroke width
+            //       shift the MSDF 0.5 threshold (already wired as
+            //       WEIGHT_SHIFT in the shader) to render variable-weight
+            //       text: light/regular/bold/black from ONE atlas page.
+            //   - Outline / stroke
+            //       render `abs(signedDist - threshold) - halfStroke < 0`
+            //       to draw a stroked glyph outline of arbitrary thickness.
+            //   - Drop shadow / glow
+            //       sample the MSDF at an offset UV with a smoother
+            //       falloff; composite shadow then glyph in one draw.
+            //   - Glyph-space gradient fills
+            //       already works via the unified gradient path — per-glyph
+            //       gradient shading with no extra code.
+            //
+            // These are all juce::Graphics-surface-incompatible (JUCE has no
+            // concept of variable text weight or glyph outline), so they'd
+            // ship as jvk::Graphics extensions callable via
+            // Graphics::create(g)->drawTextWeighted(...) etc., matching the
+            // darken/brighten/tint/blur extension pattern.
+            // ================================================================
             auto& p = arena.read<DrawGlyphsParams>(cmd.dataOffset);
             auto& atlas = atlas_;
             uint32_t afterParams = cmd.dataOffset + static_cast<uint32_t>(sizeof(DrawGlyphsParams));

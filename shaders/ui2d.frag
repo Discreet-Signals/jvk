@@ -66,10 +66,27 @@ vec4 sampleShape() {
         vec3 msd = texture(shapeTex, fragUV).rgb;
         float sd = median(msd.r, msd.g, msd.b);
         float screenPxRange = fragShapeInfo.y;
-        float screenPxDist = screenPxRange * (sd - 0.5);
+
+        // --- Weight shift ------------------------------------------------
+        // MSDF considers `sd > 0.5` as "inside". Shifting the threshold
+        // thickens (negative shift) or thins (positive shift) glyph bodies
+        // uniformly. Default 0 = pure MSDF coverage, matching JUCE's
+        // physically-correct edge. Exposed per-draw via jvk::Graphics so
+        // callers can render variable-weight text without re-rasterizing
+        // the atlas (something juce::Graphics can't do natively).
+        const float WEIGHT_SHIFT = 0.0;
+        float screenPxDist = screenPxRange * (sd - (0.5 - WEIGHT_SHIFT));
         float alpha = clamp(screenPxDist + 0.5, 0.0, 1.0);
-        // Gamma-correct text alpha to match sRGB-blended text weight.
-        alpha = pow(alpha, 0.4545);
+
+        // --- sRGB encoding of alpha -------------------------------------
+        // Pushes mid-alphas up so AA edges composite with the same "bolder
+        // reader-friendly" weight sRGB-blended text has. This is the exact
+        // sRGB linear→gamma transfer (IEC 61966-2-1), not the pow(1/2.2)
+        // approximation — matters most for low-alpha pixels at stem edges.
+        alpha = alpha <= 0.0031308
+              ? 12.92 * alpha
+              : 1.055 * pow(alpha, 1.0 / 2.4) - 0.055;
+
         return vec4(1.0, 1.0, 1.0, alpha);
     }
 

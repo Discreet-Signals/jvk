@@ -3,9 +3,9 @@ namespace jvk {
 Pipeline::~Pipeline()
 {
     VkDevice d = device_.device();
-    if (pipeline_ != VK_NULL_HANDLE)     vkDestroyPipeline(d, pipeline_, nullptr);
+    if (pipeline_     != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_,     nullptr);
     if (clipPipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(d, clipPipeline_, nullptr);
-    if (layout_ != VK_NULL_HANDLE)       vkDestroyPipelineLayout(d, layout_, nullptr);
+    if (layout_       != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
 }
 
 Pipeline::Pipeline(Pipeline&& o) noexcept
@@ -13,10 +13,10 @@ Pipeline::Pipeline(Pipeline&& o) noexcept
       layout_(o.layout_), vertSpirv_(std::move(o.vertSpirv_)),
       fragSpirv_(std::move(o.fragSpirv_)), built_(o.built_)
 {
-    o.pipeline_ = VK_NULL_HANDLE;
+    o.pipeline_     = VK_NULL_HANDLE;
     o.clipPipeline_ = VK_NULL_HANDLE;
-    o.layout_ = VK_NULL_HANDLE;
-    o.built_ = false;
+    o.layout_       = VK_NULL_HANDLE;
+    o.built_        = false;
 }
 
 void Pipeline::loadVertexShader(std::span<const uint32_t> spirv)
@@ -34,7 +34,7 @@ void Pipeline::defineLayout(Memory::M& bindings)
     // Default: 1 combined image sampler at binding 0 (already registered as IMAGE_SAMPLER)
 }
 
-void Pipeline::build(VkRenderPass renderPass, VkSampleCountFlagBits msaa)
+void Pipeline::build(VkRenderPass renderPass)
 {
     if (built_) return;
     VkDevice d = device_.device();
@@ -55,17 +55,20 @@ void Pipeline::build(VkRenderPass renderPass, VkSampleCountFlagBits msaa)
 
     vkCreatePipelineLayout(d, &pli, nullptr, &layout_);
 
-    pipeline_ = buildVariant(cfg, renderPass, msaa, layout_);
+    // Single-sample only. Geometric AA comes from SDF/MSDF shaders per-pixel;
+    // path-fill edges and shader-rendered content can optionally be smoothed
+    // via a final subpixel-offset supersample effect pass.
+    pipeline_ = buildVariant(cfg, renderPass, layout_);
 
     auto clip = clipConfig();
     if (clip)
-        clipPipeline_ = buildVariant(*clip, renderPass, msaa, layout_);
+        clipPipeline_ = buildVariant(*clip, renderPass, layout_);
 
     built_ = true;
 }
 
 VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass renderPass,
-                                   VkSampleCountFlagBits msaa, VkPipelineLayout layout)
+                                   VkPipelineLayout layout)
 {
     VkDevice d = device_.device();
 
@@ -131,7 +134,7 @@ VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass render
 
     VkPipelineMultisampleStateCreateInfo multisample {};
     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = msaa;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
     // Depth/stencil
     VkPipelineDepthStencilStateCreateInfo depthStencil {};

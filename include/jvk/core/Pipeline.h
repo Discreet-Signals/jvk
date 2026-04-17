@@ -25,7 +25,11 @@ public:
 
     virtual void defineLayout(Memory::M& bindings);
 
-    void build(VkRenderPass renderPass, VkSampleCountFlagBits msaa);
+    // Builds up to two VkPipelines — normal and (optional) clip variant —
+    // sharing one layout and one set of shader modules. Both are single-
+    // sample. The scene render passes (clear + load variants) are
+    // pipeline-compatible, so one build covers both.
+    void build(VkRenderPass renderPass);
     bool isBuilt() const { return built_; }
 
     VkPipeline       handle()     const { return pipeline_; }
@@ -44,7 +48,7 @@ private:
     bool built_ = false;
 
     VkPipeline buildVariant(const PipelineConfig& cfg, VkRenderPass renderPass,
-                            VkSampleCountFlagBits msaa, VkPipelineLayout layout);
+                            VkPipelineLayout layout);
 };
 
 } // namespace jvk

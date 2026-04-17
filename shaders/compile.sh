@@ -17,6 +17,7 @@ $GLSLC -fshader-stage=frag ui2d.frag     -o ui2d.frag.spv
 $GLSLC -fshader-stage=vert stencil.vert  -o stencil.vert.spv
 $GLSLC -fshader-stage=frag stencil.frag  -o stencil.frag.spv
 $GLSLC -fshader-stage=frag hsv.frag      -o hsv.frag.spv
+$GLSLC -fshader-stage=vert blur.vert     -o blur.vert.spv
 $GLSLC -fshader-stage=frag blur.frag     -o blur.frag.spv
 
 echo "Generating UI2DShaders.h..."
@@ -38,6 +39,7 @@ shaders = [
     ('stencil.vert.spv', 'stencil_vert_spv'),
     ('stencil.frag.spv', 'stencil_frag_spv'),
     ('hsv.frag.spv', 'hsv_frag_spv'),
+    ('blur.vert.spv', 'blur_vert_spv'),
     ('blur.frag.spv', 'blur_frag_spv'),
 ]
 

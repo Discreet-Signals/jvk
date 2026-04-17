@@ -20,16 +20,14 @@ public:
     using juce::AudioProcessorEditor::setResizeLimits;
     using juce::AudioProcessorEditor::getConstrainer;
 
-    explicit AudioProcessorEditor(juce::AudioProcessor& p,
-                                  VkSampleCountFlagBits msaa = VK_SAMPLE_COUNT_2_BIT)
-        : juce::AudioProcessorEditor(p), msaa_(msaa)
+    explicit AudioProcessorEditor(juce::AudioProcessor& p)
+        : juce::AudioProcessorEditor(p)
     {
         init();
     }
 
-    explicit AudioProcessorEditor(juce::AudioProcessor* p,
-                                  VkSampleCountFlagBits msaa = VK_SAMPLE_COUNT_2_BIT)
-        : juce::AudioProcessorEditor(p), msaa_(msaa)
+    explicit AudioProcessorEditor(juce::AudioProcessor* p)
+        : juce::AudioProcessorEditor(p)
     {
         init();
     }
@@ -154,7 +152,7 @@ private:
 #endif
         if (surface == VK_NULL_HANDLE) return;
 
-        target_ = std::make_unique<SwapchainTarget>(*device_, surface, w, h, msaa_);
+        target_ = std::make_unique<SwapchainTarget>(*device_, surface, w, h);
         renderer_ = std::make_unique<Renderer>(*device_, *target_);
         registerPipelines();
     }
@@ -183,6 +181,16 @@ private:
         blendPipeline_ = std::make_unique<pipelines::BlendPipeline>(
             *device_, spv(vert_spv, vert_spvSize), spv(frag_spv, frag_spvSize));
         renderer_->registerPipeline(*blendPipeline_);
+
+        // Generic post-process pipeline. Runs any single-input fullscreen
+        // fragment shader as an intra-frame effect. Configured here for
+        // separable Gaussian blur.
+        blurEffect_ = std::make_unique<EffectPipeline>();
+        blurEffect_->init(*device_,
+            target_->effectRenderPass(),
+            spv(blur_vert_spv, blur_vert_spvSize),
+            spv(blur_frag_spv, blur_frag_spvSize));
+        renderer_->setPostProcess(blurEffect_.get());
     }
 
     struct RenderTimer : public juce::Timer {
@@ -214,9 +222,9 @@ private:
     std::unique_ptr<pipelines::StencilWritePipeline>  stencilWritePipeline_;
     std::unique_ptr<pipelines::StencilCoverPipeline>  stencilCoverPipeline_;
     std::unique_ptr<pipelines::BlendPipeline>         blendPipeline_;
+    std::unique_ptr<EffectPipeline>                   blurEffect_;
 
     RenderTimer renderTimer_;
-    VkSampleCountFlagBits msaa_;
     bool vulkanEnabled_ = true;
     uint64_t frameCounter_ = 0;
 };

@@ -99,6 +99,7 @@ set(JVK_SHADER_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ui2d.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/stencil.vert"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/stencil.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.vert"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hsv.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader_region.vert"

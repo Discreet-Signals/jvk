@@ -17,16 +17,13 @@ void Renderer::registerPipeline(Pipeline& pipeline)
 
 void Renderer::execute()
 {
-    // Sort: stable sort by z, then by pipeline within z (future optimization)
-    // For now, replay in submission order as spec says.
-
     auto frame = target_.beginFrame();
     if (frame.cmd == VK_NULL_HANDLE) return;
 
     vertices_.beginFrame(frame.frameSlot);
     device_.flushRetired(frame.frameSlot);
 
-    // Let pipelines stage pending uploads (atlas pages, deferred textures)
+    // Pipeline prepare (atlas dirty pages, etc.) and gradient/texture uploads
     {
         Pipeline* seen[static_cast<size_t>(DrawOp::COUNT)] = {};
         int n = 0;
@@ -37,54 +34,146 @@ void Renderer::execute()
             if (!dup) { seen[n++] = p; p->prepare(); }
         }
     }
-
-    // Stage all rows that were registered during recording. One contiguous
-    // upload rather than one descriptor set per gradient.
     device_.caches().gradientAtlas().stageUploads();
-
     device_.flushUploads(frame.cmd);
 
-    // Begin render pass
-    VkRenderPassBeginInfo rpbi {};
-    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpbi.renderPass = target_.renderPass();
-    rpbi.framebuffer = frame.framebuffer;
-    rpbi.renderArea.extent = frame.extent;
+    auto const& sb = target_.sceneBuffers(frame.frameSlot);
 
-    std::array<VkClearValue, 3> clears {};
-    clears[0].color = {{ 0.0f, 0.0f, 0.0f, 1.0f }};
-    clears[1].color = clears[0].color;
-    clears[2].depthStencil = { 1.0f, 0 };
-    rpbi.clearValueCount = static_cast<uint32_t>(clears.size());
-    rpbi.pClearValues = clears.data();
+    // Ping-pong state. Scene draws go into `current`; an effect samples
+    // `current` and writes into `other`, then the two swap so subsequent
+    // scene draws land on top of the effect's output.
+    VkFramebuffer   currentSceneFB  = sb.framebufferA;  // scene RP writes here
+    VkFramebuffer   currentEffectFB = sb.effectFBtoA;   // effect writes into colorA
+    VkFramebuffer   otherSceneFB    = sb.framebufferB;
+    VkFramebuffer   otherEffectFB   = sb.effectFBtoB;
+    VkDescriptorSet currentSampler  = sb.samplerA;      // samples colorA
+    VkDescriptorSet otherSampler    = sb.samplerB;
+    VkImage         currentImage    = sb.colorA.image();
 
-    vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+    auto beginSceneRP = [&](VkRenderPass rp, VkFramebuffer fb, bool withClears) {
+        VkRenderPassBeginInfo rpbi {};
+        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rpbi.renderPass = rp;
+        rpbi.framebuffer = fb;
+        rpbi.renderArea.extent = frame.extent;
 
-    // Set initial viewport and scissor
-    VkViewport vp {};
-    vp.width = static_cast<float>(frame.extent.width);
-    vp.height = static_cast<float>(frame.extent.height);
-    vp.maxDepth = 1.0f;
-    vkCmdSetViewport(frame.cmd, 0, 1, &vp);
+        VkClearValue clears[2] {};
+        clears[0].color = {{ 0.0f, 0.0f, 0.0f, 0.0f }};
+        clears[1].depthStencil = { 1.0f, 0 };
+        if (withClears) {
+            rpbi.clearValueCount = 2;
+            rpbi.pClearValues = clears;
+        }
+        vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
-    VkRect2D sc {};
-    sc.extent = frame.extent;
-    vkCmdSetScissor(frame.cmd, 0, 1, &sc);
+        VkViewport vp {};
+        vp.width    = static_cast<float>(frame.extent.width);
+        vp.height   = static_cast<float>(frame.extent.height);
+        vp.maxDepth = 1.0f;
+        vkCmdSetViewport(frame.cmd, 0, 1, &vp);
+        VkRect2D sc {}; sc.extent = frame.extent;
+        vkCmdSetScissor(frame.cmd, 0, 1, &sc);
 
-    // Initialize state for replay
-    state_.begin(frame.cmd, vertices_, vp.width, vp.height);
+        state_.invalidate();
+    };
 
-    // Replay commands — Renderer handles lazy build + pipeline binding
+    beginSceneRP(target_.sceneRenderPassClear(), currentSceneFB, /*withClears=*/true);
+    state_.begin(frame.cmd, vertices_,
+        static_cast<float>(frame.extent.width),
+        static_cast<float>(frame.extent.height));
+
+    VkRenderPass scenePassLoad = target_.sceneRenderPassLoad();
+    VkRenderPass sceneBuildRP  = target_.sceneRenderPassClear(); // compat for build
+
     for (auto& cmd : commands_) {
+        if (cmd.op == DrawOp::EffectKernel) {
+            vkCmdEndRenderPass(frame.cmd);
+
+            if (postProcess_) {
+                auto& bp = arena_.read<BlurParams>(cmd.dataOffset);
+                // Separable Gaussian: horizontal into `other`, vertical back
+                // into `current`. `current` keeps its identity so subsequent
+                // scene draws land on top of the blurred result.
+                postProcess_->applyPass(frame.cmd,
+                    currentSampler, otherEffectFB, target_.effectRenderPass(),
+                    frame.extent, 1.0f, 0.0f, bp.radius);
+                postProcess_->applyPass(frame.cmd,
+                    otherSampler, currentEffectFB, target_.effectRenderPass(),
+                    frame.extent, 0.0f, 1.0f, bp.radius);
+            }
+
+            beginSceneRP(scenePassLoad, currentSceneFB, /*withClears=*/false);
+            continue;
+        }
         auto* pipeline = pipelineForOp_[static_cast<size_t>(cmd.op)];
         if (!pipeline) continue;
         if (!pipeline->isBuilt())
-            pipeline->build(target_.renderPass(), target_.msaaSamples());
+            pipeline->build(sceneBuildRP);
         state_.setPipeline(pipeline);
         pipeline->execute(*this, arena_, cmd);
     }
 
     vkCmdEndRenderPass(frame.cmd);
+
+    if (frame.swapImage == VK_NULL_HANDLE) {
+        // Offscreen target — no swap image to blit to. Scene content remains
+        // in currentImage (SHADER_READ_ONLY_OPTIMAL) for the caller to sample.
+        target_.endFrame(frame);
+        frameCounter_++;
+        return;
+    }
+
+    // Blit currentTarget → swap image. currentImage is in SHADER_READ_ONLY
+    // (finalLayout of the scene RP). Transition both images and copy.
+    VkImageMemoryBarrier barriers[2] {};
+    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[0].image = currentImage;
+    barriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barriers[1].srcAccessMask = 0;
+    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barriers[1].image = frame.swapImage;
+    barriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+
+    vkCmdPipelineBarrier(frame.cmd,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 2, barriers);
+
+    VkImageBlit region {};
+    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.srcOffsets[1] = { (int32_t)frame.extent.width, (int32_t)frame.extent.height, 1 };
+    region.dstOffsets[1] = { (int32_t)frame.extent.width, (int32_t)frame.extent.height, 1 };
+    vkCmdBlitImage(frame.cmd,
+        currentImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        frame.swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &region, VK_FILTER_NEAREST);
+
+    VkImageMemoryBarrier present {};
+    present.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    present.dstAccessMask = 0;
+    present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    present.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    present.image = frame.swapImage;
+    present.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    vkCmdPipelineBarrier(frame.cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &present);
 
     target_.endFrame(frame);
     frameCounter_++;
@@ -119,7 +208,7 @@ void State::setPipeline(Pipeline* pipeline)
     if (!pipeline) return;
 
     VkPipeline handle;
-    if (stencilDepth_ > 0 && pipeline->clipHandle() != VK_NULL_HANDLE)
+    if (stencilDepth_ > 0)
         handle = pipeline->clipHandle();
     else
         handle = pipeline->handle();

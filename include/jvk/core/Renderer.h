@@ -4,6 +4,7 @@ namespace jvk {
 
 class Pipeline;
 class RenderTarget;
+class EffectPipeline;
 
 // =============================================================================
 // UIVertex — shared vertex format for 2D pipelines
@@ -194,6 +195,12 @@ public:
     void registerPipeline(Pipeline& pipeline);
     void execute();
 
+    // Attach a post-process helper that handles EffectKernel ops. When set,
+    // the next execute() that encounters an EffectKernel routes the main
+    // render pass through the target's sampleable-intermediate variant and
+    // applies the 2-pass separable effect (e.g. Gaussian blur) before present.
+    void setPostProcess(EffectPipeline* ep) { postProcess_ = ep; }
+
     // Capture non-POD types into side vectors. Returns index.
     uint32_t captureFont(const juce::Font& f)     { fonts_.push_back(f); return static_cast<uint32_t>(fonts_.size() - 1); }
     uint32_t captureFill(const juce::FillType& f)  { fills_.push_back(f); return static_cast<uint32_t>(fills_.size() - 1); }
@@ -235,6 +242,7 @@ private:
     std::vector<juce::FillType> fills_;
 
     Pipeline* pipelineForOp_[static_cast<size_t>(DrawOp::COUNT)] = {};
+    EffectPipeline* postProcess_ = nullptr;
     uint64_t frameCounter_ = 0;
 };
 
