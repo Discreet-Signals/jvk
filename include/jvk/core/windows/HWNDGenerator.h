@@ -100,3 +100,14 @@ private:
 };
 
 } // jvk::core::windows
+
+// windows.h defines legacy macros that collide with common identifiers.
+#ifdef near
+ #undef near
+#endif
+#ifdef far
+ #undef far
+#endif
+#ifdef small
+ #undef small
+#endif
