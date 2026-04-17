@@ -698,7 +698,7 @@ void BenchmarkEditor::sceneBlur(juce::Graphics& g, float w, float h, float t, fl
     g.setColour(juce::Colours::white);
     g.setFont(juce::FontOptions(20.0f));
     juce::String label = effectEnabled
-        ? juce::String::formatted("Blur ON — radius %.1f", blurRadius)
+        ? juce::String::formatted("Blur ON  -  radius %.1f", blurRadius)
         : juce::String("Blur OFF");
     g.drawText(label,
                0, static_cast<int>(h * 0.5f) - 15, static_cast<int>(w), 30,
