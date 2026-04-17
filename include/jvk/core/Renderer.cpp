@@ -38,6 +38,10 @@ void Renderer::execute()
         }
     }
 
+    // Stage all rows that were registered during recording. One contiguous
+    // upload rather than one descriptor set per gradient.
+    device_.caches().gradientAtlas().stageUploads();
+
     device_.flushUploads(frame.cmd);
 
     // Begin render pass
@@ -104,7 +108,8 @@ void State::invalidate()
     currentPipeline_ = nullptr;
     boundPipeline_ = VK_NULL_HANDLE;
     boundLayout_ = VK_NULL_HANDLE;
-    boundDescriptor_ = VK_NULL_HANDLE;
+    boundColorSet_ = VK_NULL_HANDLE;
+    boundShapeSet_ = VK_NULL_HANDLE;
     boundStencilRef_ = 0;
     boundScissor_ = { -1, -1, 0, 0 };
 }
@@ -122,16 +127,26 @@ void State::setPipeline(Pipeline* pipeline)
     if (handle != boundPipeline_) {
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, handle);
         boundPipeline_ = handle;
-        boundLayout_ = pipeline->layout();
+
+        // Layout change invalidates descriptor set bindings in Vulkan
+        if (boundLayout_ != pipeline->layout()) {
+            boundColorSet_ = VK_NULL_HANDLE;
+            boundShapeSet_ = VK_NULL_HANDLE;
+            boundLayout_ = pipeline->layout();
+        }
 
         // Push viewport size for pixel→NDC conversion in vertex shader
         float vpSize[2] = { vpWidth_, vpHeight_ };
         vkCmdPushConstants(cmd_, boundLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vpSize), vpSize);
     }
 
-    if (stencilDepth_ > 0 && stencilDepth_ != boundStencilRef_) {
-        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, stencilDepth_);
-        boundStencilRef_ = stencilDepth_;
+    // Per-level bit stencil: each clip level owns bit N. The clip variant
+    // tests that ALL active bits are set (EQUAL with mask = (1<<depth)-1).
+    if (stencilDepth_ > 0) {
+        uint32_t mask = (1u << stencilDepth_) - 1;
+        vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
+        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
+        boundStencilRef_ = mask;
     }
 
     currentPipeline_ = pipeline;
@@ -150,20 +165,28 @@ void State::setCustomPipeline(VkPipeline pipeline, VkPipelineLayout layout)
     currentPipeline_ = nullptr; // force rebind on next setPipeline
 }
 
-void State::setResource(VkDescriptorSet set)
+void State::setResources(VkDescriptorSet colorSet, VkDescriptorSet shapeSet)
 {
-    if (set != boundDescriptor_) {
+    setColorResource(colorSet);
+    setShapeResource(shapeSet);
+}
+
+void State::setColorResource(VkDescriptorSet set)
+{
+    if (set != boundColorSet_) {
         vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
             boundLayout_, 0, 1, &set, 0, nullptr);
-        boundDescriptor_ = set;
+        boundColorSet_ = set;
     }
 }
 
-void State::setResource(VkDescriptorSet set, uint32_t dynamicOffset)
+void State::setShapeResource(VkDescriptorSet set)
 {
-    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
-        boundLayout_, 0, 1, &set, 1, &dynamicOffset);
-    boundDescriptor_ = set;
+    if (set != boundShapeSet_) {
+        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            boundLayout_, 1, 1, &set, 0, nullptr);
+        boundShapeSet_ = set;
+    }
 }
 
 void State::draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count)
@@ -231,6 +254,16 @@ void State::popClip()
                 currentClipBounds_ = currentClipBounds_.getIntersection(entry.rect);
         }
     }
+}
+
+void State::setStencilWriteMask(uint32_t mask)
+{
+    vkCmdSetStencilWriteMask(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
+}
+
+void State::setStencilCompareMask(uint32_t mask)
+{
+    vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
 }
 
 } // namespace jvk

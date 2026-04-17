@@ -30,6 +30,7 @@ public:
         cfg.stencilCompareOp = VK_COMPARE_OP_EQUAL;
         cfg.stencilFailOp = VK_STENCIL_OP_KEEP;
         cfg.stencilPassOp = VK_STENCIL_OP_KEEP;
+        // compareMask and reference are set dynamically per-level by State
         return cfg;
     }
 
@@ -37,8 +38,8 @@ public:
     {
         static constexpr DrawOp ops[] = {
             DrawOp::FillRect, DrawOp::FillRectList, DrawOp::FillRoundedRect,
-            DrawOp::FillEllipse, DrawOp::DrawImage, DrawOp::DrawGlyphs,
-            DrawOp::DrawLine
+            DrawOp::FillEllipse, DrawOp::StrokeRoundedRect, DrawOp::StrokeEllipse,
+            DrawOp::DrawImage, DrawOp::DrawGlyphs, DrawOp::DrawLine
         };
         return ops;
     }

@@ -56,6 +56,17 @@ BenchmarkEditor::BenchmarkEditor(BenchmarkProcessor& p)
                        &btnTextStatic })
         addAndMakeVisible(*btn);
 
+    // Renderer toggle button (top-right)
+    btnToggleRenderer.onClick = [this] {
+        setVulkanEnabled(!isVulkanEnabled());
+        updateToggleButtonText();
+    };
+    btnToggleRenderer.setColour(juce::TextButton::buttonColourId, juce::Colour(0xFF333355));
+    btnToggleRenderer.setColour(juce::TextButton::textColourOnId, juce::Colours::white);
+    btnToggleRenderer.setColour(juce::TextButton::textColourOffId, juce::Colours::white);
+    addAndMakeVisible(btnToggleRenderer);
+    updateToggleButtonText();
+
     auto fullBark = juce::ImageFileFormat::loadFrom(BinaryData::bark_png, BinaryData::bark_pngSize);
     barkImage = fullBark.rescaled(48, 48, juce::Graphics::highResamplingQuality);
 
@@ -203,6 +214,8 @@ void BenchmarkEditor::runBenchmark(Mode mode)
         phase2Label = "JUCE";
     }
 
+    setBenchButtonsVisible(false);
+    btnToggleRenderer.setVisible(false);
     setVulkanEnabled(true);
     benchmarking = true;
     benchVulkanPhase = true;
@@ -310,14 +323,6 @@ void BenchmarkEditor::sceneAll(juce::Graphics& g, float w, float h, float t, flo
         float lx1 = std::fmod(fi * 41.0f + t * 300.0f, w), ly1 = std::fmod(fi * 31.0f, h);
         g.setColour(juce::Colour::fromHSV(std::fmod(fi / 120.0f + t, 1.0f), 0.8f, 1.0f, 0.6f));
         g.drawLine(lx1, ly1, lx1 + std::sin(phase + fi) * 80.0f, ly1 + std::cos(phase + fi) * 60.0f, 2.0f + fi * 0.05f);
-    }
-
-    // Apply effects if this is the ALL benchmark (exercises effect pipelines too)
-    auto vk = jvk::Graphics::create(g);
-    if (vk)
-    {
-        vk->darken(0.15f, juce::Rectangle<float>(0, 0, w * 0.5f, h * 0.5f));
-        vk->tint(juce::Colour(0xFF4488FF), juce::Rectangle<float>(w * 0.5f, 0, w * 0.5f, h * 0.5f));
     }
 }
 
@@ -608,7 +613,7 @@ void BenchmarkEditor::sceneEffects(juce::Graphics& g, float w, float h, float t,
             vk->warmth(0.8f, juce::Rectangle<float>(w / 3.0f, 0, w / 3.0f, h));
 
             // Tint the right third cool
-            vk->tint(juce::Colour(0xFF6688FF), juce::Rectangle<float>(w * 2.0f / 3.0f, 0, w / 3.0f, h));
+            vk->tint(juce::Colour(0xFF0000FF), juce::Rectangle<float>(w * 2.0f / 3.0f, 0, w / 3.0f, h));
 
             // Darken bottom half
             vk->darken(0.2f, juce::Rectangle<float>(0, h * 0.5f, w, h * 0.5f));
@@ -881,6 +886,8 @@ void BenchmarkEditor::paint(juce::Graphics& g)
                 vulkanFPS = vulkanRenderedFrames / (benchDurationMs / 1000.0);
                 juceFPS = juceRenderedFrames / (benchDurationMs / 1000.0);
                 showResults = true;
+                setBenchButtonsVisible(true);
+                btnToggleRenderer.setVisible(true);
             }
         }
         return;
@@ -890,25 +897,43 @@ void BenchmarkEditor::paint(juce::Graphics& g)
     g.fillAll(juce::Colour(0xFF0E0E1A));
     g.setColour(juce::Colours::white);
     g.setFont(juce::FontOptions(28.0f));
-    g.drawText("JVK Benchmark", 0, getHeight() / 2 - 80, getWidth(), 35, juce::Justification::centred);
+    g.drawText("JVK Benchmark", 0, getHeight() / 2 - 160, getWidth(), 35, juce::Justification::centred);
     g.setFont(juce::FontOptions(14.0f));
     g.setColour(juce::Colour(0xFFAAAAAA));
-    g.drawText("Select a benchmark to compare Vulkan vs JUCE rendering", 0, getHeight() / 2 - 40, getWidth(), 20, juce::Justification::centred);
+    g.drawText("Select a benchmark to compare Vulkan vs JUCE rendering", 0, getHeight() / 2 - 120, getWidth(), 20, juce::Justification::centred);
 
     g.setFont(juce::FontOptions(11.0f));
     g.setColour(juce::Colour(0xFF666666));
     g.drawText("Row 1: Core pipelines (Vulkan vs JUCE)  |  Row 2: Specialized (EFFECTS/BLUR compare ON vs OFF)",
-               0, getHeight() / 2 - 15, getWidth(), 16, juce::Justification::centred);
+               0, getHeight() / 2 - 95, getWidth(), 16, juce::Justification::centred);
 }
 
 // =============================================================================
 // Layout
 // =============================================================================
 
+void BenchmarkEditor::updateToggleButtonText()
+{
+    btnToggleRenderer.setButtonText(isVulkanEnabled() ? "Vulkan" : "JUCE");
+    auto col = isVulkanEnabled() ? juce::Colour(0xFF2A9D8F) : juce::Colour(0xFFE07A5F);
+    btnToggleRenderer.setColour(juce::TextButton::buttonColourId, col);
+}
+
+void BenchmarkEditor::setBenchButtonsVisible(bool visible)
+{
+    for (auto* btn : { &btnAll, &btnFills, &btnText, &btnPaths,
+                       &btnImages, &btnGradients, &btnEffects, &btnBlur,
+                       &btnTextStatic })
+        btn->setVisible(visible);
+}
+
 void BenchmarkEditor::resized()
 {
     pathsGenerated = false;
     spritesInitialized = false;
+
+    // Renderer toggle button — top right
+    btnToggleRenderer.setBounds(getWidth() - 90, 5, 80, 28);
 
     // Benchmark buttons centered in three rows
     int btnW = 120, btnH = 40, gap = 10;

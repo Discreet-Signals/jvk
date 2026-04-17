@@ -40,7 +40,8 @@ public:
     void execute(Renderer& r, const Arena& arena, const DrawCommand& cmd) override
     {
         auto& state = r.state();
-        state.setResource(r.caches().defaultDescriptor());
+        auto def = r.caches().defaultDescriptor();
+        state.setResources(def, def);
         auto& p = arena.read<EffectBlendParams>(cmd.dataOffset);
         float x = p.region.getX() * p.scale;
         float y = p.region.getY() * p.scale;

@@ -39,14 +39,17 @@ void Pipeline::build(VkRenderPass renderPass, VkSampleCountFlagBits msaa)
     if (built_) return;
     VkDevice d = device_.device();
 
-    // Create pipeline layout using the default image sampler layout
-    VkDescriptorSetLayout setLayout = device_.bindings().getLayout(Memory::M::IMAGE_SAMPLER);
+    // Two descriptor sets, both IMAGE_SAMPLER layout:
+    //   set 0 = color source (solid default or gradient LUT)
+    //   set 1 = shape source (1x1 default, MSDF atlas page, image texture)
+    VkDescriptorSetLayout imageSampler = device_.bindings().getLayout(Memory::M::IMAGE_SAMPLER);
+    VkDescriptorSetLayout setLayouts[2] = { imageSampler, imageSampler };
     auto cfg = config();
 
     VkPipelineLayoutCreateInfo pli {};
     pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pli.setLayoutCount = 1;
-    pli.pSetLayouts = &setLayout;
+    pli.setLayoutCount = 2;
+    pli.pSetLayouts = setLayouts;
     pli.pushConstantRangeCount = static_cast<uint32_t>(cfg.pushConstantRanges.size());
     pli.pPushConstantRanges = cfg.pushConstantRanges.empty() ? nullptr : cfg.pushConstantRanges.data();
 
@@ -96,17 +99,18 @@ VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass render
     binding.stride = sizeof(UIVertex);
     binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-    VkVertexInputAttributeDescription attrs[4] {};
+    VkVertexInputAttributeDescription attrs[5] {};
     attrs[0] = { 0, 0, VK_FORMAT_R32G32_SFLOAT,       offsetof(UIVertex, position) };
     attrs[1] = { 1, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, color) };
     attrs[2] = { 2, 0, VK_FORMAT_R32G32_SFLOAT,        offsetof(UIVertex, uv) };
     attrs[3] = { 3, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, shapeInfo) };
+    attrs[4] = { 4, 0, VK_FORMAT_R32G32B32A32_SFLOAT,  offsetof(UIVertex, gradientInfo) };
 
     VkPipelineVertexInputStateCreateInfo vertexInput {};
     vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
     vertexInput.vertexBindingDescriptionCount = 1;
     vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = 4;
+    vertexInput.vertexAttributeDescriptionCount = 5;
     vertexInput.pVertexAttributeDescriptions = attrs;
 
     VkPipelineInputAssemblyStateCreateInfo inputAsm {};
@@ -210,11 +214,14 @@ VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass render
     colorBlend.pAttachments = &blend;
 
     VkDynamicState dynamicStates[] = {
-        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_REFERENCE
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+        VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK
     };
     VkPipelineDynamicStateCreateInfo dynamicState {};
     dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamicState.dynamicStateCount = 3;
+    dynamicState.dynamicStateCount = 5;
     dynamicState.pDynamicStates = dynamicStates;
 
     VkGraphicsPipelineCreateInfo pci {};

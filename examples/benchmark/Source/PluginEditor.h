@@ -65,6 +65,10 @@ private:
     juce::TextButton btnAll, btnFills, btnText, btnPaths;
     juce::TextButton btnImages, btnGradients, btnEffects, btnBlur;
     juce::TextButton btnTextStatic;
+    juce::TextButton btnToggleRenderer;
+
+    void setBenchButtonsVisible(bool visible);
+    void updateToggleButtonText();
 
     // Pregenerated complex paths (built once at startup)
     std::vector<juce::Path> waveformPaths;

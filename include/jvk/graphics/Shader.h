@@ -76,10 +76,10 @@ public:
         }
 
         // Create pipeline (fullscreen triangle, fragment-only shader)
-        // Uses the fullscreen vertex shader
+        // Uses the shader_region vertex shader (generates fullscreen tri from gl_VertexIndex)
         std::vector<uint32_t> fullscreenVert(
-            shaders::ui2d::fullscreen_vert_spv,
-            shaders::ui2d::fullscreen_vert_spv + shaders::ui2d::fullscreen_vert_spvSize / 4);
+            reinterpret_cast<const uint32_t*>(shaders::shader_region::vert_spv),
+            reinterpret_cast<const uint32_t*>(shaders::shader_region::vert_spv) + shaders::shader_region::vert_spvSize / 4);
 
         VkShaderModuleCreateInfo vci {};
         vci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;

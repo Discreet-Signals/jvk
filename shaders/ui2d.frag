@@ -1,10 +1,15 @@
 #version 450
 
-layout(binding = 0) uniform sampler2D texSampler;
+// Two descriptor sets, both combined image samplers:
+//   set 0 = color LUT   (1x1 default for solid, or 256x1 gradient LUT)
+//   set 1 = shape tex   (1x1 default, or MSDF atlas page, or image)
+layout(set = 0, binding = 0) uniform sampler2D colorLUT;
+layout(set = 1, binding = 0) uniform sampler2D shapeTex;
 
 layout(location = 0) in vec4 fragColor;
 layout(location = 1) in vec2 fragUV;
 layout(location = 2) in vec4 fragShapeInfo;
+layout(location = 3) in vec4 fragGradientInfo;
 
 layout(location = 0) out vec4 outColor;
 
@@ -19,77 +24,114 @@ float median(float r, float g, float b) {
     return max(min(r, g), min(max(r, g), b));
 }
 
-void main() {
+// ---- Color source --------------------------------------------------------
+// mode 0: solid  — color from vertex attribute (fragColor)
+// mode 1: linear — sample colorLUT row at gradientInfo.x
+// mode 2: radial — sample colorLUT row at length(gradientInfo.xy)
+// gradientInfo.w is the pre-normalised y of the gradient's row in the atlas
+// (row-center, safe under linear filtering). Each row is one 256-sample LUT
+// rasterized from juce::ColourGradient::getColourAtPosition, so N-stop
+// gradients work natively. Opacity always comes from fragColor.a.
+vec4 sampleColor() {
+    int mode = int(fragGradientInfo.z + 0.5);
+    if (mode == 0)
+        return fragColor;
+
+    float t = (mode == 2) ? length(fragGradientInfo.xy) : fragGradientInfo.x;
+    t = clamp(t, 0.0, 1.0);
+    vec4 col = texture(colorLUT, vec2(t, fragGradientInfo.w));
+    return vec4(col.rgb, col.a * fragColor.a);
+}
+
+// ---- Shape source --------------------------------------------------------
+// Returns an RGBA mask multiplied against sampled color. RGB is usually (1,1,1)
+// except for images, which supply their own color; the "fill color" then acts
+// as a tint.
+// Types:
+//   0 = flat quad            (full coverage)
+//   1 = rounded rect SDF     (shapeInfo.yz = halfSize, .w = cornerRadius)
+//   2 = ellipse SDF          (shapeInfo.yz = halfSize)
+//   3 = sampled image        (shapeTex = image)
+//   4 = MSDF text            (shapeTex = atlas page, shapeInfo.y = screenPxRange)
+vec4 sampleShape() {
     int type = int(fragShapeInfo.x + 0.5);
 
-    // Type 0: Flat color (vertex-interpolated, solid fills)
-    if (type == 0) {
-        outColor = fragColor;
-        return;
-    }
+    if (type == 0)
+        return vec4(1.0);
 
-    // Type 3: Textured quad (drawImage — sample texture, multiply by vertex color)
-    if (type == 3) {
-        vec4 texColor = texture(texSampler, fragUV);
-        outColor = texColor * fragColor;
-        return;
-    }
+    if (type == 3)
+        return texture(shapeTex, fragUV);
 
-    // Type 4: MSDF text — multi-channel signed distance field
     if (type == 4) {
-        vec3 msd = texture(texSampler, fragUV).rgb;
-
-        // DEBUG: if shapeInfo.z > 0.5, output raw MSDF RGB for visual inspection
-        if (fragShapeInfo.z > 0.5) {
-            outColor = vec4(msd, 1.0);
-            return;
-        }
-
+        vec3 msd = texture(shapeTex, fragUV).rgb;
         float sd = median(msd.r, msd.g, msd.b);
         float screenPxRange = fragShapeInfo.y;
-        // JUCE's Y-flip reverses winding, so inside/outside sign is inverted.
-        // Use (0.5 - sd) to compensate.
-        float screenPxDist = screenPxRange * (0.5 - sd);
+        float screenPxDist = screenPxRange * (sd - 0.5);
         float alpha = clamp(screenPxDist + 0.5, 0.0, 1.0);
-
         // Gamma-correct text alpha to match sRGB-blended text weight.
-        // Linear blending thins AA pixels; this boosts midtones so text pops.
         alpha = pow(alpha, 0.4545);
-
-        outColor = vec4(fragColor.rgb, fragColor.a * alpha);
-        return;
+        return vec4(1.0, 1.0, 1.0, alpha);
     }
 
-    // Type 5: Linear gradient — texSampler is a 1D gradient LUT
-    if (type == 5) {
-        float t = clamp(fragUV.x, 0.0, 1.0);
-        vec4 gradColor = texture(texSampler, vec2(t, 0.5));
-        outColor = vec4(gradColor.rgb, gradColor.a * fragColor.a);
-        return;
+    // Stroked rounded rect (type 8), stroked ellipse (type 9):
+    //   shapeInfo.yz = halfSize (of the filled shape)
+    //   shapeInfo.w  = packHalf2(cornerSize, strokeWidth)  [type 8]
+    //   shapeInfo.w  = packHalf2(0,          strokeWidth)  [type 9]
+    // Standard stroke trick: abs(filledSDF) - strokeWidth/2 gives an annular band.
+    if (type == 8 || type == 9) {
+        vec2 halfSize = fragShapeInfo.yz;
+        vec2 packed = unpackHalf2x16(floatBitsToUint(fragShapeInfo.w));
+        float cornerSize = packed.x;
+        float strokeW    = packed.y;
+        vec2 p = (fragUV - 0.5) * halfSize * 2.0;
+
+        float filled;
+        if (type == 8) {
+            filled = roundedRectSDF(p, halfSize, cornerSize);
+        } else {
+            float k = length(p / max(halfSize, vec2(0.001)));
+            filled = (k - 1.0) * min(halfSize.x, halfSize.y);
+        }
+        float dist = abs(filled) - strokeW * 0.5;
+        float aa = fwidth(dist);
+        float alpha = 1.0 - smoothstep(-aa, aa, dist);
+        return vec4(1.0, 1.0, 1.0, alpha);
     }
 
-    // Type 6: Radial gradient — texSampler is a 1D gradient LUT
-    if (type == 6) {
-        float t = clamp(length(fragUV), 0.0, 1.0);
-        vec4 gradColor = texture(texSampler, vec2(t, 0.5));
-        outColor = vec4(gradColor.rgb, gradColor.a * fragColor.a);
-        return;
+    // Capsule line (type 10) — quad is oriented along the line direction on CPU.
+    // Local frame: +x along the segment, +y perpendicular. shapeInfo.yz holds
+    // the unpadded (halfLen, radius); fragUV is offset to map 0..1 across the
+    // padded quad so localP reaches slightly beyond (halfLen, radius) for AA.
+    if (type == 10) {
+        vec2 halfSize = fragShapeInfo.yz; // (halfLen, radius)
+        vec2 p = (fragUV - 0.5) * halfSize * 2.0;
+        vec2 q = vec2(max(abs(p.x) - halfSize.x, 0.0), p.y);
+        float dist = length(q) - halfSize.y;
+        float aa = fwidth(dist);
+        float alpha = 1.0 - smoothstep(-aa, aa, dist);
+        return vec4(1.0, 1.0, 1.0, alpha);
     }
 
-    // Types 1,2: Analytical SDF shapes (rounded rect, ellipse)
+    // Analytical SDF shapes (rounded rect, ellipse)
     vec2 halfSize = fragShapeInfo.yz;
     float param = fragShapeInfo.w;
     vec2 p = (fragUV - 0.5) * halfSize * 2.0;
 
-    float dist = 0.0;
+    float dist;
     if (type == 1) {
         dist = roundedRectSDF(p, halfSize, param);
-    } else if (type == 2) {
+    } else {
         float k = length(p / max(halfSize, vec2(0.001)));
         dist = (k - 1.0) * min(halfSize.x, halfSize.y);
     }
 
     float aa = fwidth(dist);
     float alpha = 1.0 - smoothstep(-aa, aa, dist);
-    outColor = vec4(fragColor.rgb, fragColor.a * alpha);
+    return vec4(1.0, 1.0, 1.0, alpha);
+}
+
+void main() {
+    vec4 color = sampleColor();
+    vec4 shape = sampleShape();
+    outColor = color * shape;
 }

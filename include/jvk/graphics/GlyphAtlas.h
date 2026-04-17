@@ -202,6 +202,10 @@ private:
         // The Y-flip reverses winding, which inverts inside/outside sign —
         // we compensate in the fragment shader with (0.5 - sd) instead of (sd - 0.5).
         shape.normalize();
+        // orientContours() resolves winding ambiguity so msdfgen correctly
+        // identifies inside vs outside for all contours. Without this,
+        // characters with single open-ish contours (like ')') can invert.
+        shape.orientContours();
         msdfgen::edgeColoringSimple(shape, 3.0);
 
         // Compute MSDF dimensions — scale glyph to fit in MSDF_GLYPH_SIZE texels
@@ -314,9 +318,10 @@ private:
         if (!device) return nullptr;
 
         AtlasPage page;
-        // Initialize to white (sd=1.0 per channel = "far outside glyph") so that
-        // linear filtering near quad edges doesn't bleed opaque border artifacts.
-        page.pixels.resize(static_cast<size_t>(ATLAS_SIZE * ATLAS_SIZE), 0xFFFFFFFF);
+        // Initialize to black (sd=0.0 per channel = "far outside glyph") so that
+        // linear filtering near quad edges smoothly transitions to transparent.
+        // Alpha=0xFF is unused by MSDF but keeps the texture valid.
+        page.pixels.resize(static_cast<size_t>(ATLAS_SIZE * ATLAS_SIZE), 0xFF000000);
 
         page.texture = Image(device->pool(), device->device(),
             static_cast<uint32_t>(ATLAS_SIZE), static_cast<uint32_t>(ATLAS_SIZE),

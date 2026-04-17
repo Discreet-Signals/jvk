@@ -20,7 +20,7 @@ public:
         cfg.cullMode = VK_CULL_MODE_NONE;
         cfg.stencilTestEnable = true;
         cfg.stencilCompareOp = VK_COMPARE_OP_ALWAYS;
-        cfg.stencilPassOp = VK_STENCIL_OP_INCREMENT_AND_WRAP;
+        cfg.stencilPassOp = VK_STENCIL_OP_INVERT;
         cfg.stencilFailOp = VK_STENCIL_OP_KEEP;
         cfg.stencilWriteMask = 0xFF;
         cfg.pushConstantRanges = {{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float) * 2 }};
@@ -37,9 +37,17 @@ public:
     {
         auto& state = r.state();
         auto& p = arena.read<PushClipPathParams>(cmd.dataOffset);
-        uint32_t after = cmd.dataOffset + static_cast<uint32_t>(sizeof(PushClipPathParams));
-        auto verts = arena.readSpan<UIVertex>(after, p.vertexCount);
-        state.draw(cmd, verts.data(), p.vertexCount);
+        if (p.vertexCount > 0) {
+            // Set write mask to this level's bit (depth is N before push, write bit N)
+            state.setStencilWriteMask(1u << state.stencilDepth());
+            uint32_t after = cmd.dataOffset + static_cast<uint32_t>(sizeof(PushClipPathParams));
+            auto verts = arena.readSpan<UIVertex>(after, p.vertexCount);
+            // Stencil-only writes don't read textures, but the pipeline layout
+            // still has two sets — bind the default to both.
+            auto def = r.caches().defaultDescriptor();
+            state.setResources(def, def);
+            state.draw(cmd, verts.data(), p.vertexCount);
+        }
         state.pushClipPath(juce::Path(), juce::AffineTransform());
     }
 };
@@ -63,7 +71,7 @@ public:
         cfg.cullMode = VK_CULL_MODE_NONE;
         cfg.stencilTestEnable = true;
         cfg.stencilCompareOp = VK_COMPARE_OP_ALWAYS;
-        cfg.stencilPassOp = VK_STENCIL_OP_DECREMENT_AND_WRAP;
+        cfg.stencilPassOp = VK_STENCIL_OP_INVERT;
         cfg.stencilFailOp = VK_STENCIL_OP_KEEP;
         cfg.stencilWriteMask = 0xFF;
         cfg.pushConstantRanges = {{ VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(float) * 2 }};
@@ -78,7 +86,20 @@ public:
 
     void execute(Renderer& r, const Arena& arena, const DrawCommand& cmd) override
     {
-        r.state().popClip();
+        auto& state = r.state();
+        auto& p = arena.read<PopClipParams>(cmd.dataOffset);
+        if (p.vertexCount > 0) {
+            // Set write mask to the level being popped (depth is N, clean bit N-1)
+            uint8_t depth = state.stencilDepth();
+            if (depth > 0)
+                state.setStencilWriteMask(1u << (depth - 1));
+            uint32_t after = cmd.dataOffset + static_cast<uint32_t>(sizeof(PopClipParams));
+            auto verts = arena.readSpan<UIVertex>(after, p.vertexCount);
+            auto def = r.caches().defaultDescriptor();
+            state.setResources(def, def);
+            state.draw(cmd, verts.data(), p.vertexCount);
+        }
+        state.popClip();
     }
 };
 

@@ -32,6 +32,25 @@ struct FillEllipseParams {
     float                  scale;
 };
 
+struct StrokeRoundedRectParams {
+    juce::Rectangle<float> rect;
+    float                  cornerSize;
+    float                  lineWidth;
+    uint32_t               fillIndex;
+    juce::AffineTransform  transform;
+    float                  opacity;
+    float                  scale;
+};
+
+struct StrokeEllipseParams {
+    juce::Rectangle<float> area;
+    float                  lineWidth;
+    uint32_t               fillIndex;
+    juce::AffineTransform  transform;
+    float                  opacity;
+    float                  scale;
+};
+
 struct DrawImageParams {
     uint64_t               imageHash;
     juce::AffineTransform  transform;
@@ -76,7 +95,11 @@ struct PushClipPathParams {
     // followed in arena by: UIVertex[vertexCount] (triangulated path)
 };
 
-struct PopClipParams {};
+struct PopClipParams {
+    uint32_t             vertexCount = 0;  // 0 for rect clips
+    juce::Rectangle<int> fanBounds;
+    // followed in arena by: UIVertex[vertexCount] (reversed fan for stencil decrement)
+};
 
 struct EffectBlendParams {
     float r, g, b;

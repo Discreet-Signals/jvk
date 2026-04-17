@@ -3,6 +3,110 @@
 namespace jvk {
 
 // =============================================================================
+// GradientAtlas — one image, N rows of 256-sample color LUTs
+//
+// Replaces per-gradient VkImage+descriptor-set allocation. All gradients in a
+// frame share this one image and one descriptor set; each occupies one row.
+// The row index is packed into the vertex `gradientInfo.w` and the shader
+// samples the atlas at (t, rowNorm).
+//
+// Lifecycle per frame:
+//   - beginFrame(): cursor = 0, hash→row map cleared.
+//   - getRow(g): looks up the gradient by hash; on miss, rasterizes a new row
+//     into the CPU mirror and returns cursor++. O(1) per call.
+//   - stageUploads(): bulk-copies rows [0, cursor) from CPU mirror to L2
+//     staging and queues one GPU copy. Called once before the render pass.
+//
+// Designed for the degenerate case of thousands of unique, time-varying
+// gradients per frame — no descriptor churn, one upload per frame.
+// =============================================================================
+
+class GradientAtlas {
+public:
+    static constexpr uint32_t WIDTH  = 256;   // colour stops per gradient
+    static constexpr uint32_t HEIGHT = 4096;  // max unique gradients per frame
+
+    void init(Device& device)
+    {
+        if (device_) return;
+        device_ = &device;
+        image_ = Image(device.pool(), device.device(), WIDTH, HEIGHT,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+
+        descriptorSet_ = device.bindings().alloc();
+        Memory::M::writeImage(device.device(), descriptorSet_, 0,
+            image_.view(), image_.sampler());
+
+        cpuBuffer_.resize(static_cast<size_t>(WIDTH) * HEIGHT * 4);
+        hashToRow_.reserve(HEIGHT);
+    }
+
+    ~GradientAtlas()
+    {
+        if (device_ && descriptorSet_ != VK_NULL_HANDLE)
+            device_->bindings().free(descriptorSet_);
+    }
+
+    void beginFrame()
+    {
+        cursor_ = 0;
+        hashToRow_.clear();
+    }
+
+    // Returns normalized row y-coord (row center) for this gradient.
+    // Sampling the atlas at (t, rowNorm) yields the gradient's colour at t.
+    // On overflow (>= HEIGHT), the last row is reused — visible artifacts are
+    // preferable to silent black fills.
+    float getRow(const juce::ColourGradient& g, uint64_t hash)
+    {
+        auto it = hashToRow_.find(hash);
+        uint32_t row;
+        if (it != hashToRow_.end()) {
+            row = it->second;
+        } else {
+            row = (cursor_ < HEIGHT) ? cursor_++ : (HEIGHT - 1);
+            hashToRow_.emplace(hash, row);
+            rasterizeRow(g, row);
+        }
+        return (static_cast<float>(row) + 0.5f) / static_cast<float>(HEIGHT);
+    }
+
+    void stageUploads()
+    {
+        if (cursor_ == 0 || !device_) return;
+        VkDeviceSize byteSize = static_cast<VkDeviceSize>(WIDTH) * cursor_ * 4;
+        auto staging = device_->staging().alloc(byteSize);
+        memcpy(staging.mappedPtr, cpuBuffer_.data(), static_cast<size_t>(byteSize));
+        device_->upload(staging, image_.image(), WIDTH, cursor_);
+    }
+
+    VkDescriptorSet descriptorSet() const { return descriptorSet_; }
+    uint32_t        activeRows()    const { return cursor_; }
+
+private:
+    void rasterizeRow(const juce::ColourGradient& g, uint32_t row)
+    {
+        uint8_t* dst = cpuBuffer_.data() + static_cast<size_t>(row) * WIDTH * 4;
+        for (uint32_t i = 0; i < WIDTH; i++) {
+            double t = static_cast<double>(i) / static_cast<double>(WIDTH - 1);
+            auto c = g.getColourAtPosition(t);
+            dst[i * 4 + 0] = c.getRed();
+            dst[i * 4 + 1] = c.getGreen();
+            dst[i * 4 + 2] = c.getBlue();
+            dst[i * 4 + 3] = c.getAlpha();
+        }
+    }
+
+    Device*         device_        = nullptr;
+    Image           image_;
+    VkDescriptorSet descriptorSet_ = VK_NULL_HANDLE;
+    std::vector<uint8_t>              cpuBuffer_;
+    std::unordered_map<uint64_t, uint32_t> hashToRow_;
+    uint32_t        cursor_ = 0;
+};
+
+// =============================================================================
 // Generic frame-based LRU cache
 // =============================================================================
 
@@ -105,16 +209,16 @@ class ResourceCaches {
 public:
     explicit ResourceCaches(Device& dev)
         : device_(dev),
-          gradients_(120),
           textures_(120)
     {
         createBlackPixel();
+        gradientAtlas_.init(dev);
     }
 
     ~ResourceCaches() = default;
 
-    Cache<uint64_t, CachedImage>& gradients() { return gradients_; }
-    Cache<uint64_t, CachedImage>& textures()  { return textures_; }
+    GradientAtlas&                gradientAtlas() { return gradientAtlas_; }
+    Cache<uint64_t, CachedImage>& textures()       { return textures_; }
 
     VkDescriptorSet getTexture(uint64_t hash, const juce::Image& img)
     {
@@ -134,16 +238,14 @@ public:
         Memory::M::writeImage(device_.device(), ci.descriptorSet, 0,
             ci.image.view(), ci.image.sampler());
 
-        // Stage pixel upload (JUCE → RGBA)
+        // Stage pixel upload (JUCE → RGBA8)
         VkDeviceSize byteSize = static_cast<VkDeviceSize>(w) * h * 4;
         auto staging = device_.staging().alloc(byteSize);
         auto* dst = static_cast<uint8_t*>(staging.mappedPtr);
         juce::Image::BitmapData bmp(img, juce::Image::BitmapData::readOnly);
         for (uint32_t y = 0; y < h; y++) {
-            auto* src = bmp.getLinePointer(static_cast<int>(y));
             for (uint32_t x = 0; x < w; x++) {
-                auto c = juce::Colour(static_cast<uint32_t>(
-                    *reinterpret_cast<const uint32_t*>(src + x * static_cast<uint32_t>(bmp.pixelStride))));
+                auto c = bmp.getPixelColour(static_cast<int>(x), static_cast<int>(y));
                 auto idx = (y * w + x) * 4;
                 dst[idx + 0] = c.getRed();
                 dst[idx + 1] = c.getGreen();
@@ -157,20 +259,46 @@ public:
         return inserted.descriptorSet;
     }
 
+    static uint64_t hashGradient(const juce::ColourGradient& g)
+    {
+        uint64_t h = g.isRadial ? 1ULL : 0ULL;
+        h ^= static_cast<uint64_t>(g.getNumColours()) * 0x9e3779b97f4a7c15ULL;
+        for (int i = 0; i < g.getNumColours(); i++) {
+            auto c = g.getColour(i).getARGB();
+            h ^= (static_cast<uint64_t>(c) + 0x517cc1b727220a95ULL) + (h << 6) + (h >> 2);
+            double pos = g.getColourPosition(i);
+            uint64_t posBytes;
+            memcpy(&posBytes, &pos, sizeof(posBytes));
+            h ^= posBytes * 0x6c62272e07bb0142ULL;
+        }
+        return h;
+    }
+
+    // Stage a gradient for rendering this frame. Returns the normalized row
+    // y-coord (pass via vertex gradientInfo.w). All gradients share the atlas
+    // descriptor set (ResourceCaches::gradientDescriptor()), so there is no
+    // per-gradient descriptor switch during draws.
+    float registerGradient(const juce::ColourGradient& g)
+    {
+        return gradientAtlas_.getRow(g, hashGradient(g));
+    }
+
+    VkDescriptorSet gradientDescriptor() const { return gradientAtlas_.descriptorSet(); }
+
     VkDescriptorSet defaultDescriptor() const { return blackPixel_.descriptorSet; }
 
     void beginFrame(uint64_t frameId)
     {
         currentFrame_ = frameId;
-        gradients_.evict(frameId);
         textures_.evict(frameId);
+        gradientAtlas_.beginFrame();
     }
 
     Device& device() { return device_; }
 
 private:
     Device& device_;
-    Cache<uint64_t, CachedImage> gradients_;
+    GradientAtlas                gradientAtlas_;
     Cache<uint64_t, CachedImage> textures_;
     CachedImage                  blackPixel_;
     uint64_t currentFrame_ = 0;

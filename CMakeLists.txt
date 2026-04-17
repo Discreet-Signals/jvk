@@ -87,6 +87,53 @@ find_package(Vulkan REQUIRED)
 target_link_libraries(jvk INTERFACE Vulkan::Vulkan)
 
 # ==============================================================================
+# Shader compilation — auto-regenerate UI2DShaders.h whenever any .vert/.frag
+# changes. The custom command is wired into jvk's interface sources so every
+# consumer implicitly depends on the header being up-to-date before their
+# compile of jvk.mm / jvk.cpp (which #include UI2DShaders.h). No manual
+# `cd shaders && ./compile.sh` required.
+# ==============================================================================
+
+set(JVK_SHADER_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ui2d.vert"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ui2d.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/stencil.vert"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/stencil.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hsv.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader_region.vert"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/compile.sh"
+)
+
+set(JVK_SHADER_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/include/jvk/graphics/UI2DShaders.h")
+
+# Pass the CMake-discovered glslc to compile.sh so it doesn't depend on PATH
+if (Vulkan_GLSLC_EXECUTABLE)
+    set(_JVK_GLSLC_ENV "GLSLC=${Vulkan_GLSLC_EXECUTABLE}")
+else()
+    set(_JVK_GLSLC_ENV)
+endif()
+
+add_custom_command(
+    OUTPUT  "${JVK_SHADER_HEADER}"
+    COMMAND ${CMAKE_COMMAND} -E env ${_JVK_GLSLC_ENV}
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/shaders/compile.sh"
+    DEPENDS ${JVK_SHADER_SOURCES}
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+    COMMENT "jvk: Compiling shaders → UI2DShaders.h"
+    VERBATIM
+)
+
+# Custom target so the generated file gets built even on clean first builds,
+# and an explicit `cmake --build build --target jvk_shaders` target exists.
+add_custom_target(jvk_shaders DEPENDS "${JVK_SHADER_HEADER}")
+
+# Attach the generated header as an interface source of jvk. Any consumer
+# that compiles jvk.mm / jvk.cpp (which #include UI2DShaders.h) inherits this
+# as a build-graph dependency, so CMake runs the custom command first.
+target_sources(jvk INTERFACE "${JVK_SHADER_HEADER}")
+
+# ==============================================================================
 # Platform configuration
 # ==============================================================================
 

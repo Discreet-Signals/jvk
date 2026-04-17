@@ -59,6 +59,7 @@
 
 // Shaders (embedded SPIR-V)
 #include "include/jvk/graphics/UI2DShaders.h"
+#include "include/jvk/graphics/ShaderRegionVert.h"
 
 // SPIRV-Reflect (for Shader.h)
 #include "include/jvk/reflect/spirv_reflect.h"
