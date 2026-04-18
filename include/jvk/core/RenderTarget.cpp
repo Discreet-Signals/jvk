@@ -149,16 +149,26 @@ void SwapchainTarget::createRenderPasses()
     // Two-sided dep: incoming (prior effect's sampler read completes before
     // we write color) + outgoing (our color write visible to the next effect's
     // sampler read).
+    //
+    // dstAccess MUST include both READ and WRITE for the colour and
+    // depth/stencil attachments. LOAD_OP_LOAD reads the attachment at RP
+    // begin — without the READ bit, MoltenVK's tile renderer can execute
+    // that load before the previous effect-pass writes are fully visible,
+    // producing tile-shaped corruption (stale pixels mixed into newly-
+    // written ones).
     VkSubpassDependency deps[2] {};
     deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
     deps[0].dstSubpass    = 0;
     deps[0].srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
                           | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
     deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-                          | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+                          | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                          | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
     deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT
                           | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                          | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                          | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
                           | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
     deps[1].srcSubpass    = 0;
     deps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
