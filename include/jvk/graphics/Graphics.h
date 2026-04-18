@@ -156,7 +156,6 @@ public:
         uint32_t segStart = pp->uploadSegments(
             scratchSegments_.data(),
             static_cast<uint32_t>(scratchSegments_.size()));
-        if (segStart == UINT32_MAX) return; // ring full — drop this clip
 
         // Cover rect in physical pixels, expanded by 1 pixel so the clip
         // fragment shader runs for every pixel the path's SDF could mark
@@ -302,7 +301,6 @@ public:
         uint32_t segStart = pp->uploadSegments(
             scratchSegments_.data(),
             static_cast<uint32_t>(scratchSegments_.size()));
-        if (segStart == UINT32_MAX) return; // ring full — drop this path
 
         // Path bounds in physical pixels, expanded by 1 pixel for the AA
         // ramp that smoothstep() kernels around the SDF zero-crossing.

@@ -35,6 +35,10 @@ void Renderer::execute()
         }
     }
     device_.caches().gradientAtlas().stageUploads();
+    // Flush record-phase path/clip segments into the shared SSBO. Safe
+    // now because target_.beginFrame() above waited on the frame fence,
+    // so the GPU is done reading last frame's copy of this buffer.
+    if (pathPipeline_) pathPipeline_->flushToGPU();
     device_.flushUploads(frame.cmd);
 
     auto const& sb = target_.sceneBuffers(frame.frameSlot);

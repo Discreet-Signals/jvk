@@ -40,11 +40,11 @@ namespace jvk {
 
 class PathPipeline {
 public:
-    // Storage-buffer ring capacity — total bytes. Each line segment is
-    // 16 bytes (vec4: p0.xy, p1.xy). 256 KB = 16,384 segments per frame.
-    // Plenty for realistic plugin UI where each fillPath typically
-    // flattens to at most a few hundred segments.
-    static constexpr VkDeviceSize SEGMENT_BUFFER_BYTES = 256 * 1024;
+    // Initial storage-buffer capacity in bytes — the SSBO is grown
+    // automatically in flushToGPU() when a frame's segments exceed the
+    // current allocation, doubling each time. Each line segment is 16
+    // bytes (vec4: p0.xy, p1.xy), so 256 KB starts us at 16,384 segments.
+    static constexpr VkDeviceSize INITIAL_BUFFER_BYTES = 256 * 1024;
     static constexpr uint32_t     SEGMENT_STRIDE       = 16; // sizeof(vec4)
 
     PathPipeline() = default;
@@ -125,24 +125,47 @@ public:
 
     bool ready() const { return device_ != nullptr && pipeline_ != VK_NULL_HANDLE; }
 
-    // Called once per frame before any fillPath uploads — resets the ring
-    // cursor so the next frame overwrites old segment data. Simple single-
-    // slot ring for v1; can grow to per-frame slots if MoltenVK/SyncHazard
-    // complains about overwriting in-flight data.
-    void beginFrame() { cursor_ = 0; }
+    // Called once per frame BEFORE record phase — clears the CPU-side
+    // segment staging buffer. Record-time `uploadSegments` appends here,
+    // then `flushToGPU` (called inside Renderer::execute after the frame
+    // fence wait) memcpys the whole staging buffer into the mapped SSBO.
+    //
+    // Why the CPU side: record phase runs in the JUCE paint tree before
+    // the frame fence is waited on. Writing directly into a single
+    // persistent-mapped SSBO during record would race with the previous
+    // frame's GPU reads (MoltenVK on Apple Silicon shows it as horizontal
+    // streaks of stale segments bleeding into new paths). Staging on the
+    // CPU and flushing once after the fence wait eliminates the hazard
+    // without needing per-frame-slot SSBOs.
+    void beginFrame() { cpuSegments_.clear(); }
 
-    // Append `count` segments (each 16 bytes: vec4 of p0.xy, p1.xy) to the
-    // ring buffer and return the starting segment index. Caller is
-    // Graphics::fillPath which has flattened the path CPU-side. Returns
-    // UINT32_MAX if the ring is full and we can't fit the request.
+    // Append `count` segments (16 bytes each: vec4 p0.xy,p1.xy) to the
+    // CPU staging buffer. Returns the starting segment index into the
+    // SSBO — stable, since the CPU buffer is copied verbatim into the
+    // SSBO at flushToGPU time. The CPU buffer grows unbounded; the GPU
+    // SSBO is resized to fit during flushToGPU.
     uint32_t uploadSegments(const void* segmentData, uint32_t segmentCount)
     {
-        VkDeviceSize bytes = static_cast<VkDeviceSize>(segmentCount) * SEGMENT_STRIDE;
-        if (cursor_ + bytes > SEGMENT_BUFFER_BYTES) return UINT32_MAX;
-        uint32_t firstSegment = static_cast<uint32_t>(cursor_ / SEGMENT_STRIDE);
-        memcpy(static_cast<uint8_t*>(mappedPtr_) + cursor_, segmentData, bytes);
-        cursor_ += bytes;
+        size_t bytes = static_cast<size_t>(segmentCount) * SEGMENT_STRIDE;
+        uint32_t firstSegment = static_cast<uint32_t>(cpuSegments_.size() / SEGMENT_STRIDE);
+        auto* src = static_cast<const uint8_t*>(segmentData);
+        cpuSegments_.insert(cpuSegments_.end(), src, src + bytes);
         return firstSegment;
+    }
+
+    // Called at the top of Renderer::execute (after target_.beginFrame's
+    // fence wait) to push the CPU-staged segments into the mapped SSBO.
+    // If the CPU buffer outgrew the SSBO this frame, we resize the SSBO
+    // (destroy + recreate + rewire the descriptor) before the memcpy.
+    // Safe to destroy because the frame-fence wait above guarantees the
+    // GPU is done reading the previous copy of this buffer.
+    void flushToGPU()
+    {
+        if (cpuSegments_.empty()) return;
+        if (cpuSegments_.size() > static_cast<size_t>(bufferCapacity_))
+            growStorageBuffer(cpuSegments_.size());
+        if (mappedPtr_)
+            memcpy(mappedPtr_, cpuSegments_.data(), cpuSegments_.size());
     }
 
     // Dispatch a single FillPath draw inside the active scene render pass.
@@ -226,11 +249,37 @@ private:
 
     void createStorageBuffer()
     {
+        allocateBuffer(INITIAL_BUFFER_BYTES);
+        writeDescriptor();
+    }
+
+    // Recreate the SSBO at a capacity that fits `neededBytes` (doubling
+    // from the current capacity so we don't thrash). Safe because this is
+    // only ever called from flushToGPU, which runs after the frame fence
+    // wait — no GPU access to the old buffer can be in flight.
+    void growStorageBuffer(size_t neededBytes)
+    {
+        VkDeviceSize newCap = bufferCapacity_;
+        while (static_cast<size_t>(newCap) < neededBytes) newCap *= 2;
+
+        VkDevice d = device_->device();
+        if (mappedPtr_) { vkUnmapMemory(d, storageMemory_); mappedPtr_ = nullptr; }
+        if (storageBuffer_ != VK_NULL_HANDLE) vkDestroyBuffer(d, storageBuffer_, nullptr);
+        if (storageMemory_ != VK_NULL_HANDLE) vkFreeMemory(d, storageMemory_, nullptr);
+        storageBuffer_ = VK_NULL_HANDLE;
+        storageMemory_ = VK_NULL_HANDLE;
+
+        allocateBuffer(newCap);
+        writeDescriptor();
+    }
+
+    void allocateBuffer(VkDeviceSize capacityBytes)
+    {
         VkDevice d = device_->device();
 
         VkBufferCreateInfo bci {};
         bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bci.size = SEGMENT_BUFFER_BYTES;
+        bci.size = capacityBytes;
         bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         vkCreateBuffer(d, &bci, nullptr, &storageBuffer_);
@@ -249,9 +298,16 @@ private:
         vkAllocateMemory(d, &mi, nullptr, &storageMemory_);
         vkBindBufferMemory(d, storageBuffer_, storageMemory_, 0);
         vkMapMemory(d, storageMemory_, 0, VK_WHOLE_SIZE, 0, &mappedPtr_);
+        bufferCapacity_ = capacityBytes;
+    }
 
-        // Wire the buffer into the descriptor set once — the buffer handle
-        // is stable for this pipeline's lifetime.
+    void writeDescriptor()
+    {
+        VkDevice d = device_->device();
+
+        // (Re)wire the current storage buffer into the descriptor set.
+        // Called on initial allocation AND after each grow — descriptors
+        // targeting the old buffer become invalid when it's destroyed.
         VkDescriptorBufferInfo dbi {};
         dbi.buffer = storageBuffer_;
         dbi.offset = 0;
@@ -405,10 +461,11 @@ private:
     VkDescriptorSetLayout ssboSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool      descPool_      = VK_NULL_HANDLE;
     VkDescriptorSet       ssboDescSet_   = VK_NULL_HANDLE;
-    VkBuffer              storageBuffer_ = VK_NULL_HANDLE;
-    VkDeviceMemory        storageMemory_ = VK_NULL_HANDLE;
-    void*                 mappedPtr_     = nullptr;
-    VkDeviceSize          cursor_        = 0;
+    VkBuffer              storageBuffer_  = VK_NULL_HANDLE;
+    VkDeviceMemory        storageMemory_  = VK_NULL_HANDLE;
+    void*                 mappedPtr_      = nullptr;
+    VkDeviceSize          bufferCapacity_ = 0;   // current SSBO size in bytes
+    std::vector<uint8_t>  cpuSegments_;          // record-phase staging; flushed at execute start
 };
 
 } // namespace jvk
