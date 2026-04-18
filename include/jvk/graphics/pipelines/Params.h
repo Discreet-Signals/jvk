@@ -163,6 +163,17 @@ struct BlurParams {
     float                  scale;
 };
 
+// Full-screen HSV transform. `scale*` defaults to 1.0, `delta*` to 0.0 —
+// identity. Applied as `hsv *= (scale...); hsv += (delta...);` in hsv.frag.
+// Specialised callers like Graphics::saturate / shiftHue / brightness fill
+// in only the relevant fields; everything else stays at defaults.
+struct HSVParams {
+    float scaleH = 1.0f, scaleS = 1.0f, scaleV = 1.0f;
+    float deltaH = 0.0f, deltaS = 0.0f, deltaV = 0.0f;
+    juce::Rectangle<float> region;
+    float scale;
+};
+
 // Shape-aware variable-radius blur. Pre-packed in the layout the fragment
 // shader's push-constant block expects, minus viewport/direction which the
 // pipeline fills in per-pass. Distances are in LOGICAL pixels; the shader

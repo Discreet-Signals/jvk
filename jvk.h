@@ -73,6 +73,7 @@
 #include "include/jvk/graphics/pipelines/color/ColorDraw.h"
 #include "include/jvk/graphics/pipelines/blend/BlendPipeline.h"
 #include "include/jvk/graphics/pipelines/effect/EffectPipeline.h"
+#include "include/jvk/graphics/pipelines/effect/HSVPipeline.h"
 #include "include/jvk/graphics/pipelines/effect/ShapeBlurPipeline.h"
 #include "include/jvk/graphics/pipelines/path/PathPipeline.h"
 #include "include/jvk/graphics/pipelines/clip/ClipPipeline.h"

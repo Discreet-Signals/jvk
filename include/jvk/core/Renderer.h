@@ -5,6 +5,7 @@ namespace jvk {
 class Pipeline;
 class RenderTarget;
 class EffectPipeline;
+class HSVPipeline;
 class ShapeBlurPipeline;
 class ShaderPipeline;
 class PathPipeline;
@@ -35,6 +36,7 @@ enum class DrawOp : uint8_t {
     EffectBlend,
     EffectResolve,
     EffectKernel,
+    EffectHSV,          // full-screen HSV scale/delta (saturate, shiftHue, etc.)
     BlurShape,
     PushClipRect, PopClipRect,      // scissor-only clips (State-side stack)
     PushClipPath, PopClipPath,      // stencil INCR/DECR via ClipPipeline
@@ -207,6 +209,11 @@ public:
     // applies the 2-pass separable effect (e.g. Gaussian blur) before present.
     void setPostProcess(EffectPipeline* ep) { postProcess_ = ep; }
 
+    // Attach the HSV transform pipeline — required for EffectHSV ops
+    // (g.saturate / g.shiftHue / g.hsv). Ping-pongs through the scene
+    // intermediate and returns to `current`.
+    void setHSVPipeline(HSVPipeline* hp) { hsvPipeline_ = hp; }
+
     // Attach the shape-aware blur pipeline. Required for BlurShape draw ops
     // (g.blurEllipse / blurRect / blurRoundedRectangle / blurLine).
     void setShapeBlur(ShapeBlurPipeline* sb) { shapeBlur_ = sb; }
@@ -277,6 +284,7 @@ private:
 
     Pipeline* pipelineForOp_[static_cast<size_t>(DrawOp::COUNT)] = {};
     EffectPipeline*    postProcess_      = nullptr;
+    HSVPipeline*       hsvPipeline_      = nullptr;
     ShapeBlurPipeline* shapeBlur_        = nullptr;
     ShaderPipeline*    shaderPipeline_   = nullptr;
     PathPipeline*      pathPipeline_     = nullptr;

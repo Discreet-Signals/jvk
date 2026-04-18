@@ -214,6 +214,29 @@ void Renderer::execute()
             }
             continue;
         }
+        if (cmd.op == DrawOp::EffectHSV) {
+            // Full-screen HSV transform. Ping-pong through `other`:
+            //   pass 1 (A → B) applies the HSV transform
+            //   pass 2 (B → A) identity copy, so `current` stays A for
+            //                  any scene draws after this effect.
+            vkCmdEndRenderPass(frame.cmd);
+
+            if (hsvPipeline_) {
+                auto& hp = arena_.read<HSVParams>(cmd.dataOffset);
+                HSVPipeline::PushConstants pc {};
+                pc.scaleH = hp.scaleH; pc.scaleS = hp.scaleS; pc.scaleV = hp.scaleV;
+                pc.deltaH = hp.deltaH; pc.deltaS = hp.deltaS; pc.deltaV = hp.deltaV;
+                hsvPipeline_->applyPass(frame.cmd,
+                    currentSampler, otherEffectFB, target_.effectRenderPass(),
+                    frame.extent, pc);
+                hsvPipeline_->applyPass(frame.cmd,
+                    otherSampler, currentEffectFB, target_.effectRenderPass(),
+                    frame.extent, HSVPipeline::identity());
+            }
+
+            beginSceneRP(scenePassLoad, currentSceneFB, /*withClears=*/false);
+            continue;
+        }
         if (cmd.op == DrawOp::BlurShape) {
             vkCmdEndRenderPass(frame.cmd);
 

@@ -190,6 +190,17 @@ private:
             spv(blur_frag_spv, blur_frag_spvSize));
         renderer_->setPostProcess(blurEffect_.get());
 
+        // HSV transform pipeline — one shader, covers every HSV-space
+        // operation (saturate, shift hue, lift value, tint-like effects)
+        // via scale-then-delta per channel. Reuses blur's fullscreen-
+        // triangle vertex shader.
+        hsvPipeline_ = std::make_unique<HSVPipeline>();
+        hsvPipeline_->init(*device_,
+            target_->effectRenderPass(),
+            spv(blur_vert_spv, blur_vert_spvSize),
+            spv(hsv_frag_spv,  hsv_frag_spvSize));
+        renderer_->setHSVPipeline(hsvPipeline_.get());
+
         // Shape-aware blur — variable per-pixel radius driven by the shape's
         // SDF. Used by Graphics::blurRect / blurRoundedRectangle / blurEllipse
         // / blurLine. Reuses the fullscreen-triangle vertex shader from the
@@ -260,6 +271,7 @@ private:
     std::unique_ptr<pipelines::ColorPipeline>         colorPipeline_;
     std::unique_ptr<pipelines::BlendPipeline>         blendPipeline_;
     std::unique_ptr<EffectPipeline>                   blurEffect_;
+    std::unique_ptr<HSVPipeline>                      hsvPipeline_;
     std::unique_ptr<ShapeBlurPipeline>                shapeBlur_;
     std::unique_ptr<ShaderPipeline>                   shaderPipeline_;
     std::unique_ptr<PathPipeline>                     pathPipeline_;

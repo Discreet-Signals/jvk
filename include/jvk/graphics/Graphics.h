@@ -515,6 +515,41 @@ public:
     }
 
     // =========================================================================
+    // HSV transforms — one primitive, a handful of specialised helpers.
+    //
+    // `hsv` is the universal form: `hsv *= (scaleH, scaleS, scaleV);
+    //                                hsv += (deltaH, deltaS, deltaV);`
+    //
+    // Defaults are identity (scales 1.0, deltas 0.0). The specialised wrappers
+    // below set only the relevant fields — they exist purely for readability
+    // at call sites, they all compile down to the same DrawOp::EffectHSV.
+    // =========================================================================
+
+    void hsv(float scaleH, float scaleS, float scaleV,
+             float deltaH, float deltaS, float deltaV,
+             juce::Rectangle<float> region = {})
+    {
+        if (region.isEmpty()) region = state().clipBounds.toFloat();
+        auto& s = state();
+        renderer_.push(DrawOp::EffectHSV, s.zOrder, s.clipBounds,
+                       s.stencilDepth, s.scopeDepth,
+            HSVParams { scaleH, scaleS, scaleV, deltaH, deltaS, deltaV,
+                        region, displayScale_ });
+    }
+
+    // amount: 0 = grayscale, 1 = original, >1 = boosted saturation.
+    void saturate(float amount, juce::Rectangle<float> region = {})
+    {
+        hsv(1.0f, amount, 1.0f, 0.0f, 0.0f, 0.0f, region);
+    }
+
+    // turns: hue rotation in 0..1 (1 = full 360°).
+    void shiftHue(float turns, juce::Rectangle<float> region = {})
+    {
+        hsv(1.0f, 1.0f, 1.0f, turns, 0.0f, 0.0f, region);
+    }
+
+    // =========================================================================
     // Shape-aware variable-radius blur. Inside the shape blurs at `blurRadius`;
     // the effective radius ramps down to 0 across `falloffRadius` logical px.
     // `edge` controls where the falloff band sits relative to the shape edge.
