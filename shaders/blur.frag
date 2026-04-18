@@ -22,8 +22,9 @@ layout(set = 0, binding = 0) uniform sampler2D srcTexture;
 layout(location = 0) in  vec2 fragUV;
 layout(location = 0) out vec4 outColor;
 
-// Compile-time cap so drivers can bound the loop; supports radius up to ~128px.
-const int MAX_PAIRS = 64;
+// Upper bound for the driver's loop cost model. The runtime `if (i1 > N) break;`
+// exits at the actual radius, so only insane radii (> 8192 px) would pay full cost.
+const int MAX_PAIRS = 4096;
 
 void main() {
     vec2 texelSize = 1.0 / pc.viewportSize;

@@ -35,7 +35,11 @@ public:
         int   shapeType;              // 4  0=rect,1=rrect,2=ellipse,3=line
         int   edgePlacement;          // 4  0=centered,1=inside,2=outside
         int   inverted;               // 4
-    };                                // total: 88 bytes — fits in min-guaranteed 128 B
+        // Explicit trailing pad so the push-constant block is a multiple of
+        // 16 bytes — matches GLSL's std140-style block rounding that some
+        // MoltenVK paths rely on.
+        float _pad0, _pad1;           // 8
+    };                                // total: 96 bytes
 
     ShapeBlurPipeline() = default;
     ~ShapeBlurPipeline() { destroy(); }
@@ -153,14 +157,16 @@ public:
         vkDestroyShaderModule(d, fragMod, nullptr);
     }
 
-    // One separable pass. Caller provides direction (1,0) or (0,1) and the
-    // pre-packed shape params (everything the shader needs minus viewport
-    // size and direction, which we fill in from the extent+dir here).
+    // One separable pass. Caller provides direction (1,0) or (0,1), the
+    // pre-packed shape params, and a physical-pixel scissor rectangle. The
+    // render pass is assumed to be the LOAD variant, so pixels outside the
+    // scissor keep their pre-pass contents (passthrough = original scene).
     void applyPass(VkCommandBuffer cmd,
                    VkDescriptorSet srcDesc,
                    VkFramebuffer   dstFramebuffer,
                    VkRenderPass    dstRenderPass,
                    VkExtent2D      extent,
+                   VkRect2D        scissor,
                    float           dirX, float dirY,
                    const PushConstants& params)
     {
@@ -176,15 +182,9 @@ public:
         rpbi.pClearValues = &clear;
         vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
-        VkViewport vp {};
-        vp.width    = static_cast<float>(extent.width);
-        vp.height   = static_cast<float>(extent.height);
-        vp.maxDepth = 1.0f;
-        vkCmdSetViewport(cmd, 0, 1, &vp);
-
-        VkRect2D sc { {0, 0}, extent };
-        vkCmdSetScissor(cmd, 0, 1, &sc);
-
+        // Bind pipeline first, then dynamic state + push constants. Some
+        // drivers invalidate dynamic state on pipeline bind; ordering this
+        // way guarantees all state is fresh for the draw.
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
             layout_, 0, 1, &srcDesc, 0, nullptr);
@@ -194,9 +194,15 @@ public:
         pc.viewportH = static_cast<float>(extent.height);
         pc.dirX      = dirX;
         pc.dirY      = dirY;
-
         vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
             0, sizeof(pc), &pc);
+
+        VkViewport vp {};
+        vp.width    = static_cast<float>(extent.width);
+        vp.height   = static_cast<float>(extent.height);
+        vp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
         vkCmdEndRenderPass(cmd);

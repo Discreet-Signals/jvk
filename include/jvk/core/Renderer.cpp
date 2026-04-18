@@ -112,7 +112,6 @@ void Renderer::execute()
                 auto& sp = arena_.read<BlurShapeParams>(cmd.dataOffset);
 
                 ShapeBlurPipeline::PushConstants pc {};
-                // invCol0, invCol1, invCol2 — packed as 6 floats
                 pc.invCol0X = sp.invXform[0]; pc.invCol0Y = sp.invXform[1];
                 pc.invCol1X = sp.invXform[2]; pc.invCol1Y = sp.invXform[3];
                 pc.invCol2X = sp.invXform[4]; pc.invCol2Y = sp.invXform[5];
@@ -129,14 +128,14 @@ void Renderer::execute()
                 pc.edgePlacement = static_cast<int>(sp.edgePlacement);
                 pc.inverted      = static_cast<int>(sp.inverted);
 
-                // H-pass: current → other, V-pass: other → current.
-                // Same ping-pong as the uniform blur; current keeps identity.
+                VkRect2D scissor { {0, 0}, frame.extent };
+                VkRenderPass rp = target_.effectRenderPass();
                 shapeBlur_->applyPass(frame.cmd,
-                    currentSampler, otherEffectFB, target_.effectRenderPass(),
-                    frame.extent, 1.0f, 0.0f, pc);
+                    currentSampler, otherEffectFB, rp,
+                    frame.extent, scissor, 1.0f, 0.0f, pc);
                 shapeBlur_->applyPass(frame.cmd,
-                    otherSampler, currentEffectFB, target_.effectRenderPass(),
-                    frame.extent, 0.0f, 1.0f, pc);
+                    otherSampler, currentEffectFB, rp,
+                    frame.extent, scissor, 0.0f, 1.0f, pc);
             }
 
             beginSceneRP(scenePassLoad, currentSceneFB, /*withClears=*/false);

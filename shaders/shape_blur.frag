@@ -31,6 +31,7 @@ layout(push_constant) uniform PC {
     int   shapeType;        // 0=rect, 1=rrect, 2=ellipse, 3=line
     int   edgePlacement;    // 0=centered, 1=inside, 2=outside
     int   inverted;         // 0 or 1
+    float _pad0, _pad1;     // pad block to 96 bytes (std140 multiple-of-16)
 } pc;
 
 layout(set = 0, binding = 0) uniform sampler2D srcTexture;
@@ -38,7 +39,9 @@ layout(set = 0, binding = 0) uniform sampler2D srcTexture;
 layout(location = 0) in  vec2 fragUV;
 layout(location = 0) out vec4 outColor;
 
-const int MAX_PAIRS = 64;   // supports radius up to ~128 px like blur.frag
+// Upper bound for the driver's loop cost model. The runtime `if (i1 > N) break;`
+// exits at the actual radius, so only insane radii (> 8192 px) would pay full cost.
+const int MAX_PAIRS = 4096;
 
 // ---- SDF primitives (all in shape-local coords, origin-centered) ----
 
@@ -97,8 +100,30 @@ float computeRadius(vec2 fragCoord) {
     float t = 1.0 - smoothstep(bandMin, bandMax, d);
     if (pc.inverted != 0) t = 1.0 - t;
 
-    // Logical → physical for the sampling kernel.
-    return pc.maxRadius * t * pc.displayScale;
+    // Requested blur radius (physical px) following the falloff curve.
+    float requested = pc.maxRadius * t * pc.displayScale;
+
+    // Symmetric cap — applied identically to H and V so the kernel stays a
+    // proper blur, not a smear.
+    //
+    // Bounded shapes (rect / rrect / ellipse): isotropic SDF cap prevents
+    // scene content from bleeding past the outer falloff edge into the
+    // blurred region.
+    //
+    // Capsule: the shape is unbounded in one direction (by design — it
+    // models a line segment), so an SDF-based cap would clamp the whole
+    // blur to the narrow cross-section. Leave it uncapped; samples reaching
+    // the texture boundary clamp-to-edge automatically.
+    float cap;
+    if (pc.shapeType == 3) {
+        cap = 1e20; // effectively infinite; relies on CLAMP_TO_EDGE sampling
+    } else {
+        float sdfDist = (pc.inverted != 0) ? (d - bandMin) : (bandMax - d);
+        sdfDist = max(sdfDist, 0.0);
+        cap = sdfDist * pc.displayScale;
+    }
+
+    return min(requested, cap);
 }
 
 void main() {
