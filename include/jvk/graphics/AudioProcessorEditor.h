@@ -194,6 +194,17 @@ private:
             spv(blur_vert_spv, blur_vert_spvSize),
             spv(blur_frag_spv, blur_frag_spvSize));
         renderer_->setPostProcess(blurEffect_.get());
+
+        // Shape-aware blur — variable per-pixel radius driven by the shape's
+        // SDF. Used by Graphics::blurRect / blurRoundedRectangle / blurEllipse
+        // / blurLine. Reuses the fullscreen-triangle vertex shader from the
+        // standard blur.
+        shapeBlur_ = std::make_unique<ShapeBlurPipeline>();
+        shapeBlur_->init(*device_,
+            target_->effectRenderPass(),
+            spv(blur_vert_spv, blur_vert_spvSize),
+            spv(shape_blur_frag_spv, shape_blur_frag_spvSize));
+        renderer_->setShapeBlur(shapeBlur_.get());
     }
 
     struct RenderTimer : public juce::Timer {
@@ -227,6 +238,7 @@ private:
     std::unique_ptr<pipelines::StencilCoverPipeline>  stencilCoverPipeline_;
     std::unique_ptr<pipelines::BlendPipeline>         blendPipeline_;
     std::unique_ptr<EffectPipeline>                   blurEffect_;
+    std::unique_ptr<ShapeBlurPipeline>                shapeBlur_;
 
     RenderTimer renderTimer_;
     bool vulkanEnabled_ = true;

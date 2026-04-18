@@ -73,6 +73,7 @@
 #include "include/jvk/graphics/pipelines/stencil/StencilPipeline.h"
 #include "include/jvk/graphics/pipelines/blend/BlendPipeline.h"
 #include "include/jvk/graphics/pipelines/effect/EffectPipeline.h"
+#include "include/jvk/graphics/pipelines/effect/ShapeBlurPipeline.h"
 #include "include/jvk/graphics/Graphics.h"
 #include "include/jvk/graphics/Shader.h"
 

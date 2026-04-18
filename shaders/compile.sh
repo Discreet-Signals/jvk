@@ -17,8 +17,9 @@ $GLSLC -fshader-stage=frag ui2d.frag     -o ui2d.frag.spv
 $GLSLC -fshader-stage=vert stencil.vert  -o stencil.vert.spv
 $GLSLC -fshader-stage=frag stencil.frag  -o stencil.frag.spv
 $GLSLC -fshader-stage=frag hsv.frag      -o hsv.frag.spv
-$GLSLC -fshader-stage=vert blur.vert     -o blur.vert.spv
-$GLSLC -fshader-stage=frag blur.frag     -o blur.frag.spv
+$GLSLC -fshader-stage=vert blur.vert       -o blur.vert.spv
+$GLSLC -fshader-stage=frag blur.frag       -o blur.frag.spv
+$GLSLC -fshader-stage=frag shape_blur.frag -o shape_blur.frag.spv
 
 echo "Generating UI2DShaders.h..."
 python3 - << 'PYEOF'
@@ -41,6 +42,7 @@ shaders = [
     ('hsv.frag.spv', 'hsv_frag_spv'),
     ('blur.vert.spv', 'blur_vert_spv'),
     ('blur.frag.spv', 'blur_frag_spv'),
+    ('shape_blur.frag.spv', 'shape_blur_frag_spv'),
 ]
 
 out = """/*

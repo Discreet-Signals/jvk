@@ -5,6 +5,7 @@ namespace jvk {
 class Pipeline;
 class RenderTarget;
 class EffectPipeline;
+class ShapeBlurPipeline;
 
 // =============================================================================
 // UIVertex — shared vertex format for 2D pipelines
@@ -30,6 +31,7 @@ enum class DrawOp : uint8_t {
     EffectBlend,
     EffectResolve,
     EffectKernel,
+    BlurShape,
     PushClipRect, PushClipPath, PopClip,
     COUNT
 };
@@ -211,6 +213,10 @@ public:
     // applies the 2-pass separable effect (e.g. Gaussian blur) before present.
     void setPostProcess(EffectPipeline* ep) { postProcess_ = ep; }
 
+    // Attach the shape-aware blur pipeline. Required for BlurShape draw ops
+    // (g.blurEllipse / blurRect / blurRoundedRectangle / blurLine).
+    void setShapeBlur(ShapeBlurPipeline* sb) { shapeBlur_ = sb; }
+
     // Capture non-POD types into side vectors. Returns index.
     uint32_t captureFont(const juce::Font& f)     { fonts_.push_back(f); return static_cast<uint32_t>(fonts_.size() - 1); }
     uint32_t captureFill(const juce::FillType& f)  { fills_.push_back(f); return static_cast<uint32_t>(fills_.size() - 1); }
@@ -256,7 +262,8 @@ private:
     std::vector<juce::FillType> fills_;
 
     Pipeline* pipelineForOp_[static_cast<size_t>(DrawOp::COUNT)] = {};
-    EffectPipeline* postProcess_ = nullptr;
+    EffectPipeline*    postProcess_ = nullptr;
+    ShapeBlurPipeline* shapeBlur_   = nullptr;
     uint64_t frameCounter_ = 0;
 };
 

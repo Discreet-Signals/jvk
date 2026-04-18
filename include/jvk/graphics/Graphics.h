@@ -396,6 +396,55 @@ public:
             BlurParams { radius, region, displayScale_ });
     }
 
+    // =========================================================================
+    // Shape-aware variable-radius blur. Inside the shape blurs at `blurRadius`;
+    // the effective radius ramps down to 0 across `falloffRadius` logical px.
+    // `edge` controls where the falloff band sits relative to the shape edge.
+    // `inverted = true` blurs OUTSIDE the shape instead (ramp direction flips).
+    // All distances are logical pixels; displayScale is folded in per-pixel.
+    // =========================================================================
+
+    void blurRect(const juce::Rectangle<float>& rect,
+                  float blurRadius, float falloffRadius,
+                  bool inverted = false, BlurEdge edge = BlurEdge::Centered)
+    {
+        pushBlurShape(rect, 0.0f, /*shapeType*/ 0,
+                      blurRadius, falloffRadius, inverted, edge,
+                      /*lineB*/ {0,0}, /*lineThickness*/ 0.0f);
+    }
+
+    void blurRoundedRectangle(const juce::Rectangle<float>& rect, float cornerSize,
+                              float blurRadius, float falloffRadius,
+                              bool inverted = false, BlurEdge edge = BlurEdge::Centered)
+    {
+        pushBlurShape(rect, cornerSize, /*shapeType*/ 1,
+                      blurRadius, falloffRadius, inverted, edge,
+                      {0,0}, 0.0f);
+    }
+
+    void blurEllipse(const juce::Rectangle<float>& area,
+                     float blurRadius, float falloffRadius,
+                     bool inverted = false, BlurEdge edge = BlurEdge::Centered)
+    {
+        pushBlurShape(area, 0.0f, /*shapeType*/ 2,
+                      blurRadius, falloffRadius, inverted, edge,
+                      {0,0}, 0.0f);
+    }
+
+    void blurLine(const juce::Line<float>& line, float thickness,
+                  float blurRadius, float falloffRadius,
+                  bool inverted = false, BlurEdge edge = BlurEdge::Centered)
+    {
+        // Shape-local anchor at endpoint A; B is stored relative to A.
+        auto a = line.getStart();
+        auto b = line.getEnd();
+        juce::Rectangle<float> anchor { a.x, a.y, 0.0f, 0.0f };
+        juce::Point<float> bRel { b.x - a.x, b.y - a.y };
+        pushBlurShape(anchor, 0.0f, /*shapeType*/ 3,
+                      blurRadius, falloffRadius, inverted, edge,
+                      { bRel.x, bRel.y }, thickness * 0.5f);
+    }
+
     void drawShader(Shader& shader, juce::Rectangle<float> region = {})
     {
         if (region.isEmpty()) region = state().clipBounds.toFloat();
@@ -456,6 +505,57 @@ private:
         }
         s.scopeDepth--;
         if (s.stencilDepth > 0) s.stencilDepth--;
+    }
+
+    // Pack a BlurShape draw command. Handles the inverse-affine computation
+    // that maps physical fragment coords back into shape-local logical space.
+    void pushBlurShape(const juce::Rectangle<float>& boundsRect,
+                       float cornerSize,
+                       uint32_t shapeType,
+                       float blurRadius, float falloffRadius,
+                       bool inverted, BlurEdge edge,
+                       juce::Point<float> lineB, float lineThickness)
+    {
+        if (isClipEmpty()) return;
+        if (blurRadius <= 0.0f && falloffRadius <= 0.0f) return;
+        auto& s = state();
+
+        // Shape-local anchor: rect/rrect/ellipse are origin-centred with
+        // halfSize; lines have A at origin, B at `lineB`; for either we
+        // translate so shape-local origin lands at the anchor point.
+        juce::Point<float> anchor = (shapeType == 3)
+            ? juce::Point<float>{ boundsRect.getX(), boundsRect.getY() }
+            : boundsRect.getCentre();
+
+        juce::AffineTransform M    = s.transform.scaled(displayScale_);
+        juce::AffineTransform invM = M.inverted();
+        // Subtract the anchor (in logical context coords) AFTER the inverse
+        // of the physical→logical mapping, so the shader's frag.xy lands at
+        // the shape-local origin.
+        juce::AffineTransform invMshift = invM.translated(-anchor.x, -anchor.y);
+
+        BlurShapeParams p {};
+        p.invXform[0] = invMshift.mat00; p.invXform[1] = invMshift.mat10;
+        p.invXform[2] = invMshift.mat01; p.invXform[3] = invMshift.mat11;
+        p.invXform[4] = invMshift.mat02; p.invXform[5] = invMshift.mat12;
+
+        p.shapeHalf[0] = boundsRect.getWidth()  * 0.5f;
+        p.shapeHalf[1] = boundsRect.getHeight() * 0.5f;
+        p.lineB[0]     = lineB.x;
+        p.lineB[1]     = lineB.y;
+
+        p.maxRadius     = blurRadius;
+        p.falloff       = juce::jmax(0.001f, falloffRadius);
+        p.displayScale  = displayScale_;
+        p.cornerRadius  = cornerSize;
+        p.lineThickness = lineThickness;
+
+        p.shapeType     = shapeType;
+        p.edgePlacement = static_cast<uint32_t>(edge);
+        p.inverted      = inverted ? 1u : 0u;
+
+        renderer_.push(DrawOp::BlurShape, s.zOrder, s.clipBounds,
+                       s.stencilDepth, s.scopeDepth, p);
     }
 
     // Flatten a path into a triangle fan for stencil rendering.

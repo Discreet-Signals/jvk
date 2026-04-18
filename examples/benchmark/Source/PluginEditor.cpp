@@ -686,12 +686,27 @@ void BenchmarkEditor::sceneBlur(juce::Graphics& g, float w, float h, float t, fl
     // Apply blur if enabled — radius pulses 0..128..0 on a cosine, 4 cycles per scene loop.
     constexpr float maxRadius = 128.0f;
     const float blurRadius = (1.0f - std::cos(t * juce::MathConstants<float>::twoPi * 4.0f)) * 0.5f * maxRadius;
+    // Phase-inverted so the shape blurs are brightest when the global blur is dimmest.
+    const float shapeBlurRadius = maxRadius - blurRadius;
 
     if (effectEnabled)
     {
         auto vk = jvk::Graphics::create(g);
         if (vk)
-            vk->blur(blurRadius);
+        {
+            // vk->blur(blurRadius); // temporarily disabled while testing shape blurs
+
+            // Centered circle blur — disc of radius 100 logical px, 24 px falloff.
+            float cx = w * 0.5f;
+            float cy = h * 0.5f;
+            float r  = 100.0f;
+            vk->blurEllipse({ cx - r, cy - r, r * 2.0f, r * 2.0f },
+                            shapeBlurRadius, 24.0f);
+
+            // Vertical line hugging the right edge, 48 px thick, 24 px falloff.
+            juce::Line<float> rightEdge { w - 24.0f, 0.0f, w - 24.0f, h };
+            vk->blurLine(rightEdge, 48.0f, shapeBlurRadius, 24.0f);
+        }
     }
 
     // Draw text on top (to show that post-blur drawing works)

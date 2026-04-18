@@ -2,6 +2,16 @@
 
 namespace jvk {
 
+// Placement of the shape-blur falloff band relative to the shape edge (SDF=0).
+//   Centered → falloff straddles the edge, half inside + half outside
+//   Inside   → falloff sits entirely inside the shape, ending at the edge
+//   Outside  → falloff sits entirely outside the shape, starting at the edge
+enum class BlurEdge : uint32_t {
+    Centered = 0,
+    Inside   = 1,
+    Outside  = 2,
+};
+
 // =============================================================================
 // Parameter structs — POD only, packed into Arena via memcpy.
 // Non-POD types (Font, FillType) stored in Renderer side vectors by index.
@@ -119,6 +129,24 @@ struct BlurParams {
     float                  radius;
     juce::Rectangle<float> region;
     float                  scale;
+};
+
+// Shape-aware variable-radius blur. Pre-packed in the layout the fragment
+// shader's push-constant block expects, minus viewport/direction which the
+// pipeline fills in per-pass. Distances are in LOGICAL pixels; the shader
+// multiplies by `displayScale` when converting to physical sample offsets.
+struct BlurShapeParams {
+    float    invXform[6];          // inverse affine: frag (physical) → shape-local (logical)
+    float    shapeHalf[2];         // rect/rrect/ellipse halfsize (logical)
+    float    lineB[2];             // line: endpoint B in shape-local (A is origin)
+    float    maxRadius;            // logical pixels
+    float    falloff;              // logical pixels
+    float    displayScale;
+    float    cornerRadius;         // rrect only
+    float    lineThickness;        // line only
+    uint32_t shapeType;            // 0=rect, 1=rrect, 2=ellipse, 3=line
+    uint32_t edgePlacement;        // BlurEdge as uint32
+    uint32_t inverted;             // 0 or 1
 };
 
 struct EffectResolveParams {

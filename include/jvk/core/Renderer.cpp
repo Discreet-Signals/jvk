@@ -105,6 +105,43 @@ void Renderer::execute()
             beginSceneRP(scenePassLoad, currentSceneFB, /*withClears=*/false);
             continue;
         }
+        if (cmd.op == DrawOp::BlurShape) {
+            vkCmdEndRenderPass(frame.cmd);
+
+            if (shapeBlur_) {
+                auto& sp = arena_.read<BlurShapeParams>(cmd.dataOffset);
+
+                ShapeBlurPipeline::PushConstants pc {};
+                // invCol0, invCol1, invCol2 — packed as 6 floats
+                pc.invCol0X = sp.invXform[0]; pc.invCol0Y = sp.invXform[1];
+                pc.invCol1X = sp.invXform[2]; pc.invCol1Y = sp.invXform[3];
+                pc.invCol2X = sp.invXform[4]; pc.invCol2Y = sp.invXform[5];
+                pc.shapeHalfX = sp.shapeHalf[0];
+                pc.shapeHalfY = sp.shapeHalf[1];
+                pc.lineBX     = sp.lineB[0];
+                pc.lineBY     = sp.lineB[1];
+                pc.maxRadius     = sp.maxRadius;
+                pc.falloff       = sp.falloff;
+                pc.displayScale  = sp.displayScale;
+                pc.cornerRadius  = sp.cornerRadius;
+                pc.lineThickness = sp.lineThickness;
+                pc.shapeType     = static_cast<int>(sp.shapeType);
+                pc.edgePlacement = static_cast<int>(sp.edgePlacement);
+                pc.inverted      = static_cast<int>(sp.inverted);
+
+                // H-pass: current → other, V-pass: other → current.
+                // Same ping-pong as the uniform blur; current keeps identity.
+                shapeBlur_->applyPass(frame.cmd,
+                    currentSampler, otherEffectFB, target_.effectRenderPass(),
+                    frame.extent, 1.0f, 0.0f, pc);
+                shapeBlur_->applyPass(frame.cmd,
+                    otherSampler, currentEffectFB, target_.effectRenderPass(),
+                    frame.extent, 0.0f, 1.0f, pc);
+            }
+
+            beginSceneRP(scenePassLoad, currentSceneFB, /*withClears=*/false);
+            continue;
+        }
         auto* pipeline = pipelineForOp_[static_cast<size_t>(cmd.op)];
         if (!pipeline) continue;
         if (!pipeline->isBuilt())
