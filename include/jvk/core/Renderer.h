@@ -6,6 +6,7 @@ class Pipeline;
 class RenderTarget;
 class EffectPipeline;
 class ShapeBlurPipeline;
+class ShaderPipeline;
 
 // =============================================================================
 // UIVertex — shared vertex format for 2D pipelines
@@ -217,6 +218,11 @@ public:
     // (g.blurEllipse / blurRect / blurRoundedRectangle / blurLine).
     void setShapeBlur(ShapeBlurPipeline* sb) { shapeBlur_ = sb; }
 
+    // Attach the DrawShader dispatcher. Required for DrawShader draw ops
+    // (g.drawShader). User shaders own their own VkPipeline; this module
+    // handles the per-command bind + push-constants + draw.
+    void setShaderPipeline(ShaderPipeline* sp) { shaderPipeline_ = sp; }
+
     // Capture non-POD types into side vectors. Returns index.
     uint32_t captureFont(const juce::Font& f)     { fonts_.push_back(f); return static_cast<uint32_t>(fonts_.size() - 1); }
     uint32_t captureFill(const juce::FillType& f)  { fills_.push_back(f); return static_cast<uint32_t>(fills_.size() - 1); }
@@ -262,8 +268,9 @@ private:
     std::vector<juce::FillType> fills_;
 
     Pipeline* pipelineForOp_[static_cast<size_t>(DrawOp::COUNT)] = {};
-    EffectPipeline*    postProcess_ = nullptr;
-    ShapeBlurPipeline* shapeBlur_   = nullptr;
+    EffectPipeline*    postProcess_    = nullptr;
+    ShapeBlurPipeline* shapeBlur_      = nullptr;
+    ShaderPipeline*    shaderPipeline_ = nullptr;
     uint64_t frameCounter_ = 0;
 };
 

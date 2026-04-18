@@ -56,7 +56,9 @@ public:
         device_ = &device;
         VkDevice d = device.device();
 
-        // Create pipeline layout from reflected bindings
+        // Create pipeline layout from reflected bindings. Shaders with no
+        // reflected bindings (e.g. fragment-only effects driven by push
+        // constants) build a layout with zero descriptor sets.
         std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
         for (auto& b : bindings_) {
             layoutBindings.push_back({
@@ -64,9 +66,12 @@ public:
             });
         }
 
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
         if (!layoutBindings.empty()) {
-            layoutId_ = device.bindings().registerLayout(layoutBindings.data(), static_cast<uint32_t>(layoutBindings.size()));
+            layoutId_ = device.bindings().registerLayout(layoutBindings.data(),
+                static_cast<uint32_t>(layoutBindings.size()));
             descriptorSet_ = device.bindings().alloc(layoutId_);
+            setLayout = device.bindings().getLayout(layoutId_);
 
             // Bind defaults (1x1 black pixel) for unset image bindings
             for (auto& b : bindings_) {
@@ -95,14 +100,19 @@ public:
         VkShaderModule fragMod;
         vkCreateShaderModule(d, &fci, nullptr, &fragMod);
 
-        VkDescriptorSetLayout setLayout = device.bindings().getLayout(layoutId_);
-        VkPushConstantRange pushRange { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                                        0, sizeof(float) * 4 };
+        // Push constant layout mirrors shader_region.vert:
+        //   bytes  0..11 — resolution (vec2) + time (float) — vertex + fragment
+        //   bytes 12..27 — viewport (vec2) + region origin (vec2) — vertex only
+        // One unified range covers both stages; fragment just reads the head.
+        VkPushConstantRange pushRange {
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(float) * 7
+        };
 
         VkPipelineLayoutCreateInfo pli {};
         pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pli.setLayoutCount = 1;
-        pli.pSetLayouts = &setLayout;
+        pli.setLayoutCount = (setLayout != VK_NULL_HANDLE) ? 1u : 0u;
+        pli.pSetLayouts = (setLayout != VK_NULL_HANDLE) ? &setLayout : nullptr;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pushRange;
         vkCreatePipelineLayout(d, &pli, nullptr, &layout_);
@@ -139,10 +149,6 @@ public:
         ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         ms.rasterizationSamples = msaa;
 
-        VkPipelineDepthStencilStateCreateInfo ds {};
-        ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.stencilTestEnable = VK_TRUE;
-
         VkPipelineColorBlendAttachmentState blend {};
         blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
@@ -159,29 +165,62 @@ public:
         cb.attachmentCount = 1;
         cb.pAttachments = &blend;
 
-        VkDynamicState dynStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
-                                       VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+        // Matches ColorPipeline — STENCIL_REFERENCE + COMPARE_MASK are pushed
+        // per-draw by the dispatcher to select the current clip level's bit.
+        VkDynamicState dynStates[] = {
+            VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+            VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+            VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+        };
         VkPipelineDynamicStateCreateInfo dynState {};
         dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 3;
+        dynState.dynamicStateCount = 5;
         dynState.pDynamicStates = dynStates;
 
-        VkGraphicsPipelineCreateInfo pci {};
-        pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-        pci.stageCount = 2;
-        pci.pStages = stages;
-        pci.pVertexInputState = &vertexInput;
-        pci.pInputAssemblyState = &inputAsm;
-        pci.pViewportState = &vpState;
-        pci.pRasterizationState = &raster;
-        pci.pMultisampleState = &ms;
-        pci.pDepthStencilState = &ds;
-        pci.pColorBlendState = &cb;
-        pci.pDynamicState = &dynState;
-        pci.layout = layout_;
-        pci.renderPass = renderPass;
+        // Build two variants sharing one layout: the normal variant for
+        // stencilDepth==0, and a clip variant that matches on the active
+        // stencil bits so shader draws respect path clips just like ColorOps.
+        auto buildVariant = [&](bool stencilTest) -> VkPipeline
+        {
+            VkPipelineDepthStencilStateCreateInfo ds {};
+            ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+            ds.stencilTestEnable = stencilTest ? VK_TRUE : VK_FALSE;
+            if (stencilTest) {
+                VkStencilOpState op {};
+                op.failOp      = VK_STENCIL_OP_KEEP;
+                op.passOp      = VK_STENCIL_OP_KEEP;
+                op.depthFailOp = VK_STENCIL_OP_KEEP;
+                op.compareOp   = VK_COMPARE_OP_EQUAL;
+                op.compareMask = 0xFF; // overridden by dynamic state per draw
+                op.writeMask   = 0xFF;
+                op.reference   = 0;
+                ds.front = op;
+                ds.back  = op;
+            }
 
-        vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline_);
+            VkGraphicsPipelineCreateInfo pci {};
+            pci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            pci.stageCount = 2;
+            pci.pStages = stages;
+            pci.pVertexInputState = &vertexInput;
+            pci.pInputAssemblyState = &inputAsm;
+            pci.pViewportState = &vpState;
+            pci.pRasterizationState = &raster;
+            pci.pMultisampleState = &ms;
+            pci.pDepthStencilState = &ds;
+            pci.pColorBlendState = &cb;
+            pci.pDynamicState = &dynState;
+            pci.layout = layout_;
+            pci.renderPass = renderPass;
+
+            VkPipeline result = VK_NULL_HANDLE;
+            vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &result);
+            return result;
+        };
+
+        pipeline_     = buildVariant(false);
+        clipPipeline_ = buildVariant(true);
 
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);
@@ -194,6 +233,7 @@ public:
     bool isReady() const { return created_; }
 
     VkPipeline       pipeline()      const { return pipeline_; }
+    VkPipeline       clipPipeline()  const { return clipPipeline_ ? clipPipeline_ : pipeline_; }
     VkPipelineLayout layout()        const { return layout_; }
     VkDescriptorSet  descriptorSet() const { return descriptorSet_; }
 
@@ -204,8 +244,9 @@ public:
     {
         if (!device_) return;
         VkDevice d = device_->device();
-        if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_, nullptr);
-        if (layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
+        if (pipeline_     != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_,     nullptr);
+        if (clipPipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(d, clipPipeline_, nullptr);
+        if (layout_       != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
         if (descriptorSet_ != VK_NULL_HANDLE) device_->bindings().free(descriptorSet_);
     }
 
@@ -259,6 +300,7 @@ private:
 
     Device*          device_        = nullptr;
     VkPipeline       pipeline_      = VK_NULL_HANDLE;
+    VkPipeline       clipPipeline_  = VK_NULL_HANDLE;
     VkPipelineLayout layout_        = VK_NULL_HANDLE;
     VkDescriptorSet  descriptorSet_ = VK_NULL_HANDLE;
     Memory::M::LayoutID layoutId_   = 0;

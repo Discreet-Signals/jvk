@@ -205,6 +205,14 @@ private:
             spv(blur_vert_spv, blur_vert_spvSize),
             spv(shape_blur_frag_spv, shape_blur_frag_spvSize));
         renderer_->setShapeBlur(shapeBlur_.get());
+
+        // DrawShader dispatcher — runs user shaders (jvk::Shader) inside the
+        // scene render pass. Each user shader lazily builds its own pipeline
+        // variants (normal + clip) on first draw, against the scene RP
+        // captured here.
+        shaderPipeline_ = std::make_unique<ShaderPipeline>();
+        shaderPipeline_->init(*device_, target_->sceneRenderPassClear());
+        renderer_->setShaderPipeline(shaderPipeline_.get());
     }
 
     struct RenderTimer : public juce::Timer {
@@ -239,6 +247,7 @@ private:
     std::unique_ptr<pipelines::BlendPipeline>         blendPipeline_;
     std::unique_ptr<EffectPipeline>                   blurEffect_;
     std::unique_ptr<ShapeBlurPipeline>                shapeBlur_;
+    std::unique_ptr<ShaderPipeline>                   shaderPipeline_;
 
     RenderTimer renderTimer_;
     bool vulkanEnabled_ = true;

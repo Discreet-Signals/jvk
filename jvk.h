@@ -76,6 +76,7 @@
 #include "include/jvk/graphics/pipelines/effect/ShapeBlurPipeline.h"
 #include "include/jvk/graphics/Graphics.h"
 #include "include/jvk/graphics/Shader.h"
+#include "include/jvk/graphics/pipelines/shader/ShaderPipeline.h"
 
 // Platform surface creation (must come before AudioProcessorEditor)
 #if JUCE_MAC

@@ -105,6 +105,24 @@ void Renderer::execute()
             beginSceneRP(scenePassLoad, currentSceneFB, /*withClears=*/false);
             continue;
         }
+        if (cmd.op == DrawOp::DrawShader) {
+            // DrawShader is a regular scene draw — no render-pass transition.
+            // Dispatch updates State's bound pipeline/layout and issues one
+            // fullscreen triangle against the current scene framebuffer.
+            if (shaderPipeline_) {
+                auto& sp = arena_.read<DrawShaderParams>(cmd.dataOffset);
+                auto* shader = static_cast<Shader*>(sp.shader);
+                if (shader) {
+                    shaderPipeline_->dispatch(state_, frame.cmd, *shader,
+                        sp.region,
+                        static_cast<float>(frame.extent.width),
+                        static_cast<float>(frame.extent.height),
+                        cmd.clipBounds,
+                        cmd.stencilDepth);
+                }
+            }
+            continue;
+        }
         if (cmd.op == DrawOp::BlurShape) {
             vkCmdEndRenderPass(frame.cmd);
 
@@ -267,12 +285,14 @@ void State::setPipeline(Pipeline* pipeline)
         vkCmdPushConstants(cmd_, boundLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vpSize), vpSize);
     }
 
-    // Per-level bit stencil: each clip level owns bit N. The clip variant
-    // tests that ALL active bits are set (EQUAL with mask = (1<<depth)-1).
+    // Even-odd clip mask in the high nibble — each nested clip level N
+    // owns bit (4 + N). Active mask is ((1 << depth) - 1) << 4, with the
+    // clip test comparing EQUAL. Low nibble is reserved for fillPath's
+    // winding counter and doesn't participate in the comparison.
     if (stencilDepth_ > 0) {
-        uint32_t mask = (1u << stencilDepth_) - 1;
+        uint32_t mask = (((1u << stencilDepth_) - 1) << 4);
         vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
-        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
+        vkCmdSetStencilReference  (cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
         boundStencilRef_ = mask;
     }
 
@@ -333,10 +353,18 @@ void State::drawCached(const DrawCommand& cmd, VkBuffer vbuf,
         clip = clip.getIntersection(currentClipBounds_);
 
     if (clip != boundScissor_) {
+        // Clamp each edge against the framebuffer before computing the
+        // extent — otherwise a clip that starts at x<0 would give an offset
+        // of 0 with the full (un-clipped) width, letting draws bleed past
+        // the intended right edge.
+        int x0 = std::max(0, clip.getX());
+        int y0 = std::max(0, clip.getY());
+        int x1 = std::max(x0, clip.getRight());
+        int y1 = std::max(y0, clip.getBottom());
         VkRect2D sc;
-        sc.offset = { std::max(0, clip.getX()), std::max(0, clip.getY()) };
-        sc.extent = { static_cast<uint32_t>(std::max(0, clip.getWidth())),
-                      static_cast<uint32_t>(std::max(0, clip.getHeight())) };
+        sc.offset = { x0, y0 };
+        sc.extent = { static_cast<uint32_t>(x1 - x0),
+                      static_cast<uint32_t>(y1 - y0) };
         vkCmdSetScissor(cmd_, 0, 1, &sc);
         boundScissor_ = clip;
     }
@@ -360,10 +388,16 @@ void State::draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count)
         clip = clip.getIntersection(currentClipBounds_);
 
     if (clip != boundScissor_) {
+        // See drawCached for why each edge is clamped independently before
+        // subtracting to get the extent.
+        int x0 = std::max(0, clip.getX());
+        int y0 = std::max(0, clip.getY());
+        int x1 = std::max(x0, clip.getRight());
+        int y1 = std::max(y0, clip.getBottom());
         VkRect2D sc;
-        sc.offset = { std::max(0, clip.getX()), std::max(0, clip.getY()) };
-        sc.extent = { static_cast<uint32_t>(std::max(0, clip.getWidth())),
-                      static_cast<uint32_t>(std::max(0, clip.getHeight())) };
+        sc.offset = { x0, y0 };
+        sc.extent = { static_cast<uint32_t>(x1 - x0),
+                      static_cast<uint32_t>(y1 - y0) };
         vkCmdSetScissor(cmd_, 0, 1, &sc);
         boundScissor_ = clip;
     }

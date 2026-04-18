@@ -69,8 +69,71 @@ public:
 
     void excludeClipRectangle(const juce::Rectangle<int>&) override {}
 
+    // Axis-aligned rectangle detection — SVG clip-path paths are almost
+    // always a <rect>, which shows up here as a 4-or-5 vertex path of
+    // horizontal+vertical line segments. Returning true lets clipToPath
+    // promote the clip to a simple scissor via clipToRectangle, which
+    // leaves the stencil free for the inner fillPath's winding counter
+    // (non-zero winding can't tolerate an outer stencil clip summing into
+    // its counter — every pixel inside the outer rect would then test as
+    // non-zero regardless of the inner path).
+    static bool isAxisAlignedRect(const juce::Path& path,
+                                  juce::Rectangle<float>& out)
+    {
+        juce::Path::Iterator iter(path);
+        juce::Point<float> verts[6] {};
+        int count = 0;
+        while (iter.next())
+        {
+            if (count >= 6) return false;
+            switch (iter.elementType)
+            {
+                case juce::Path::Iterator::startNewSubPath:
+                case juce::Path::Iterator::lineTo:
+                    verts[count++] = { iter.x1, iter.y1 };
+                    break;
+                case juce::Path::Iterator::closePath:
+                    break;
+                default:
+                    return false; // any curve segment → not a simple rect
+            }
+        }
+        if (count < 4) return false;
+        // Rectangle: 4 corners, optional explicit close-vertex equal to start.
+        int n = (count == 5 && verts[4] == verts[0]) ? 4 : count;
+        if (n != 4) return false;
+        for (int i = 0; i < 4; ++i)
+        {
+            auto a = verts[i];
+            auto b = verts[(i + 1) % 4];
+            if (a.x != b.x && a.y != b.y) return false; // not axis-aligned
+        }
+        float xMin = std::min({verts[0].x, verts[1].x, verts[2].x, verts[3].x});
+        float xMax = std::max({verts[0].x, verts[1].x, verts[2].x, verts[3].x});
+        float yMin = std::min({verts[0].y, verts[1].y, verts[2].y, verts[3].y});
+        float yMax = std::max({verts[0].y, verts[1].y, verts[2].y, verts[3].y});
+        if (xMax <= xMin || yMax <= yMin) return false;
+        out = { xMin, yMin, xMax - xMin, yMax - yMin };
+        return true;
+    }
+
     void clipToPath(const juce::Path& path, const juce::AffineTransform& t) override
     {
+        // Fast path for rectangular clip paths (common: SVG <clipPath><rect/>
+        // wrappers on Drawables). Preserved transforms that stay axis-aligned
+        // keep the rectangle axis-aligned, so we can route through the
+        // scissor-based clipToRectangle and avoid the stencil altogether.
+        auto& s0 = state();
+        auto combinedForRectCheck = t.followedBy(s0.transform);
+        juce::Rectangle<float> rectLocal;
+        if (combinedForRectCheck.mat01 == 0.0f && combinedForRectCheck.mat10 == 0.0f
+            && isAxisAlignedRect(path, rectLocal))
+        {
+            auto transformed = rectLocal.transformedBy(t);
+            clipToRectangle(transformed.getSmallestIntegerContainer());
+            return;
+        }
+
         auto& s = state();
         auto combined = t.followedBy(s.transform).scaled(displayScale_);
 
@@ -176,11 +239,16 @@ public:
 
     juce::Rectangle<int> getClipBounds() const override
     {
-        // Return logical coords to JUCE (internal clipBounds are in pixels)
-        auto& cb = state().clipBounds;
-        float inv = 1.0f / displayScale_;
-        return { static_cast<int>(cb.getX() * inv), static_cast<int>(cb.getY() * inv),
-                 static_cast<int>(cb.getWidth() * inv), static_cast<int>(cb.getHeight() * inv) };
+        // JUCE expects the clip bounds in the CURRENT coord space — that's
+        // what Component::paintChildren compares each child's local bounds
+        // against when deciding whether to paint. `s.clipBounds` is in root
+        // pixels, so invert the local→pixel transform to get back to the
+        // caller's local coord space.
+        auto& s = state();
+        if (s.clipBounds.isEmpty()) return {};
+        auto pixelToLocal = s.transform.scaled(displayScale_).inverted();
+        auto local = s.clipBounds.toFloat().transformedBy(pixelToLocal);
+        return local.getSmallestIntegerContainer();
     }
     bool isClipEmpty() const override { return state().clipBounds.isEmpty(); }
 
@@ -648,7 +716,87 @@ private:
             }
         }
 
-        // Phase 2: build triangle fan from flattened points
+        // Phase 2: orientation normalisation.
+        //
+        // The two-sided INCR/DECR stencil trick computes the true signed
+        // winding number per pixel only when every contour carries the
+        // orientation that matches its containment depth:
+        //   even depth (outer, island nested inside a hole) → CCW
+        //   odd  depth (hole, hole-inside-an-island)        → CW
+        //
+        // SVG author orientation conventions are not enforced anywhere in
+        // the input path — Chrome/Firefox/Skia scanline-fill by counting
+        // edge dy-signs so they don't need this, but a fan emits +1 / -1
+        // triangle contributions and relies on contours being oriented
+        // correctly for the overlaps to cancel. Without this step,
+        // multi-subpath paths (text, SVG logos) accumulate winding where
+        // they shouldn't and the whole bounding box fills in.
+        //
+        // We work in-place over scratchPoints_ using the SUBPATH_MARKER
+        // bookends already inserted in phase 1. For each subpath we
+        // compute the shoelace signed area + axis-aligned bounds, derive
+        // containment depth by bbox nesting against every other subpath,
+        // and reverse the point order for any subpath whose signed-area
+        // sign doesn't match the expected orientation for its depth.
+        scratchSpans_.clear();
+        {
+            size_t i = 0;
+            while (i < scratchPoints_.size()) {
+                if (scratchPoints_[i].x != SUBPATH_MARKER) { ++i; continue; }
+                size_t start = i + 1;
+                size_t end   = start;
+                while (end < scratchPoints_.size() &&
+                       scratchPoints_[end].x != SUBPATH_MARKER)
+                    ++end;
+                if (end > start) {
+                    SpanInfo s { start, end, 0.0f,
+                                 std::numeric_limits<float>::max(),
+                                 std::numeric_limits<float>::max(),
+                                -std::numeric_limits<float>::max(),
+                                -std::numeric_limits<float>::max() };
+                    double area = 0;
+                    size_t n = end - start;
+                    for (size_t k = 0; k < n; ++k) {
+                        auto p  = scratchPoints_[start + k];
+                        auto pn = scratchPoints_[start + ((k + 1) % n)];
+                        area += double(p.x) * pn.y - double(pn.x) * p.y;
+                        s.bl = std::min(s.bl, p.x); s.bt = std::min(s.bt, p.y);
+                        s.br = std::max(s.br, p.x); s.bb = std::max(s.bb, p.y);
+                    }
+                    s.signedArea = static_cast<float>(area * 0.5);
+                    scratchSpans_.push_back(s);
+                }
+                i = end;
+            }
+        }
+
+        // Containment depth: how many other spans' bboxes strictly enclose
+        // this one. Bbox-nesting is cheap and matches font/SVG topology for
+        // the overwhelming common case (letter with holes, ring, nested
+        // island) — it breaks only for self-intersecting contours where
+        // no stencil-fan algorithm can be correct without Skia / Clipper.
+        for (size_t i = 0; i < scratchSpans_.size(); ++i) {
+            int depth = 0;
+            auto& si = scratchSpans_[i];
+            for (size_t j = 0; j < scratchSpans_.size(); ++j) {
+                if (i == j) continue;
+                auto& sj = scratchSpans_[j];
+                if (sj.bl <= si.bl && sj.bt <= si.bt &&
+                    sj.br >= si.br && sj.bb >= si.bb)
+                    ++depth;
+            }
+            // In Y-down screen space a "CCW-as-drawn" contour has negative
+            // shoelace area — we keep that as the outer convention (depth
+            // even) and flip holes to match.
+            bool wantNegative = ((depth & 1) == 0);
+            bool isNegative   = si.signedArea < 0.0f;
+            if (wantNegative != isNegative && si.end > si.start + 1) {
+                std::reverse(scratchPoints_.begin() + static_cast<ptrdiff_t>(si.start),
+                             scratchPoints_.begin() + static_cast<ptrdiff_t>(si.end));
+            }
+        }
+
+        // Phase 3: build triangle fan from the now-orientation-normalised points
         glm::vec4 dummy(0);
         glm::vec2 fanCenter(0), prevPt(0);
         bool inSubpath = false;
@@ -697,9 +845,15 @@ private:
     // Flatten scratch buffers — cleared-but-not-freed between paths so the
     // hot path is allocation-free after the first frame.
     struct Seg { glm::vec2 a, b, c, d; };
+    struct SpanInfo {
+        size_t start, end;
+        float  signedArea;
+        float  bl, bt, br, bb;
+    };
     std::vector<UIVertex>  scratchFanVerts_;
     std::vector<glm::vec2> scratchPoints_;
     std::vector<Seg>       scratchSegStack_;
+    std::vector<SpanInfo>  scratchSpans_;
 };
 
 } // namespace jvk

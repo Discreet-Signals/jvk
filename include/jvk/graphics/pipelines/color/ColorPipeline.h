@@ -25,12 +25,15 @@ public:
 
     std::optional<PipelineConfig> clipConfig() const override
     {
+        // Even-odd clip test against the high-nibble clip mask — passes
+        // where all active clip-level bits are set (stencil & mask == mask).
+        // compareMask + reference are pushed dynamically per draw by State.
         auto cfg = config();
-        cfg.stencilTestEnable = true;
-        cfg.stencilCompareOp = VK_COMPARE_OP_EQUAL;
-        cfg.stencilFailOp = VK_STENCIL_OP_KEEP;
-        cfg.stencilPassOp = VK_STENCIL_OP_KEEP;
-        // compareMask and reference are set dynamically per-level by State
+        cfg.stencilTestEnable    = true;
+        cfg.stencilCompareOp     = VK_COMPARE_OP_EQUAL;
+        cfg.stencilFailOp        = VK_STENCIL_OP_KEEP;
+        cfg.stencilPassOp        = VK_STENCIL_OP_KEEP;
+        cfg.stencilDepthFailOp   = VK_STENCIL_OP_KEEP;
         return cfg;
     }
 
