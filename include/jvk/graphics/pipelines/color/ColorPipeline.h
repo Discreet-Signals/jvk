@@ -42,7 +42,7 @@ public:
         static constexpr DrawOp ops[] = {
             DrawOp::FillRect, DrawOp::FillRectList, DrawOp::FillRoundedRect,
             DrawOp::FillEllipse, DrawOp::StrokeRoundedRect, DrawOp::StrokeEllipse,
-            DrawOp::DrawImage, DrawOp::DrawGlyphs, DrawOp::DrawLine
+            DrawOp::DrawImage, DrawOp::DrawGlyphs, DrawOp::DrawLine,
         };
         return ops;
     }

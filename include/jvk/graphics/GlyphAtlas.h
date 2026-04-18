@@ -126,213 +126,42 @@ private:
         bool needsUpload = false;
     };
 
-    // Convert a JUCE Path to an msdfgen Shape.
-    //
-    // msdfgen requires CLOSED contours — orientContours() and generateMSDF()
-    // both rely on scanline inside/outside tests, which are undefined for
-    // open contours. JUCE's Path::Iterator emits `closePath` as a marker
-    // only (no coordinates), so we track each subpath's start point and
-    // emit an explicit lineTo back to it on closePath. We also close any
-    // still-open contour when a new subpath starts or the path ends, which
-    // matches JUCE's rendering behaviour for un-terminated subpaths.
-    static msdfgen::Shape jucePathToShape(const juce::Path& path)
-    {
-        msdfgen::Shape shape;
-        msdfgen::Contour* contour = nullptr;
-
-        juce::Path::Iterator it(path);
-        msdfgen::Point2 lastPoint(0, 0);
-        msdfgen::Point2 subpathStart(0, 0);
-        bool haveSubpath = false;
-
-        auto closeIfOpen = [&]() {
-            if (!contour || !haveSubpath) return;
-            // Avoid a zero-length closing edge — msdfgen rejects those.
-            if (lastPoint.x != subpathStart.x || lastPoint.y != subpathStart.y)
-                contour->addEdge(msdfgen::EdgeHolder(lastPoint, subpathStart));
-            haveSubpath = false;
-        };
-
-        while (it.next())
-        {
-            switch (it.elementType)
-            {
-                case juce::Path::Iterator::startNewSubPath:
-                    // A new subpath without an explicit closePath implicitly
-                    // terminates the previous one.
-                    closeIfOpen();
-                    contour = &shape.addContour();
-                    lastPoint = msdfgen::Point2(it.x1, it.y1);
-                    subpathStart = lastPoint;
-                    haveSubpath = true;
-                    break;
-
-                case juce::Path::Iterator::lineTo:
-                    if (contour)
-                    {
-                        msdfgen::Point2 p(it.x1, it.y1);
-                        contour->addEdge(msdfgen::EdgeHolder(lastPoint, p));
-                        lastPoint = p;
-                    }
-                    break;
-
-                case juce::Path::Iterator::quadraticTo:
-                    if (contour)
-                    {
-                        msdfgen::Point2 c(it.x1, it.y1);
-                        msdfgen::Point2 p(it.x2, it.y2);
-                        contour->addEdge(msdfgen::EdgeHolder(lastPoint, c, p));
-                        lastPoint = p;
-                    }
-                    break;
-
-                case juce::Path::Iterator::cubicTo:
-                    if (contour)
-                    {
-                        msdfgen::Point2 c1(it.x1, it.y1);
-                        msdfgen::Point2 c2(it.x2, it.y2);
-                        msdfgen::Point2 p(it.x3, it.y3);
-                        contour->addEdge(msdfgen::EdgeHolder(lastPoint, c1, c2, p));
-                        lastPoint = p;
-                    }
-                    break;
-
-                case juce::Path::Iterator::closePath:
-                    closeIfOpen();
-                    break;
-            }
-        }
-
-        // Close any trailing subpath that had no explicit closePath marker.
-        closeIfOpen();
-
-        return shape;
-    }
-
     const AtlasEntry* rasterizeGlyph(const GlyphKey& key, const juce::Font& font)
     {
         auto* typeface = key.typeface;
         if (!typeface) return nullptr;
 
-        // Get glyph outline (normalized to height=1.0 by JUCE)
+        // Get glyph outline (normalized to height=1.0 by JUCE). JUCE applies
+        // scale(s, -s) internally → Y is down, matching Vulkan's V-down
+        // texture storage convention so we leave inverseYAxis=false.
         juce::Path glyphPath;
         typeface->getOutlineForGlyph(font.getMetricsKind(), key.glyphId, glyphPath);
         if (glyphPath.isEmpty()) return nullptr;
 
-        auto pathBounds = glyphPath.getBounds();
-        if (pathBounds.isEmpty()) return nullptr;
+        // Delegate the entire MSDF pipeline (path → shape → normalise →
+        // orient → edge-colour → generate → sign-correct → error-correct)
+        // to the shared jvk::msdf module. Config matches the tuned values
+        // we previously baked into this class:
+        //   MSDF_GLYPH_SIZE  → Config::maxDimension
+        //   GLYPH_PADDING    → Config::padding
+        //   MSDF_PIXEL_RANGE → Config::pxRange
+        // Glyphs are always non-zero winding (font standard).
+        msdf::Config cfg;
+        cfg.maxDimension = MSDF_GLYPH_SIZE;
+        cfg.padding      = GLYPH_PADDING;
+        cfg.pxRange      = MSDF_PIXEL_RANGE;
+        cfg.fillRule     = msdf::FillRule::NonZero;
 
-        // Convert JUCE path to msdfgen shape
-        msdfgen::Shape shape = jucePathToShape(glyphPath);
-        if (shape.contours.empty()) return nullptr;
+        auto result = msdf::rasteriseJucePath(glyphPath, cfg);
+        if (!result.valid) return nullptr;
 
-        // JUCE's getOutlineForGlyph applies scale(s, -s) which flips Y.
-        // This makes the Y-down shape coords match Vulkan's V-down texture convention,
-        // so we leave inverseYAxis=false for correct atlas storage order.
-        shape.normalize();
-
-        // Winding normalization. msdfgen's Shape::orientContours() uses a
-        // scanline sampled at ~0.618 of each contour's vertical extent — for
-        // non-convex single-contour glyphs (e.g. the letter 't') that ray can
-        // hit the cross-bar and produce intersections whose dy signs cancel,
-        // leaving the contour unreversed. Those glyphs then render inverted
-        // relative to every other glyph that did get normalized.
-        //
-        // Shoelace-based winding() is robust for any closed polygon, so we
-        // compute a containment depth per contour (how many other contours'
-        // bounding boxes enclose it) and force the expected winding:
-        //   even depth (outer / island)   → CCW (winding = +1)
-        //   odd  depth (hole  / hole-in-) → CW  (winding = -1)
-        // Y-flipped glyph coords from JUCE put "font interior" on the CCW
-        // side, matching the fragment shader's `sd > 0.5` inside convention.
-        {
-            std::vector<msdfgen::Shape::Bounds> bounds;
-            bounds.reserve(shape.contours.size());
-            for (auto& c : shape.contours) {
-                msdfgen::Shape::Bounds b { +INFINITY, +INFINITY, -INFINITY, -INFINITY };
-                c.bound(b.l, b.b, b.r, b.t);
-                bounds.push_back(b);
-            }
-            for (size_t i = 0; i < shape.contours.size(); ++i) {
-                int depth = 0;
-                for (size_t j = 0; j < shape.contours.size(); ++j) {
-                    if (i == j) continue;
-                    const auto& bi = bounds[i];
-                    const auto& bj = bounds[j];
-                    if (bj.l <= bi.l && bj.b <= bi.b && bj.r >= bi.r && bj.t >= bi.t)
-                        ++depth;
-                }
-                const int expected = (depth & 1) ? -1 : +1;
-                if (shape.contours[i].winding() != expected)
-                    shape.contours[i].reverse();
-            }
-        }
-
-        // edgeColoringByDistance picks edge colours so that the three MSDF
-        // channels disagree only in regions where their median still resolves
-        // to the correct distance. edgeColoringSimple can miscolour chains of
-        // short edges around tight interior features (e.g. the counter of
-        // 'e' or the bowl of 'a'), producing pinpoint median inversions.
-        msdfgen::edgeColoringByDistance(shape, 3.0);
-
-        // Compute MSDF dimensions — scale glyph to fit in MSDF_GLYPH_SIZE texels
-        // with padding for the distance field spread
-        float glyphMaxDim = std::max(pathBounds.getWidth(), pathBounds.getHeight());
-        if (glyphMaxDim <= 0) return nullptr;
-
-        // Scale so the glyph fits in (MSDF_GLYPH_SIZE - 2*GLYPH_PADDING) texels
-        int innerSize = MSDF_GLYPH_SIZE - GLYPH_PADDING * 2;
-        double texelScale = static_cast<double>(innerSize) / static_cast<double>(glyphMaxDim);
-
-        // Actual output dimensions based on glyph aspect ratio
-        int msdfW = static_cast<int>(std::ceil(pathBounds.getWidth() * texelScale)) + GLYPH_PADDING * 2;
-        int msdfH = static_cast<int>(std::ceil(pathBounds.getHeight() * texelScale)) + GLYPH_PADDING * 2;
-        msdfW = std::max(msdfW, 4);
-        msdfH = std::max(msdfH, 4);
-
+        int msdfW = result.bitmap.width();
+        int msdfH = result.bitmap.height();
         if (msdfW > ATLAS_SIZE / 2 || msdfH > ATLAS_SIZE / 2) return nullptr;
 
-        // Generate MSDF using msdfgen
-        msdfgen::Bitmap<float, 3> msdf(msdfW, msdfH);
-
-        // Transform: scale glyph coordinates to texel coordinates, with padding offset
-        msdfgen::Vector2 translate(
-            -static_cast<double>(pathBounds.getX()) + GLYPH_PADDING / texelScale,
-            -static_cast<double>(pathBounds.getY()) + GLYPH_PADDING / texelScale);
-
-        // Generate MSDF: Projection maps shape coords -> pixel coords.
-        // Range must be in shape units — convert pixel range by dividing by scale.
-        // msdfgen computes distances in shape space, so Range(px/scale) ensures
-        // MSDF_PIXEL_RANGE pixels of distance map to the full [0,1] output.
-        msdfgen::Projection projection(msdfgen::Vector2(texelScale), translate);
-        double rangeInShapeUnits = MSDF_PIXEL_RANGE / texelScale;
-
-        // Canonical non-Skia pipeline used by msdf-atlas-gen:
-        //
-        //   1. generateMSDF  — distance per pixel, per-contour combiner
-        //   2. distanceSignCorrection — scanline pass under the real non-zero
-        //      fill rule; rewrites the sign of any pixel whose combined-
-        //      contour distance disagrees with the true inside/outside test.
-        //      This is what fixes the pinhole / stripe artifacts inside
-        //      counters of glyphs with overlapping same-winding contours
-        //      (common in sans-serif — the bowls of e/a, the crossbar of A).
-        //   3. msdfErrorCorrection with CHECK_DISTANCE disabled — a fast
-        //      median-coherence pass that cleans up any leftover edge-
-        //      coloring seams without re-running the exact distance solve.
-        //
-        // Step 1's built-in error correction is disabled here so the
-        // scanlinePass (step 2) owns sign correction. Running both would
-        // fight each other — the exact-distance fallback in generateMSDF
-        // can't see overlapping contours as filled.
-        msdfgen::MSDFGeneratorConfig cfg;
-        cfg.errorCorrection.mode = msdfgen::ErrorCorrectionConfig::DISABLED;
-        msdfgen::generateMSDF(msdf, shape, projection, msdfgen::Range(rangeInShapeUnits), cfg);
-
-        msdfgen::distanceSignCorrection(msdf, shape, projection, msdfgen::FILL_NONZERO);
-
-        msdfgen::MSDFGeneratorConfig ecCfg;
-        ecCfg.errorCorrection.distanceCheckMode = msdfgen::ErrorCorrectionConfig::DO_NOT_CHECK_DISTANCE;
-        msdfgen::msdfErrorCorrection(msdf, shape, projection, msdfgen::Range(rangeInShapeUnits), ecCfg);
+        auto pathBounds = result.shapeBounds;
+        auto& msdfBitmap = result.bitmap;
+        double texelScale = result.texelScale;
 
         // Find space in atlas
         auto* page = findSpace(msdfW + 1, msdfH + 1);
@@ -349,7 +178,7 @@ private:
             {
                 // msdfgen output is float [0,1] after normalization
                 // Clamp and convert to 8-bit
-                const float* pixel = msdf(x, y);
+                const float* pixel = msdfBitmap(x, y);
                 auto toU8 = [](float v) -> uint8_t {
                     return static_cast<uint8_t>(juce::jlimit(0.0f, 255.0f, v * 255.0f));
                 };

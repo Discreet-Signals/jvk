@@ -7,6 +7,8 @@ class RenderTarget;
 class EffectPipeline;
 class ShapeBlurPipeline;
 class ShaderPipeline;
+class PathPipeline;
+class ClipPipeline;
 
 // =============================================================================
 // UIVertex — shared vertex format for 2D pipelines
@@ -28,12 +30,14 @@ enum class DrawOp : uint8_t {
     FillRect, FillRectList, FillRoundedRect, FillEllipse,
     StrokeRoundedRect, StrokeEllipse,
     DrawImage, DrawGlyphs, DrawLine,
+    FillPath,           // analytical SDF path fill (vger-style)
     DrawShader,
     EffectBlend,
     EffectResolve,
     EffectKernel,
     BlurShape,
-    PushClipRect, PushClipPath, PopClip,
+    PushClipRect, PopClipRect,      // scissor-only clips (State-side stack)
+    PushClipPath, PopClipPath,      // stencil INCR/DECR via ClipPipeline
     COUNT
 };
 
@@ -129,27 +133,20 @@ public:
     void setShapeResource(VkDescriptorSet shapeSet);
     void setColorResource(VkDescriptorSet colorSet);
     void draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count);
-    // Draw from a pre-uploaded device-local vertex buffer (PathMeshPool) using
-    // firstVertex to select the mesh — no per-path buffer bind. Caller handles
-    // push-constant state (transform, viewport).
-    void drawCached(const DrawCommand& cmd, VkBuffer vbuf,
-                    uint32_t firstVertex, uint32_t vertexCount);
     // Push a payload to the vertex-stage push-constant range at the given
-    // byte offset. Used by stencil pipelines to push the affine transform
-    // alongside the viewport size already written by setPipeline().
+    // byte offset (after the viewport already written by setPipeline()).
     void pushConstants(uint32_t offset, uint32_t size, const void* data);
 
     void pushClipRect(const juce::Rectangle<int>& rect);
-    void pushClipPath(const juce::Path& path, const juce::AffineTransform& transform);
-    void popClip();
+    void pushStencilDepth(); // CPU-only: increment the clip counter used as
+                              // stencil reference for INCR/compare. The GPU
+                              // INCR pass is a separate DrawOp::PushClipPath
+                              // dispatched via ClipPipeline.
+    void popStencilDepth();
+    void popClipRect();
 
     juce::Rectangle<int> clipBounds() const { return currentClipBounds_; }
     uint8_t              stencilDepth() const { return stencilDepth_; }
-
-    // Per-level stencil bit management for even-odd path clipping.
-    // Each nesting level owns one stencil bit (bit N for level N).
-    void setStencilWriteMask(uint32_t mask);
-    void setStencilCompareMask(uint32_t mask);
 
     void invalidate();
     void begin(VkCommandBuffer cmd, Memory::V& vertices, float vpWidth, float vpHeight);
@@ -169,16 +166,12 @@ private:
     juce::Rectangle<int> boundScissor_ { -1, -1, 0, 0 };
     VkBuffer         boundVertexBuffer_ = VK_NULL_HANDLE;
 
-    struct ClipEntry {
-        enum Type { Rect, Path };
-        Type type;
-        juce::Rectangle<int> rect;
-        std::vector<UIVertex> fanVerts;
-        juce::Rectangle<int> fanBounds;
-    };
-    std::vector<ClipEntry> clipStack_;
-    juce::Rectangle<int>   currentClipBounds_;
-    uint8_t stencilDepth_ = 0;
+    // Clip rectangle stack — scissor-based (axis-aligned rect clips). Path
+    // / rrect clips don't use this stack; they're tracked purely via the
+    // stencil buffer + stencilDepth_ counter.
+    std::vector<juce::Rectangle<int>> clipRectStack_;
+    juce::Rectangle<int>              currentClipBounds_;
+    uint8_t                           stencilDepth_ = 0;
 };
 
 // =============================================================================
@@ -222,6 +215,21 @@ public:
     // (g.drawShader). User shaders own their own VkPipeline; this module
     // handles the per-command bind + push-constants + draw.
     void setShaderPipeline(ShaderPipeline* sp) { shaderPipeline_ = sp; }
+
+    // Attach the analytical-SDF path renderer. Used by Graphics::fillPath
+    // to upload flattened path segments and emit DrawOp::FillPath ops.
+    // Owns a storage buffer ring that holds the per-frame segment data —
+    // ALSO shared with the clip-stencil pipelines for DrawOp::PushClipPath
+    // / PopClip of arbitrary paths (they read the same SSBO).
+    void setPathPipeline(PathPipeline* pp) { pathPipeline_ = pp; }
+    PathPipeline* pathPipeline() const { return pathPipeline_; }
+
+    // Attach the clip-stencil pipeline. Owns two VkPipelines sharing one
+    // shader + layout: push variant uses stencilPassOp=INCR_WRAP, pop
+    // variant uses DECR_WRAP. Called for rrect + arbitrary-path clips —
+    // axis-aligned rect clips bypass this via plain scissor.
+    void setClipPipeline(ClipPipeline* p) { clipPipeline_ = p; }
+    ClipPipeline* clipPipeline() const { return clipPipeline_; }
 
     // Capture non-POD types into side vectors. Returns index.
     uint32_t captureFont(const juce::Font& f)     { fonts_.push_back(f); return static_cast<uint32_t>(fonts_.size() - 1); }
@@ -268,9 +276,11 @@ private:
     std::vector<juce::FillType> fills_;
 
     Pipeline* pipelineForOp_[static_cast<size_t>(DrawOp::COUNT)] = {};
-    EffectPipeline*    postProcess_    = nullptr;
-    ShapeBlurPipeline* shapeBlur_      = nullptr;
-    ShaderPipeline*    shaderPipeline_ = nullptr;
+    EffectPipeline*    postProcess_      = nullptr;
+    ShapeBlurPipeline* shapeBlur_        = nullptr;
+    ShaderPipeline*    shaderPipeline_   = nullptr;
+    PathPipeline*      pathPipeline_     = nullptr;
+    ClipPipeline*      clipPipeline_     = nullptr;
     uint64_t frameCounter_ = 0;
 };
 

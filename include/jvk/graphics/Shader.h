@@ -165,17 +165,16 @@ public:
         cb.attachmentCount = 1;
         cb.pAttachments = &blend;
 
-        // Matches ColorPipeline — STENCIL_REFERENCE + COMPARE_MASK are pushed
-        // per-draw by the dispatcher to select the current clip level's bit.
+        // Stencil reference is pushed per-draw (= current clip depth). We
+        // no longer mask bits per-level — stencilCompareMask stays at the
+        // default 0xFF so the EQUAL test checks the full depth counter.
         VkDynamicState dynStates[] = {
             VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
             VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-            VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
-            VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
         };
         VkPipelineDynamicStateCreateInfo dynState {};
         dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 5;
+        dynState.dynamicStateCount = 3;
         dynState.pDynamicStates = dynStates;
 
         // Build two variants sharing one layout: the normal variant for

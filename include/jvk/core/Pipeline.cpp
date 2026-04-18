@@ -219,12 +219,10 @@ VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass render
     VkDynamicState dynamicStates[] = {
         VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
         VK_DYNAMIC_STATE_STENCIL_REFERENCE,
-        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
-        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK
     };
     VkPipelineDynamicStateCreateInfo dynamicState {};
     dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamicState.dynamicStateCount = 5;
+    dynamicState.dynamicStateCount = 3;
     dynamicState.pDynamicStates = dynamicStates;
 
     VkGraphicsPipelineCreateInfo pci {};

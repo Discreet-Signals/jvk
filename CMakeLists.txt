@@ -97,12 +97,14 @@ target_link_libraries(jvk INTERFACE Vulkan::Vulkan)
 set(JVK_SHADER_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ui2d.vert"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ui2d.frag"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/stencil.vert"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/stencil.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/clip.vert"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/clip.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.vert"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shape_blur.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hsv.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/path_sdf.vert"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/path_sdf.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader_region.vert"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/compile.sh"
 )

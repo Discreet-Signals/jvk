@@ -200,67 +200,6 @@ struct CachedBuffer {
 };
 
 // =============================================================================
-// CachedPathMesh — a suballocation inside the shared PathMeshPool buffer.
-// Transform-agnostic local-space verts; the same mesh is reusable under any
-// affine transform (applied in the stencil vertex shader via push constants).
-// =============================================================================
-
-struct CachedPathMesh {
-    uint32_t               firstVertex = 0;  // offset into PathMeshPool, in verts
-    uint32_t               vertexCount = 0;
-    juce::Rectangle<float> localBounds;      // in path-local coords
-};
-
-// =============================================================================
-// PathMeshPool — one big device-local VkBuffer that all cached path meshes
-// suballocate into. Lets us bind the vertex buffer once per frame and use
-// firstVertex to select each path — eliminating per-path vkCmdBindVertexBuffers
-// overhead, which dominates once flatten/upload are cached out.
-//
-// Simple bump allocator. When full, `alloc` returns `ok=false` and the caller
-// falls back to streaming the mesh through the per-frame arena.
-// =============================================================================
-
-class PathMeshPool {
-public:
-    static constexpr VkDeviceSize CAPACITY_BYTES = 64ull * 1024 * 1024; // 64 MB
-    static constexpr uint32_t     VERTEX_STRIDE  = sizeof(UIVertex);
-    static constexpr uint32_t     CAPACITY_VERTS =
-        static_cast<uint32_t>(CAPACITY_BYTES / VERTEX_STRIDE);
-
-    struct Allocation { uint32_t firstVertex = 0; bool ok = false; };
-
-    void init(Device& dev)
-    {
-        if (buffer_.valid()) return;
-        buffer_ = Buffer(dev.pool(), dev.device(), CAPACITY_BYTES,
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    }
-
-    Allocation alloc(uint32_t vertexCount)
-    {
-        if (vertexCount == 0) return { 0, true };
-        if (head_ + vertexCount > CAPACITY_VERTS) return { 0, false };
-        Allocation a { head_, true };
-        head_ += vertexCount;
-        return a;
-    }
-
-    // Reset the bump cursor (caller must also clear the associated cache).
-    // Used when the pool fills up: we purge the mesh cache and start over.
-    void reset() { head_ = 0; }
-
-    VkBuffer     buffer()    const { return buffer_.buffer(); }
-    uint32_t     used()      const { return head_; }
-    uint32_t     capacity()  const { return CAPACITY_VERTS; }
-
-private:
-    Buffer   buffer_;
-    uint32_t head_ = 0;
-};
-
-
-// =============================================================================
 // ResourceCaches — shared across all plugin instances
 // Generic GPU resource caches. Does not know about specific resource types.
 // =============================================================================
@@ -269,23 +208,20 @@ class ResourceCaches {
 public:
     explicit ResourceCaches(Device& dev)
         : device_(dev),
-          textures_(120),
-          pathMeshes_(300)
+          textures_(120)
     {
         createBlackPixel();
         gradientAtlas_.init(dev);
-        pathMeshPool_.init(dev);
     }
 
     ~ResourceCaches() = default;
 
     GradientAtlas&                     gradientAtlas() { return gradientAtlas_; }
     Cache<uint64_t, CachedImage>&      textures()      { return textures_; }
-    Cache<uint64_t, CachedPathMesh>&   pathMeshes()    { return pathMeshes_; }
-    PathMeshPool&                      pathMeshPool()  { return pathMeshPool_; }
 
-    // Stable 64-bit hash of a juce::Path's geometry — same path shape produces
-    // the same key regardless of transform / position.
+    // Stable 64-bit hash of a juce::Path's geometry. Still used by path
+    // de-duplication within the frame (e.g. segment-upload caching) even
+    // though the old path-mesh cache is gone.
     static uint64_t hashPath(const juce::Path& p)
     {
         uint64_t h = 0xcbf29ce484222325ULL;
@@ -314,15 +250,6 @@ public:
         }
         return h;
     }
-
-    // Two-set memory of recently-seen path hashes. A path hash that appears
-    // in `pathHashesPrev_` was seen on the previous frame — promote to the
-    // mesh cache on its second appearance, so one-shot paths never incur
-    // cache-upload cost.
-    bool pathWasSeenLastFrame(uint64_t hash) const {
-        return pathHashesPrev_.count(hash) > 0;
-    }
-    void markPathSeen(uint64_t hash) { pathHashesCurr_.insert(hash); }
 
     VkDescriptorSet getTexture(uint64_t hash, const juce::Image& img)
     {
@@ -395,12 +322,7 @@ public:
     {
         currentFrame_ = frameId;
         textures_.evict(frameId);
-        pathMeshes_.evict(frameId);
         gradientAtlas_.beginFrame();
-        // Rotate path-hash memory: what was seen last frame becomes the
-        // reference for "promote on second sight," current frame starts empty.
-        std::swap(pathHashesPrev_, pathHashesCurr_);
-        pathHashesCurr_.clear();
     }
 
     Device& device() { return device_; }
@@ -409,13 +331,8 @@ private:
     Device& device_;
     GradientAtlas                   gradientAtlas_;
     Cache<uint64_t, CachedImage>    textures_;
-    Cache<uint64_t, CachedPathMesh> pathMeshes_;
-    PathMeshPool                    pathMeshPool_;
     CachedImage                     blackPixel_;
     uint64_t currentFrame_ = 0;
-    // Two-frame hash memory for path-cache promotion heuristic.
-    std::unordered_set<uint64_t> pathHashesPrev_;
-    std::unordered_set<uint64_t> pathHashesCurr_;
 
     void createBlackPixel()
     {

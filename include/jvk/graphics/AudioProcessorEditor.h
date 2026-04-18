@@ -112,6 +112,9 @@ private:
     {
         renderer_->reset();
         device_->caches().beginFrame(frameCounter_++);
+        // Wipe the per-frame segment ring for the analytical-SDF path
+        // renderer before JUCE paint fills it up again.
+        if (pathPipeline_) pathPipeline_->beginFrame();
 
         // Phase 1: Record — JUCE paints, Graphics pushes commands into Renderer
         float scale = getDisplayScale();
@@ -173,14 +176,6 @@ private:
             *device_, spv(vert_spv, vert_spvSize), spv(frag_spv, frag_spvSize));
         renderer_->registerPipeline(*colorPipeline_);
 
-        stencilWritePipeline_ = std::make_unique<pipelines::StencilWritePipeline>(
-            *device_, spv(stencil_vert_spv, stencil_vert_spvSize), spv(stencil_frag_spv, stencil_frag_spvSize));
-        renderer_->registerPipeline(*stencilWritePipeline_);
-
-        stencilCoverPipeline_ = std::make_unique<pipelines::StencilCoverPipeline>(
-            *device_, spv(stencil_vert_spv, stencil_vert_spvSize), spv(stencil_frag_spv, stencil_frag_spvSize));
-        renderer_->registerPipeline(*stencilCoverPipeline_);
-
         blendPipeline_ = std::make_unique<pipelines::BlendPipeline>(
             *device_, spv(vert_spv, vert_spvSize), spv(frag_spv, frag_spvSize));
         renderer_->registerPipeline(*blendPipeline_);
@@ -213,6 +208,27 @@ private:
         shaderPipeline_ = std::make_unique<ShaderPipeline>();
         shaderPipeline_->init(*device_, target_->sceneRenderPassClear());
         renderer_->setShaderPipeline(shaderPipeline_.get());
+
+        // Analytical-SDF path renderer. Owns a per-frame storage-buffer
+        // ring for segment uploads and a fragment shader that walks the
+        // segments per pixel to compute the SDF + winding analytically.
+        pathPipeline_ = std::make_unique<PathPipeline>();
+        pathPipeline_->init(*device_,
+            target_->sceneRenderPassClear(),
+            spv(path_sdf_vert_spv, path_sdf_vert_spvSize),
+            spv(path_sdf_frag_spv, path_sdf_frag_spvSize));
+        renderer_->setPathPipeline(pathPipeline_.get());
+
+        // Clip-stencil pipeline. Shares PathPipeline's segment SSBO for
+        // arbitrary-path clips; rrect clips are purely analytical (no SSBO
+        // read). Owns two VkPipelines — push (INCR_WRAP) and pop (DECR_WRAP)
+        // — sharing one layout and one pair of shader modules.
+        clipPipeline_ = std::make_unique<ClipPipeline>();
+        clipPipeline_->init(*device_,
+            target_->sceneRenderPassClear(),
+            spv(clip_vert_spv, clip_vert_spvSize),
+            spv(clip_frag_spv, clip_frag_spvSize));
+        renderer_->setClipPipeline(clipPipeline_.get());
     }
 
     struct RenderTimer : public juce::Timer {
@@ -241,13 +257,13 @@ private:
     juce::Component metalView_;
 #endif
 
-    std::unique_ptr<pipelines::ColorPipeline>        colorPipeline_;
-    std::unique_ptr<pipelines::StencilWritePipeline>  stencilWritePipeline_;
-    std::unique_ptr<pipelines::StencilCoverPipeline>  stencilCoverPipeline_;
+    std::unique_ptr<pipelines::ColorPipeline>         colorPipeline_;
     std::unique_ptr<pipelines::BlendPipeline>         blendPipeline_;
     std::unique_ptr<EffectPipeline>                   blurEffect_;
     std::unique_ptr<ShapeBlurPipeline>                shapeBlur_;
     std::unique_ptr<ShaderPipeline>                   shaderPipeline_;
+    std::unique_ptr<PathPipeline>                     pathPipeline_;
+    std::unique_ptr<ClipPipeline>                     clipPipeline_;
 
     RenderTimer renderTimer_;
     bool vulkanEnabled_ = true;

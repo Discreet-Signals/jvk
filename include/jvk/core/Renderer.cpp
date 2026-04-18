@@ -105,6 +105,93 @@ void Renderer::execute()
             beginSceneRP(scenePassLoad, currentSceneFB, /*withClears=*/false);
             continue;
         }
+        if (cmd.op == DrawOp::PushClipRect) {
+            // cmd.clipBounds is already the pixel-space intersection of the
+            // new rect and the existing clip stack (computed at record
+            // time in Graphics::clipToRectangle). State tracks this as the
+            // current scissor bounds.
+            state_.pushClipRect(cmd.clipBounds);
+            continue;
+        }
+        if (cmd.op == DrawOp::PopClipRect) {
+            state_.popClipRect();
+            continue;
+        }
+        if (cmd.op == DrawOp::PushClipPath) {
+            // Analytical-SDF clip push — fragment shader discards outside the
+            // clip shape, stencil INCR_WRAP where inside at stencil == parentDepth.
+            if (clipPipeline_ && pathPipeline_) {
+                auto& p = arena_.read<ClipShapeParams>(cmd.dataOffset);
+                ClipPipeline::PushConstants pc {};
+                pc.shapeType    = p.shapeType;
+                pc.centerX      = p.centerX;
+                pc.centerY      = p.centerY;
+                pc.halfW        = p.halfW;
+                pc.halfH        = p.halfH;
+                pc.cornerRadius = p.cornerRadius;
+                pc.segmentStart = p.segmentStart;
+                pc.segmentCount = p.segmentCount;
+                pc.fillRule     = p.fillRule;
+                clipPipeline_->pushClip(state_, frame.cmd, *this, cmd,
+                    pc, p.coverRect,
+                    pathPipeline_->ssboDescriptorSet(),
+                    static_cast<uint32_t>(cmd.stencilDepth),
+                    static_cast<float>(frame.extent.width),
+                    static_cast<float>(frame.extent.height));
+            }
+            state_.pushStencilDepth();
+            continue;
+        }
+        if (cmd.op == DrawOp::PopClipPath) {
+            // Analytical-SDF clip pop — DECR_WRAP at stencil == currentDepth
+            // (before the CPU decrement). cmd.stencilDepth here is the depth
+            // one level DEEPER than parent (i.e. the push's target depth),
+            // so stencil == that value is exactly what the INCR produced.
+            if (clipPipeline_ && pathPipeline_) {
+                auto& p = arena_.read<ClipShapeParams>(cmd.dataOffset);
+                ClipPipeline::PushConstants pc {};
+                pc.shapeType    = p.shapeType;
+                pc.centerX      = p.centerX;
+                pc.centerY      = p.centerY;
+                pc.halfW        = p.halfW;
+                pc.halfH        = p.halfH;
+                pc.cornerRadius = p.cornerRadius;
+                pc.segmentStart = p.segmentStart;
+                pc.segmentCount = p.segmentCount;
+                pc.fillRule     = p.fillRule;
+                clipPipeline_->popClip(state_, frame.cmd, *this, cmd,
+                    pc, p.coverRect,
+                    pathPipeline_->ssboDescriptorSet(),
+                    static_cast<uint32_t>(cmd.stencilDepth),
+                    static_cast<float>(frame.extent.width),
+                    static_cast<float>(frame.extent.height));
+            }
+            state_.popStencilDepth();
+            continue;
+        }
+        if (cmd.op == DrawOp::FillPath) {
+            // Analytical SDF path fill — dispatched via PathPipeline which
+            // owns the segment storage buffer + the SDF fragment shader.
+            // Stays inside the scene render pass (no RP transitions).
+            if (pathPipeline_) {
+                auto& p    = arena_.read<FillPathParams>(cmd.dataOffset);
+                auto& fill = getFill(p.fillIndex);
+                // Colour source descriptor — matches the ColorPipeline pattern
+                // (gradient atlas row for gradient fills, 1x1 default for
+                // solids). path_sdf.frag samples it iff gradientInfo.z > 0.
+                VkDescriptorSet colorDesc =
+                    (fill.isGradient() && fill.gradient)
+                        ? caches().gradientDescriptor()
+                        : caches().defaultDescriptor();
+                pathPipeline_->dispatch(state_, frame.cmd, *this, cmd,
+                    p.quadVerts, 6,
+                    p.segmentStart, p.segmentCount, p.fillRule,
+                    colorDesc,
+                    static_cast<float>(frame.extent.width),
+                    static_cast<float>(frame.extent.height));
+            }
+            continue;
+        }
         if (cmd.op == DrawOp::DrawShader) {
             // DrawShader is a regular scene draw — no render-pass transition.
             // Dispatch updates State's bound pipeline/layout and issues one
@@ -262,11 +349,11 @@ void State::setPipeline(Pipeline* pipeline)
 {
     if (!pipeline) return;
 
-    VkPipeline handle;
-    if (stencilDepth_ > 0)
-        handle = pipeline->clipHandle();
-    else
-        handle = pipeline->handle();
+    // Clip variant of the pipeline has stencilTest on (cmp = EQUAL, ops =
+    // KEEP), reference pushed dynamically below. Non-clip variant has no
+    // stencil test at all — used whenever stencilDepth_ == 0.
+    VkPipeline handle = (stencilDepth_ > 0) ? pipeline->clipHandle()
+                                            : pipeline->handle();
 
     if (handle != boundPipeline_) {
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, handle);
@@ -284,15 +371,11 @@ void State::setPipeline(Pipeline* pipeline)
         vkCmdPushConstants(cmd_, boundLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vpSize), vpSize);
     }
 
-    // Even-odd clip mask in the high nibble — each nested clip level N
-    // owns bit (4 + N). Active mask is ((1 << depth) - 1) << 4, with the
-    // clip test comparing EQUAL. Low nibble is reserved for fillPath's
-    // winding counter and doesn't participate in the comparison.
-    if (stencilDepth_ > 0) {
-        uint32_t mask = (((1u << stencilDepth_) - 1) << 4);
-        vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
-        vkCmdSetStencilReference  (cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
-        boundStencilRef_ = mask;
+    // Stencil reference = clip depth. Every draw op passes only where
+    // stencil == depth (i.e. inside all active clips).
+    if (stencilDepth_ > 0 && stencilDepth_ != boundStencilRef_) {
+        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, stencilDepth_);
+        boundStencilRef_ = stencilDepth_;
     }
 
     currentPipeline_ = pipeline;
@@ -341,42 +424,6 @@ void State::pushConstants(uint32_t offset, uint32_t size, const void* data)
         offset, size, data);
 }
 
-void State::drawCached(const DrawCommand& cmd, VkBuffer vbuf,
-                       uint32_t firstVertex, uint32_t vertexCount)
-{
-    if (vertexCount == 0) return;
-
-    // Scissor — command clip intersected with the current clip-stack bounds.
-    juce::Rectangle<int> clip = cmd.clipBounds;
-    if (!currentClipBounds_.isEmpty())
-        clip = clip.getIntersection(currentClipBounds_);
-
-    if (clip != boundScissor_) {
-        // Clamp each edge against the framebuffer before computing the
-        // extent — otherwise a clip that starts at x<0 would give an offset
-        // of 0 with the full (un-clipped) width, letting draws bleed past
-        // the intended right edge.
-        int x0 = std::max(0, clip.getX());
-        int y0 = std::max(0, clip.getY());
-        int x1 = std::max(x0, clip.getRight());
-        int y1 = std::max(y0, clip.getBottom());
-        VkRect2D sc;
-        sc.offset = { x0, y0 };
-        sc.extent = { static_cast<uint32_t>(x1 - x0),
-                      static_cast<uint32_t>(y1 - y0) };
-        vkCmdSetScissor(cmd_, 0, 1, &sc);
-        boundScissor_ = clip;
-    }
-
-    // One big mesh pool — bind once, then firstVertex picks the subrange.
-    if (vbuf != boundVertexBuffer_) {
-        VkDeviceSize zero = 0;
-        vkCmdBindVertexBuffers(cmd_, 0, 1, &vbuf, &zero);
-        boundVertexBuffer_ = vbuf;
-    }
-    vkCmdDraw(cmd_, vertexCount, 1, firstVertex, 0);
-}
-
 void State::draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count)
 {
     if (count == 0) return;
@@ -387,8 +434,9 @@ void State::draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count)
         clip = clip.getIntersection(currentClipBounds_);
 
     if (clip != boundScissor_) {
-        // See drawCached for why each edge is clamped independently before
-        // subtracting to get the extent.
+        // Clamp each edge to the framebuffer before computing the extent,
+        // so a clip starting off-screen (x<0) doesn't produce an offset of
+        // 0 with the un-clipped width and leak past the right edge.
         int x0 = std::max(0, clip.getX());
         int y0 = std::max(0, clip.getY());
         int x1 = std::max(x0, clip.getRight());
@@ -419,53 +467,30 @@ void State::draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count)
 
 void State::pushClipRect(const juce::Rectangle<int>& rect)
 {
-    ClipEntry entry;
-    entry.type = ClipEntry::Rect;
-    entry.rect = currentClipBounds_.isEmpty() ? rect : currentClipBounds_.getIntersection(rect);
-    clipStack_.push_back(std::move(entry));
-    currentClipBounds_ = clipStack_.back().rect;
+    auto clipped = currentClipBounds_.isEmpty()
+        ? rect
+        : currentClipBounds_.getIntersection(rect);
+    clipRectStack_.push_back(clipped);
+    currentClipBounds_ = clipped;
 }
 
-void State::pushClipPath(const juce::Path& path, const juce::AffineTransform& transform)
+void State::popClipRect()
 {
-    ClipEntry entry;
-    entry.type = ClipEntry::Path;
-    entry.rect = currentClipBounds_;
-    // Stencil write geometry is handled by the stencil pipeline module
-    // during execute() — State just tracks the nesting depth
-    clipStack_.push_back(std::move(entry));
+    if (clipRectStack_.empty()) return;
+    clipRectStack_.pop_back();
+    currentClipBounds_ = clipRectStack_.empty()
+        ? juce::Rectangle<int>{}
+        : clipRectStack_.back();
+}
+
+void State::pushStencilDepth()
+{
     stencilDepth_++;
 }
 
-void State::popClip()
+void State::popStencilDepth()
 {
-    if (clipStack_.empty()) return;
-    auto& top = clipStack_.back();
-    if (top.type == ClipEntry::Path)
-        stencilDepth_--;
-
-    clipStack_.pop_back();
-
-    // Restore clip bounds from remaining stack
-    currentClipBounds_ = {};
-    for (auto& entry : clipStack_) {
-        if (entry.type == ClipEntry::Rect) {
-            if (currentClipBounds_.isEmpty())
-                currentClipBounds_ = entry.rect;
-            else
-                currentClipBounds_ = currentClipBounds_.getIntersection(entry.rect);
-        }
-    }
-}
-
-void State::setStencilWriteMask(uint32_t mask)
-{
-    vkCmdSetStencilWriteMask(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
-}
-
-void State::setStencilCompareMask(uint32_t mask)
-{
-    vkCmdSetStencilCompareMask(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
+    if (stencilDepth_ > 0) stencilDepth_--;
 }
 
 } // namespace jvk

@@ -67,11 +67,10 @@ public:
                                 shader.layout());
 
         if (useClipVariant) {
-            // High-nibble clip mask (bit per nesting level).
-            uint32_t mask = (((1u << stencilDepth) - 1) << 4);
-            vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
-            vkCmdSetStencilReference  (cmd, VK_STENCIL_FACE_FRONT_AND_BACK, mask);
-            vkCmdSetStencilWriteMask  (cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0u);
+            // Stencil reference = current clip depth. compareOp=EQUAL in
+            // the pipeline's clip variant passes only where stencil buffer
+            // == depth, i.e. inside every active clip.
+            vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilDepth);
         }
 
         // Scissor — clip bounds clamped to the framebuffer. Matches the

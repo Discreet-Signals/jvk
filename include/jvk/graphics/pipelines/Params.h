@@ -95,28 +95,60 @@ struct DrawShaderParams {
     float                  scale;
 };
 
+// Analytical SDF path fill. Graphics::fillPath flattens the path to line
+// segments in physical-pixel space, uploads them to PathPipeline's storage
+// buffer ring (via uploadSegments()), and packs the cover-quad vertices +
+// segment range here for later replay. The fragment shader then iterates
+// `segmentCount` segments starting at `segmentStart` in the SSBO.
+//
+// `quadVerts[6]` is a triangle-list quad in physical pixels covering the
+// path bounds + 1 AA pixel. The quad carries the fill colour in vertex
+// attrs. `fillRule` matches juce::Path::isUsingNonZeroWinding() — 0 for
+// non-zero, 1 for even-odd.
+struct FillPathParams {
+    UIVertex quadVerts[6];  // color + gradientInfo pre-baked per corner
+    uint32_t segmentStart;
+    uint32_t segmentCount;
+    uint32_t fillRule;      // 0 = non-zero winding, 1 = even-odd
+    uint32_t fillIndex;     // renderer.getFill() slot → chooses colorLUT descriptor
+};
+
 struct PushClipRectParams {
     juce::Rectangle<int>   rect;
 };
 
-// Forward decl for the cached-mesh fast path.
-struct CachedPathMesh;
-
-struct PushClipPathParams {
-    uint32_t               vertexCount;
-    uint32_t               vertexArenaOffset = 0; // where fan verts live in arena
-                                                  // (ignored when cachedMesh != nullptr)
-    const CachedPathMesh*  cachedMesh = nullptr;  // non-null → bind cached VkBuffer
-    float                  transform[6];          // affine: m00 m10 m01 m11 m02 m12
-    juce::Rectangle<int>   pathBounds;
-};
-
-struct PopClipParams {
-    uint32_t               vertexCount       = 0; // 0 for rect clips
-    uint32_t               vertexArenaOffset = 0; // same fan verts as paired PushClipPath
-    const CachedPathMesh*  cachedMesh        = nullptr;
-    float                  transform[6];          // same transform as paired push
-    juce::Rectangle<int>   fanBounds;
+// Clip shape for the stencil push/pop pipelines. One payload shared by both
+// DrawOp::PushClipPath and DrawOp::PopClip — the shapes must match exactly
+// so the INCR on push and DECR on pop cancel (same fragments touched, same
+// stencil op applied symmetrically).
+//
+// Axis-aligned rectangle clips NEVER appear here — they fast-path through
+// Graphics::clipToRectangle to a plain scissor rect. This payload covers
+// the two stencil-backed cases:
+//
+//   shapeType == 1  Rounded rectangle
+//     centerX/Y + halfW/H + cornerRadius encode the shape in physical
+//     pixels; the clip fragment shader evaluates roundedRectSDF and
+//     discards outside pixels before the stencil op.
+//
+//   shapeType == 2  Arbitrary path
+//     segmentStart/segmentCount index into the shared per-frame segment
+//     SSBO (owned by PathPipeline). fillRule selects non-zero (0) or
+//     even-odd (1) winding; the clip frag shader walks the segments and
+//     computes the winding number per fragment.
+//
+// coverRect is the bounding box + 1px AA margin in physical pixels —
+// emitted as a 6-vertex quad so the clip fragment shader runs for every
+// pixel the shape could occupy.
+struct ClipShapeParams {
+    uint32_t               shapeType;       // 1 = rrect, 2 = path
+    float                  centerX, centerY; // rrect only (physical px)
+    float                  halfW, halfH;     // rrect only (physical px)
+    float                  cornerRadius;     // rrect only (physical px)
+    uint32_t               segmentStart;     // path only
+    uint32_t               segmentCount;     // path only
+    uint32_t               fillRule;         // path only
+    juce::Rectangle<float> coverRect;        // quad to cover in physical px
 };
 
 struct EffectBlendParams {

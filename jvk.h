@@ -66,14 +66,16 @@
 #include "include/jvk/reflect/spirv_reflect.h"
 
 // Graphics — JUCE 2D rendering
+#include "include/jvk/graphics/MSDF.h"
 #include "include/jvk/graphics/GlyphAtlas.h"
 #include "include/jvk/graphics/pipelines/Params.h"
 #include "include/jvk/graphics/pipelines/color/ColorPipeline.h"
 #include "include/jvk/graphics/pipelines/color/ColorDraw.h"
-#include "include/jvk/graphics/pipelines/stencil/StencilPipeline.h"
 #include "include/jvk/graphics/pipelines/blend/BlendPipeline.h"
 #include "include/jvk/graphics/pipelines/effect/EffectPipeline.h"
 #include "include/jvk/graphics/pipelines/effect/ShapeBlurPipeline.h"
+#include "include/jvk/graphics/pipelines/path/PathPipeline.h"
+#include "include/jvk/graphics/pipelines/clip/ClipPipeline.h"
 #include "include/jvk/graphics/Graphics.h"
 #include "include/jvk/graphics/Shader.h"
 #include "include/jvk/graphics/pipelines/shader/ShaderPipeline.h"

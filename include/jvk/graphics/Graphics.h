@@ -134,94 +134,64 @@ public:
             return;
         }
 
+        // Non-rectangular path — use the analytical-SDF clip stencil pipeline.
+        // Flatten the path to line segments, upload to the shared segment
+        // SSBO (same ring PathPipeline owns), emit a PushClipPath op. The
+        // GPU then rasterises the cover quad at replay; surviving fragments
+        // INCR the stencil, and subsequent draws pass only where stencil
+        // == current depth.
+        auto* pp = renderer_.pathPipeline();
+        if (!pp) return; // no path pipeline wired — clip is a no-op
+
         auto& s = state();
+        auto pathBounds = path.getBounds();
+        if (pathBounds.isEmpty()) return;
+
         auto combined = t.followedBy(s.transform).scaled(displayScale_);
 
-        // Pack affine into the 6-float form the stencil shader consumes.
-        // Shader: pos = col0*x + col1*y + col2, where
-        //   col0 = (m00, m10), col1 = (m01, m11), col2 = (m02, m12)
-        float xform[6] = {
-            combined.mat00, combined.mat10,   // col0
-            combined.mat01, combined.mat11,   // col1
-            combined.mat02, combined.mat12,   // col2
-        };
+        scratchSegments_.clear();
+        flattenPathToSegments(path, combined, scratchSegments_);
+        if (scratchSegments_.empty()) return;
 
-        auto& caches = renderer_.caches();
-        uint64_t hash = ResourceCaches::hashPath(path);
-        caches.markPathSeen(hash);
+        uint32_t segStart = pp->uploadSegments(
+            scratchSegments_.data(),
+            static_cast<uint32_t>(scratchSegments_.size()));
+        if (segStart == UINT32_MAX) return; // ring full — drop this clip
 
-        const CachedPathMesh* cached  = caches.pathMeshes().find(hash);
-        uint32_t              vCount  = 0;
-        uint32_t              fanOff  = 0;
-        juce::Rectangle<int>  fanBounds;
+        // Cover rect in physical pixels, expanded by 1 pixel so the clip
+        // fragment shader runs for every pixel the path's SDF could mark
+        // as inside.
+        auto px = pathBounds.transformedBy(combined).expanded(1.0f);
+        int bx  = static_cast<int>(std::floor(px.getX()));
+        int by  = static_cast<int>(std::floor(px.getY()));
+        int bx2 = static_cast<int>(std::ceil(px.getRight()));
+        int by2 = static_cast<int>(std::ceil(px.getBottom()));
+        juce::Rectangle<int>  pathBoundsPx { bx, by, bx2 - bx, by2 - by };
+        juce::Rectangle<float> coverRect { static_cast<float>(bx),
+                                           static_cast<float>(by),
+                                           static_cast<float>(bx2 - bx),
+                                           static_cast<float>(by2 - by) };
 
-        if (cached) {
-            // Cache hit — skip flatten + skip arena push. Bounds come from
-            // the cached local bounds transformed into pixel space.
-            vCount    = cached->vertexCount;
-            fanBounds = cached->localBounds.transformedBy(combined)
-                               .getSmallestIntegerContainer();
-        } else {
-            // Miss — flatten in LOCAL space so the mesh is transform-independent
-            // if we later promote it to the cache.
-            juce::AffineTransform identity;
-            juce::Rectangle<int> localInt;
-            flattenPathToFan(path, identity, scratchFanVerts_, localInt);
-            vCount = static_cast<uint32_t>(scratchFanVerts_.size());
-            fanBounds = juce::Rectangle<float>(localInt.toFloat())
-                               .transformedBy(combined)
-                               .getSmallestIntegerContainer();
+        // Intersect clipBounds BEFORE incrementing stencilDepth — the push
+        // op runs at the current (parent) depth; the pop in restoreState
+        // will run against the new depth.
+        auto outerBounds = s.clipBounds.getIntersection(pathBoundsPx);
 
-            // Push local verts into the arena for this frame's draw.
-            fanOff = renderer_.arena_offset();
-            if (!scratchFanVerts_.empty())
-                renderer_.arena_pushSpan(std::span<const UIVertex>(
-                    scratchFanVerts_.data(), scratchFanVerts_.size()));
+        ClipShapeParams params {};
+        params.shapeType    = 2u; // path
+        params.segmentStart = segStart;
+        params.segmentCount = static_cast<uint32_t>(scratchSegments_.size());
+        params.fillRule     = path.isUsingNonZeroWinding() ? 0u : 1u;
+        params.coverRect    = coverRect;
 
-            // Promote to the mesh cache only on the second sighting — avoids
-            // caching one-shot animated paths whose hash changes each frame.
-            // All cached meshes suballocate into one shared PathMeshPool buffer
-            // so the vertex-buffer bind is amortised across the whole frame.
-            if (caches.pathWasSeenLastFrame(hash) && vCount > 0) {
-                auto slot = caches.pathMeshPool().alloc(vCount);
-                if (slot.ok) {
-                    VkDeviceSize size   = static_cast<VkDeviceSize>(vCount) * sizeof(UIVertex);
-                    VkDeviceSize dstOff = static_cast<VkDeviceSize>(slot.firstVertex) * sizeof(UIVertex);
+        // Remember for the matching pop — same segment range + cover rect
+        // so DECR cancels INCR exactly.
+        s.pathClipStack.push_back(params);
 
-                    auto staging = renderer_.device().staging().alloc(size);
-                    memcpy(staging.mappedPtr, scratchFanVerts_.data(), static_cast<size_t>(size));
-                    renderer_.device().upload(staging, caches.pathMeshPool().buffer(), size, dstOff);
-
-                    CachedPathMesh entry;
-                    entry.firstVertex = slot.firstVertex;
-                    entry.vertexCount = vCount;
-                    entry.localBounds = localInt.toFloat();
-
-                    auto& inserted = caches.pathMeshes().insert(hash, std::move(entry));
-                    cached = &inserted;
-                }
-            }
-        }
-
-        s.clipBounds = s.clipBounds.getIntersection(fanBounds);
-
-        PushClipPathParams params {};
-        params.vertexCount       = vCount;
-        params.vertexArenaOffset = fanOff;
-        params.cachedMesh        = cached;
-        params.pathBounds        = fanBounds;
-        memcpy(params.transform, xform, sizeof(xform));
-        renderer_.push(DrawOp::PushClipPath, s.zOrder, s.clipBounds,
+        renderer_.push(DrawOp::PushClipPath, s.zOrder, outerBounds,
                        s.stencilDepth, s.scopeDepth, params);
 
-        PathClipFan clip;
-        clip.fanBounds      = fanBounds;
-        clip.fanArenaOffset = fanOff;
-        clip.vertexCount    = vCount;
-        clip.cachedMesh     = cached;
-        memcpy(clip.transform, xform, sizeof(xform));
-        s.pathClipStack.push_back(clip);
-
+        s.clipBounds = outerBounds;
         s.stencilDepth++;
         s.scopeDepth++;
     }
@@ -261,11 +231,14 @@ public:
         auto& prev = stateStack_[stateStack_.size() - 2];
         while (old.scopeDepth > prev.scopeDepth) {
             bool isPathClip = old.stencilDepth > prev.stencilDepth;
-            if (isPathClip)
+            if (isPathClip) {
                 recordPopClip();
-            else {
-                renderer_.push(DrawOp::PopClip, old.zOrder, old.clipBounds,
-                               old.stencilDepth, old.scopeDepth, PopClipParams {});
+            } else {
+                // Rect clip — no GPU work, just a CPU-side scissor pop at
+                // replay. Payload is empty; op type conveys the kind.
+                struct Empty {};
+                renderer_.push(DrawOp::PopClipRect, old.zOrder, old.clipBounds,
+                               old.stencilDepth, old.scopeDepth, Empty {});
                 old.scopeDepth--;
             }
         }
@@ -298,14 +271,93 @@ public:
         for (auto& r : list) fillRect(r);
     }
 
+    // Analytical-SDF path fill (vger / Slug-style). CPU flattens the path's
+    // curves to line segments in physical-pixel space, uploads them to
+    // PathPipeline's per-frame storage buffer, and emits a single draw
+    // covering the path's bounds. The fragment shader evaluates the SDF
+    // analytically per pixel — no atlas, no rasterisation preprocessing.
+    //
+    // Colour is sourced the same way as every other 2D op: per-vertex
+    // `color` + `gradientInfo` populated via the shared GradientCtx /
+    // gradientAt() / fillColorAttr helpers from ColorDraw.h. Solid fills
+    // land in `color`; gradient fills set mode=1/2 in `gradientInfo.z` and
+    // the fragment shader samples the gradient atlas row.
     void fillPath(const juce::Path& path, const juce::AffineTransform& t) override
     {
-        if (isClipEmpty()) return;
-        auto bounds = path.getBoundsTransformed(t);
-        saveState();
-        clipToPath(path, t);
-        fillRect(bounds);
-        restoreState();
+        if (isClipEmpty() || path.isEmpty()) return;
+
+        auto* pp = renderer_.pathPipeline();
+        if (!pp) return;
+
+        auto& s = state();
+        auto pathBounds = path.getBounds();
+        if (pathBounds.isEmpty()) return;
+
+        auto combined = t.followedBy(s.transform).scaled(displayScale_);
+
+        scratchSegments_.clear();
+        flattenPathToSegments(path, combined, scratchSegments_);
+        if (scratchSegments_.empty()) return;
+
+        uint32_t segStart = pp->uploadSegments(
+            scratchSegments_.data(),
+            static_cast<uint32_t>(scratchSegments_.size()));
+        if (segStart == UINT32_MAX) return; // ring full — drop this path
+
+        // Path bounds in physical pixels, expanded by 1 pixel for the AA
+        // ramp that smoothstep() kernels around the SDF zero-crossing.
+        auto pxBounds = pathBounds.transformedBy(combined).expanded(1.0f);
+        int bx  = static_cast<int>(std::floor(pxBounds.getX()));
+        int by  = static_cast<int>(std::floor(pxBounds.getY()));
+        int bx2 = static_cast<int>(std::ceil(pxBounds.getRight()));
+        int by2 = static_cast<int>(std::ceil(pxBounds.getBottom()));
+        juce::Rectangle<int> quadPxRect { bx, by, bx2 - bx, by2 - by };
+        auto clipRect = s.clipBounds.getIntersection(quadPxRect);
+        if (clipRect.isEmpty()) return;
+
+        // Register the gradient row up-front so the atlas upload happens in
+        // this frame's staging pass. makeGradientCtx below also registers
+        // idempotently — we mirror the fillRect convention here anyway.
+        if (s.fill.isGradient() && s.fill.gradient)
+            renderer_.caches().registerGradient(*s.fill.gradient);
+
+        // Build the per-vertex colour source the same way ColorDraw's
+        // primitive ops do: solid colour folded into the vertex attribute,
+        // or gradient mode/row packed into gradientInfo via gradientAt().
+        pipelines::GradientCtx grad = pipelines::makeGradientCtx(renderer_, s.fill, combined);
+        glm::vec4 color = pipelines::fillColorAttr(grad, s.fill.colour, s.opacity);
+
+        auto gi = [&](float px, float py) -> glm::vec4 {
+            return grad.active() ? pipelines::gradientAt(grad, px, py)
+                                 : glm::vec4(0.0f);
+        };
+
+        auto mkv = [&](float x, float y) {
+            return UIVertex {
+                glm::vec2 { x, y },
+                color,
+                glm::vec2 { 0.0f, 0.0f },          // uv unused by path_sdf
+                glm::vec4 { 0.0f, 0.0f, 0.0f, 0.0f }, // shapeInfo unused
+                gi(x, y)
+            };
+        };
+        float fbx  = static_cast<float>(bx),  fby  = static_cast<float>(by);
+        float fbx2 = static_cast<float>(bx2), fby2 = static_cast<float>(by2);
+
+        FillPathParams p {};
+        p.quadVerts[0] = mkv(fbx,  fby);
+        p.quadVerts[1] = mkv(fbx2, fby);
+        p.quadVerts[2] = mkv(fbx2, fby2);
+        p.quadVerts[3] = mkv(fbx,  fby);
+        p.quadVerts[4] = mkv(fbx2, fby2);
+        p.quadVerts[5] = mkv(fbx,  fby2);
+        p.segmentStart = segStart;
+        p.segmentCount = static_cast<uint32_t>(scratchSegments_.size());
+        p.fillRule     = path.isUsingNonZeroWinding() ? 0u : 1u;
+        p.fillIndex    = renderer_.captureFill(s.fill);
+
+        renderer_.push(DrawOp::FillPath, s.zOrder, clipRect,
+                       s.stencilDepth, s.scopeDepth, p);
     }
 
     void drawImage(const juce::Image& img, const juce::AffineTransform& t) override
@@ -524,17 +576,6 @@ public:
     Renderer& getRenderer() { return renderer_; }
 
 private:
-    // Per-path-clip fan bookkeeping. Either `cachedMesh` holds a stable GPU
-    // buffer (cache hit / freshly promoted) or `fanArenaOffset` points at the
-    // per-frame arena range from PushClipPath.
-    struct PathClipFan {
-        uint32_t               fanArenaOffset = 0;
-        uint32_t               vertexCount    = 0;
-        const CachedPathMesh*  cachedMesh     = nullptr;
-        float                  transform[6]   = {1,0,0,1,0,0};
-        juce::Rectangle<int>   fanBounds;
-    };
-
     struct RecordState {
         juce::AffineTransform transform;
         juce::FillType        fill { juce::Colours::black };
@@ -544,32 +585,24 @@ private:
         float                 zOrder = 0.0f;
         uint32_t              scopeDepth = 0;
         uint8_t               stencilDepth = 0;
-        std::vector<PathClipFan> pathClipStack;
+        std::vector<ClipShapeParams> pathClipStack;
     };
 
     RecordState& state() { return stateStack_.back(); }
     const RecordState& state() const { return stateStack_.back(); }
 
-    // Record a PopClip for the most recent path clip. Uses the same cached
-    // mesh (or arena vertex range) and transform as the paired PushClipPath —
-    // second INVERT stencil pass toggles the bit back to zero.
+    // Record a PopClip — same ClipShapeParams as the paired PushClipPath so
+    // the DECR_WRAP at the GPU matches the INCR_WRAP exactly. Stencil
+    // reference at replay = stencilDepth BEFORE the pop (current depth),
+    // so the hardware decrements only the pixels the push incremented.
     void recordPopClip()
     {
         auto& s = state();
-        PopClipParams params {};
         if (!s.pathClipStack.empty()) {
-            auto& fan = s.pathClipStack.back();
-            params.vertexCount       = fan.vertexCount;
-            params.vertexArenaOffset = fan.fanArenaOffset;
-            params.cachedMesh        = fan.cachedMesh;
-            memcpy(params.transform, fan.transform, sizeof(fan.transform));
-            params.fanBounds         = fan.fanBounds;
-            renderer_.push(DrawOp::PopClip, s.zOrder, s.clipBounds,
+            ClipShapeParams params = s.pathClipStack.back();
+            renderer_.push(DrawOp::PopClipPath, s.zOrder, s.clipBounds,
                            s.stencilDepth, s.scopeDepth, params);
             s.pathClipStack.pop_back();
-        } else {
-            renderer_.push(DrawOp::PopClip, s.zOrder, s.clipBounds,
-                           s.stencilDepth, s.scopeDepth, params);
         }
         s.scopeDepth--;
         if (s.stencilDepth > 0) s.stencilDepth--;
@@ -626,26 +659,20 @@ private:
                        s.stencilDepth, s.scopeDepth, p);
     }
 
-    // Flatten a path into a triangle fan for stencil rendering.
-    // Uses instance-level scratch buffers — no per-call heap allocations on
-    // the steady state.
-    void flattenPathToFan(const juce::Path& path,
-                          const juce::AffineTransform& combined,
-                          std::vector<UIVertex>& fanVerts,
-                          juce::Rectangle<int>& bounds)
+    // Flatten a path to a flat list of line segments in the supplied
+    // transform's target space, packed as vec4 (p0.xy, p1.xy) ready for the
+    // PathPipeline storage buffer. Shares the same subdivision strategy as
+    // flattenPathToFan but emits segments between consecutive flattened
+    // points (not triangle-fan triples), and skips the orientation
+    // normalisation pass — analytical winding in the fragment shader does
+    // not depend on contour orientation.
+    void flattenPathToSegments(const juce::Path& path,
+                               const juce::AffineTransform& combined,
+                               std::vector<glm::vec4>& segs)
     {
-        fanVerts.clear();
         scratchPoints_.clear();
-        // (scratchSegStack_ cleared per curve below)
-
-        float minX =  std::numeric_limits<float>::max(), minY = minX;
-        float maxX = -std::numeric_limits<float>::max(), maxY = maxX;
-
-        const float SUBPATH_MARKER = -std::numeric_limits<float>::infinity();
         constexpr float flatTol = 0.5f;
-
-        juce::Path::Iterator iter(path);
-        glm::vec2 lastPt(0), subpathStart(0);
+        const float SUBPATH_MARKER = -std::numeric_limits<float>::infinity();
 
         auto transformPt = [&](float x, float y) -> glm::vec2 {
             combined.transformPoint(x, y);
@@ -687,6 +714,9 @@ private:
             flattenCubic(p0, p0 + (2.0f/3.0f)*(c-p0), p2 + (2.0f/3.0f)*(c-p2), p2);
         };
 
+        juce::Path::Iterator iter(path);
+        glm::vec2 lastPt(0), subpathStart(0);
+
         while (iter.next()) {
             switch (iter.elementType) {
                 case juce::Path::Iterator::startNewSubPath: {
@@ -716,126 +746,29 @@ private:
             }
         }
 
-        // Phase 2: orientation normalisation.
-        //
-        // The two-sided INCR/DECR stencil trick computes the true signed
-        // winding number per pixel only when every contour carries the
-        // orientation that matches its containment depth:
-        //   even depth (outer, island nested inside a hole) → CCW
-        //   odd  depth (hole, hole-inside-an-island)        → CW
-        //
-        // SVG author orientation conventions are not enforced anywhere in
-        // the input path — Chrome/Firefox/Skia scanline-fill by counting
-        // edge dy-signs so they don't need this, but a fan emits +1 / -1
-        // triangle contributions and relies on contours being oriented
-        // correctly for the overlaps to cancel. Without this step,
-        // multi-subpath paths (text, SVG logos) accumulate winding where
-        // they shouldn't and the whole bounding box fills in.
-        //
-        // We work in-place over scratchPoints_ using the SUBPATH_MARKER
-        // bookends already inserted in phase 1. For each subpath we
-        // compute the shoelace signed area + axis-aligned bounds, derive
-        // containment depth by bbox nesting against every other subpath,
-        // and reverse the point order for any subpath whose signed-area
-        // sign doesn't match the expected orientation for its depth.
-        scratchSpans_.clear();
-        {
-            size_t i = 0;
-            while (i < scratchPoints_.size()) {
-                if (scratchPoints_[i].x != SUBPATH_MARKER) { ++i; continue; }
-                size_t start = i + 1;
-                size_t end   = start;
-                while (end < scratchPoints_.size() &&
-                       scratchPoints_[end].x != SUBPATH_MARKER)
-                    ++end;
-                if (end > start) {
-                    SpanInfo s { start, end, 0.0f,
-                                 std::numeric_limits<float>::max(),
-                                 std::numeric_limits<float>::max(),
-                                -std::numeric_limits<float>::max(),
-                                -std::numeric_limits<float>::max() };
-                    double area = 0;
-                    size_t n = end - start;
-                    for (size_t k = 0; k < n; ++k) {
-                        auto p  = scratchPoints_[start + k];
-                        auto pn = scratchPoints_[start + ((k + 1) % n)];
-                        area += double(p.x) * pn.y - double(pn.x) * p.y;
-                        s.bl = std::min(s.bl, p.x); s.bt = std::min(s.bt, p.y);
-                        s.br = std::max(s.br, p.x); s.bb = std::max(s.bb, p.y);
-                    }
-                    s.signedArea = static_cast<float>(area * 0.5);
-                    scratchSpans_.push_back(s);
-                }
-                i = end;
-            }
-        }
-
-        // Containment depth: how many other spans' bboxes strictly enclose
-        // this one. Bbox-nesting is cheap and matches font/SVG topology for
-        // the overwhelming common case (letter with holes, ring, nested
-        // island) — it breaks only for self-intersecting contours where
-        // no stencil-fan algorithm can be correct without Skia / Clipper.
-        for (size_t i = 0; i < scratchSpans_.size(); ++i) {
-            int depth = 0;
-            auto& si = scratchSpans_[i];
-            for (size_t j = 0; j < scratchSpans_.size(); ++j) {
-                if (i == j) continue;
-                auto& sj = scratchSpans_[j];
-                if (sj.bl <= si.bl && sj.bt <= si.bt &&
-                    sj.br >= si.br && sj.bb >= si.bb)
-                    ++depth;
-            }
-            // In Y-down screen space a "CCW-as-drawn" contour has negative
-            // shoelace area — we keep that as the outer convention (depth
-            // even) and flip holes to match.
-            bool wantNegative = ((depth & 1) == 0);
-            bool isNegative   = si.signedArea < 0.0f;
-            if (wantNegative != isNegative && si.end > si.start + 1) {
-                std::reverse(scratchPoints_.begin() + static_cast<ptrdiff_t>(si.start),
-                             scratchPoints_.begin() + static_cast<ptrdiff_t>(si.end));
-            }
-        }
-
-        // Phase 3: build triangle fan from the now-orientation-normalised points
-        glm::vec4 dummy(0);
-        glm::vec2 fanCenter(0), prevPt(0);
-        bool inSubpath = false;
-
-        auto updateBounds = [&](float x, float y) {
-            minX = std::min(minX, x); minY = std::min(minY, y);
-            maxX = std::max(maxX, x); maxY = std::max(maxY, y);
-        };
-
-        for (size_t i = 0; i < scratchPoints_.size(); i++) {
+        // Walk the flattened point stream and emit a segment for each
+        // consecutive pair within a subpath. SUBPATH_MARKER breaks the chain
+        // so segments never cross contour boundaries. Zero-length segments
+        // are discarded — they contribute nothing to either distance or
+        // winding and would waste SSBO slots.
+        glm::vec2 prev(0); bool havePrev = false;
+        for (size_t i = 0; i < scratchPoints_.size(); ++i) {
             if (scratchPoints_[i].x == SUBPATH_MARKER) {
-                if (++i >= scratchPoints_.size()) break;
-                fanCenter = scratchPoints_[i]; prevPt = fanCenter;
-                inSubpath = true;
-                updateBounds(fanCenter.x, fanCenter.y);
+                havePrev = false;
                 continue;
             }
-            if (!inSubpath) continue;
-            glm::vec2 pt = scratchPoints_[i];
-            updateBounds(pt.x, pt.y);
-            fanVerts.push_back({ fanCenter, dummy, {}, dummy, dummy });
-            fanVerts.push_back({ prevPt,   dummy, {}, dummy, dummy });
-            fanVerts.push_back({ pt,        dummy, {}, dummy, dummy });
-            prevPt = pt;
-        }
-
-        if (fanVerts.empty()) {
-            bounds = {};
-        } else {
-            // Don't clamp to 0 — local-space meshes are centred at the origin
-            // and have negative coordinates. Clamping here corrupts the cached
-            // localBounds so the transformed scissor cuts the path.
-            int bx = static_cast<int>(std::floor(minX)) - 1;
-            int by = static_cast<int>(std::floor(minY)) - 1;
-            int bx2 = static_cast<int>(std::ceil(maxX)) + 1;
-            int by2 = static_cast<int>(std::ceil(maxY)) + 1;
-            bounds = { bx, by, bx2 - bx, by2 - by };
+            if (!havePrev) {
+                prev = scratchPoints_[i];
+                havePrev = true;
+                continue;
+            }
+            glm::vec2 cur = scratchPoints_[i];
+            if (cur != prev)
+                segs.push_back({ prev.x, prev.y, cur.x, cur.y });
+            prev = cur;
         }
     }
+
 
     Renderer& renderer_;
     float     displayScale_;
@@ -843,17 +776,13 @@ private:
     mutable uint64_t frameId_ = 0;
 
     // Flatten scratch buffers — cleared-but-not-freed between paths so the
-    // hot path is allocation-free after the first frame.
+    // hot path is allocation-free after the first frame. Used by both
+    // Graphics::fillPath (segments → PathPipeline SSBO) and clipToPath
+    // (segments → ClipPipeline via the same shared SSBO).
     struct Seg { glm::vec2 a, b, c, d; };
-    struct SpanInfo {
-        size_t start, end;
-        float  signedArea;
-        float  bl, bt, br, bb;
-    };
-    std::vector<UIVertex>  scratchFanVerts_;
     std::vector<glm::vec2> scratchPoints_;
     std::vector<Seg>       scratchSegStack_;
-    std::vector<SpanInfo>  scratchSpans_;
+    std::vector<glm::vec4> scratchSegments_;
 };
 
 } // namespace jvk

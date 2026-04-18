@@ -14,12 +14,14 @@ fi
 echo "Compiling shaders..."
 $GLSLC -fshader-stage=vert ui2d.vert     -o ui2d.vert.spv
 $GLSLC -fshader-stage=frag ui2d.frag     -o ui2d.frag.spv
-$GLSLC -fshader-stage=vert stencil.vert  -o stencil.vert.spv
-$GLSLC -fshader-stage=frag stencil.frag  -o stencil.frag.spv
 $GLSLC -fshader-stage=frag hsv.frag      -o hsv.frag.spv
 $GLSLC -fshader-stage=vert blur.vert       -o blur.vert.spv
 $GLSLC -fshader-stage=frag blur.frag       -o blur.frag.spv
 $GLSLC -fshader-stage=frag shape_blur.frag -o shape_blur.frag.spv
+$GLSLC -fshader-stage=vert path_sdf.vert   -o path_sdf.vert.spv
+$GLSLC -fshader-stage=frag path_sdf.frag   -o path_sdf.frag.spv
+$GLSLC -fshader-stage=vert clip.vert       -o clip.vert.spv
+$GLSLC -fshader-stage=frag clip.frag       -o clip.frag.spv
 
 echo "Generating UI2DShaders.h..."
 python3 - << 'PYEOF'
@@ -37,12 +39,14 @@ def spv_to_c_array(filepath):
 shaders = [
     ('ui2d.vert.spv', 'vert_spv'),
     ('ui2d.frag.spv', 'frag_spv'),
-    ('stencil.vert.spv', 'stencil_vert_spv'),
-    ('stencil.frag.spv', 'stencil_frag_spv'),
     ('hsv.frag.spv', 'hsv_frag_spv'),
     ('blur.vert.spv', 'blur_vert_spv'),
     ('blur.frag.spv', 'blur_frag_spv'),
     ('shape_blur.frag.spv', 'shape_blur_frag_spv'),
+    ('path_sdf.vert.spv', 'path_sdf_vert_spv'),
+    ('path_sdf.frag.spv', 'path_sdf_frag_spv'),
+    ('clip.vert.spv', 'clip_vert_spv'),
+    ('clip.frag.spv', 'clip_frag_spv'),
 ]
 
 out = """/*
