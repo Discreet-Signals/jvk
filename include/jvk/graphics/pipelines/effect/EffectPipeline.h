@@ -38,12 +38,28 @@ public:
     EffectPipeline(const EffectPipeline&) = delete;
     EffectPipeline& operator=(const EffectPipeline&) = delete;
 
+    // Selects which fragments this pass is allowed to write:
+    //   Inside   (EQUAL    stencil == ref) — real effects. Fragments
+    //                                         outside the active clip
+    //                                         discard; destination keeps
+    //                                         its LOAD contents.
+    //   Outside  (NOT_EQUAL stencil != ref) — the pre-copy. Only the
+    //                                         *outside-clip* pixels are
+    //                                         written with source
+    //                                         passthrough. Inside-clip
+    //                                         pixels are discarded so the
+    //                                         following effect pass can
+    //                                         fill them without overlap.
+    enum class StencilMode { Inside, Outside };
+
     void init(Device& device,
               VkRenderPass compatibleRenderPass,
               std::span<const uint32_t> vertSpv,
-              std::span<const uint32_t> fragSpv)
+              std::span<const uint32_t> fragSpv,
+              StencilMode mode = StencilMode::Inside)
     {
         device_ = &device;
+        stencilMode_ = mode;
         VkDevice d = device.device();
 
         // ---- Pipeline layout: one combined-image-sampler set + PC range
@@ -113,6 +129,22 @@ public:
 
         VkPipelineDepthStencilStateCreateInfo ds {};
         ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        ds.stencilTestEnable = VK_TRUE;
+        // writeMask=0 — effect passes never modify stencil. compareOp flips
+        // between EQUAL (Inside) and NOT_EQUAL (Outside); reference is
+        // always the active clip depth (set dynamically per pass).
+        VkStencilOpState so {};
+        so.failOp      = VK_STENCIL_OP_KEEP;
+        so.passOp      = VK_STENCIL_OP_KEEP;
+        so.depthFailOp = VK_STENCIL_OP_KEEP;
+        so.compareOp   = (mode == StencilMode::Inside)
+                            ? VK_COMPARE_OP_EQUAL
+                            : VK_COMPARE_OP_NOT_EQUAL;
+        so.compareMask = 0xFF;
+        so.writeMask   = 0x00;
+        so.reference   = 0; // dynamic state
+        ds.front = so;
+        ds.back  = so;
 
         VkPipelineColorBlendAttachmentState blend {};
         blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
@@ -124,10 +156,14 @@ public:
         cb.attachmentCount = 1;
         cb.pAttachments = &blend;
 
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+        VkDynamicState dyn[] = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        };
         VkPipelineDynamicStateCreateInfo dynState {};
         dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2;
+        dynState.dynamicStateCount = 3;
         dynState.pDynamicStates = dyn;
 
         VkGraphicsPipelineCreateInfo pci {};
@@ -151,28 +187,33 @@ public:
         vkDestroyShaderModule(d, fragMod, nullptr);
     }
 
-    // Record one blur pass. Begins + ends its own render pass. The caller is
-    // responsible for ensuring `srcDesc` is in SHADER_READ_ONLY_OPTIMAL and
-    // the `dstFramebuffer` attachment is in the correct initial layout for
-    // `dstRenderPass`.
+    // Record one effect pass. Begins + ends its own render pass. The caller
+    // is responsible for pre-copying the source into `dstFramebuffer`'s
+    // color image before a clipped pass (so outside-clip pixels retain the
+    // source contents once the stencil test discards them).
+    //
+    // `stencilRef` selects which clip depth this pass writes at. Pass 0
+    // for unclipped effects (stencil buffer starts at 0 everywhere and the
+    // pre-copy step is skipped anyway).
     void applyPass(VkCommandBuffer cmd,
                    VkDescriptorSet srcDesc,
                    VkFramebuffer   dstFramebuffer,
                    VkRenderPass    dstRenderPass,
                    VkExtent2D      extent,
                    float           dirX, float dirY,
-                   float           radius)
+                   float           radius,
+                   uint32_t        stencilRef = 0)
     {
-        VkClearValue clear {};
-        clear.color = {{ 0.0f, 0.0f, 0.0f, 1.0f }};
-
+        // The effect RP has two attachments (color + depth/stencil), but
+        // both have LOAD_OP_LOAD / LOAD_OP_DONT_CARE on the relevant aspects,
+        // so no clear values are required at begin time.
         VkRenderPassBeginInfo rpbi {};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpbi.renderPass = dstRenderPass;
         rpbi.framebuffer = dstFramebuffer;
         rpbi.renderArea.extent = extent;
-        rpbi.clearValueCount = 1;
-        rpbi.pClearValues = &clear;
+        rpbi.clearValueCount = 0;
+        rpbi.pClearValues = nullptr;
         vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
         VkViewport vp {};
@@ -187,6 +228,7 @@ public:
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
             layout_, 0, 1, &srcDesc, 0, nullptr);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilRef);
 
         PushConstants pc {
             static_cast<float>(extent.width),
@@ -213,9 +255,10 @@ private:
         layout_   = VK_NULL_HANDLE;
     }
 
-    Device*          device_   = nullptr;
-    VkPipelineLayout layout_   = VK_NULL_HANDLE;
-    VkPipeline       pipeline_ = VK_NULL_HANDLE;
+    Device*          device_      = nullptr;
+    VkPipelineLayout layout_      = VK_NULL_HANDLE;
+    VkPipeline       pipeline_    = VK_NULL_HANDLE;
+    StencilMode      stencilMode_ = StencilMode::Inside;
 };
 
 } // namespace jvk

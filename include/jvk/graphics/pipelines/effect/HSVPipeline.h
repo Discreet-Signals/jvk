@@ -115,6 +115,19 @@ public:
 
         VkPipelineDepthStencilStateCreateInfo ds {};
         ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        ds.stencilTestEnable = VK_TRUE;
+        // pass only where stencil == dynamic reference (the active clip depth);
+        // never write stencil from an effect pass.
+        VkStencilOpState so {};
+        so.failOp      = VK_STENCIL_OP_KEEP;
+        so.passOp      = VK_STENCIL_OP_KEEP;
+        so.depthFailOp = VK_STENCIL_OP_KEEP;
+        so.compareOp   = VK_COMPARE_OP_EQUAL;
+        so.compareMask = 0xFF;
+        so.writeMask   = 0x00;
+        so.reference   = 0;
+        ds.front = so;
+        ds.back  = so;
 
         VkPipelineColorBlendAttachmentState blend {};
         blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
@@ -126,10 +139,14 @@ public:
         cb.attachmentCount = 1;
         cb.pAttachments = &blend;
 
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+        VkDynamicState dyn[] = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        };
         VkPipelineDynamicStateCreateInfo dynState {};
         dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2;
+        dynState.dynamicStateCount = 3;
         dynState.pDynamicStates = dyn;
 
         VkGraphicsPipelineCreateInfo pci {};
@@ -161,18 +178,16 @@ public:
                    VkFramebuffer   dstFramebuffer,
                    VkRenderPass    dstRenderPass,
                    VkExtent2D      extent,
-                   const PushConstants& pcData)
+                   const PushConstants& pcData,
+                   uint32_t        stencilRef = 0)
     {
-        VkClearValue clear {};
-        clear.color = {{ 0.0f, 0.0f, 0.0f, 1.0f }};
-
         VkRenderPassBeginInfo rpbi {};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpbi.renderPass = dstRenderPass;
         rpbi.framebuffer = dstFramebuffer;
         rpbi.renderArea.extent = extent;
-        rpbi.clearValueCount = 1;
-        rpbi.pClearValues = &clear;
+        rpbi.clearValueCount = 0;
+        rpbi.pClearValues = nullptr;
         vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
         VkViewport vp {};
@@ -187,6 +202,7 @@ public:
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
             layout_, 0, 1, &srcDesc, 0, nullptr);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilRef);
 
         PushConstants pc = pcData;
         pc.viewportW = static_cast<float>(extent.width);

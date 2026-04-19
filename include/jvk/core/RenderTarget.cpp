@@ -146,38 +146,71 @@ void SwapchainTarget::createRenderPasses()
     sub.pColorAttachments       = &colorRef;
     sub.pDepthStencilAttachment = &depthRef;
 
-    // Two-sided dep: incoming (prior effect's sampler read completes before
-    // we write color) + outgoing (our color write visible to the next effect's
-    // sampler read).
+    // -----------------------------------------------------------------
+    // Scene RP subpass dependencies — CANONICAL form.
     //
-    // dstAccess MUST include both READ and WRITE for the colour and
-    // depth/stencil attachments. LOAD_OP_LOAD reads the attachment at RP
-    // begin — without the READ bit, MoltenVK's tile renderer can execute
-    // that load before the previous effect-pass writes are fully visible,
-    // producing tile-shaped corruption (stale pixels mixed into newly-
-    // written ones).
+    // The scene RP writes BOTH color (fragment draws) and depth/stencil
+    // (path-clip INCR/DECR). Every access type either attachment can see
+    // is listed here so the dependency holds for every combination of
+    // prior/next work: scene→effect→scene, scene→blit, scene→scene (ping-
+    // pong with no effect in between). Missing any one stage or access
+    // bit on a tile renderer (MoltenVK on Apple Silicon) causes
+    // rectangular-tile corruption because the tile writeback from the
+    // prior RP races with this RP's LOAD_OP_LOAD of the same image.
+    // -----------------------------------------------------------------
+
+    // deps[0] — EXTERNAL → this subpass. What must complete before I run.
+    //
+    //   Prior color writes (scene draws, effect passes)
+    //   Prior depth/stencil writes (path clips in an earlier scene RP)
+    //   Prior sampler reads (an effect that sampled my attachments)
+    //   Prior transfer reads (a blit that read my attachments)
+    //
+    //   I access color + depth/stencil at COLOR_OUTPUT and EARLY/LATE
+    //   fragment tests. LOAD_OP_LOAD reads each attachment at RP begin,
+    //   so ATTACHMENT_READ is required on top of ATTACHMENT_WRITE.
     VkSubpassDependency deps[2] {};
     deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
     deps[0].dstSubpass    = 0;
-    deps[0].srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                          | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                          | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                          | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                          | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                          | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                          | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                          | VK_ACCESS_SHADER_READ_BIT
+                          | VK_ACCESS_TRANSFER_READ_BIT;
     deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
                           | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
                           | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT
-                          | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
                           | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
                           | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
                           | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    deps[1].srcSubpass    = 0;
-    deps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
-    deps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[1].dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                          | VK_PIPELINE_STAGE_TRANSFER_BIT;
-    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT
-                          | VK_ACCESS_TRANSFER_READ_BIT;
+
+    // deps[1] — this subpass → EXTERNAL. What my work makes available.
+    //
+    //   My color writes → next scene LOAD, next effect sampling, final blit
+    //   My depth/stencil writes → next scene LOAD (stencil test)
+    VkSubpassDependency& out = deps[1];
+    out.srcSubpass    = 0;
+    out.dstSubpass    = VK_SUBPASS_EXTERNAL;
+    out.srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                      | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                      | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    out.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                      | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    out.dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                      | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                      | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                      | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                      | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    out.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                      | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                      | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                      | VK_ACCESS_SHADER_READ_BIT
+                      | VK_ACCESS_TRANSFER_READ_BIT;
 
     VkRenderPassCreateInfo rpci {};
     rpci.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -204,43 +237,93 @@ void SwapchainTarget::createRenderPasses()
     sceneAtts[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     vkCreateRenderPass(d, &rpci, nullptr, &sceneRPLoad_);
 
-    // ---- Effect render pass (1 attachment, sample src → write dst) ----
-    VkAttachmentDescription effectAtt {};
-    effectAtt.format         = format_;
-    effectAtt.samples        = VK_SAMPLE_COUNT_1_BIT;
-    effectAtt.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    effectAtt.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-    effectAtt.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    effectAtt.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    effectAtt.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-    effectAtt.finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    // ---- Effect render pass (color + depth/stencil) ------------------
+    //
+    // The effect pass carries the shared depth/stencil image so effect
+    // pipelines can stencil-test against the current clip state. Stencil
+    // is READ (LOAD) but never written (writeMask=0 in pipelines).
+    //
+    // Color's loadOp is LOAD so pixels outside the clip retain whatever
+    // Renderer::execute pre-copied into the destination. Without the
+    // pre-copy, a clipped effect pass would leave outside-clip pixels
+    // holding whatever was in the destination before (prior frame's
+    // content), which is garbage.
+    //
+    // Stencil's storeOp is STORE — the effect doesn't modify stencil but
+    // its contents must remain valid for the NEXT scene RP's LOAD.
+    VkAttachmentDescription effectAtts[2] {};
+
+    // Color
+    effectAtts[0].format         = format_;
+    effectAtts[0].samples        = VK_SAMPLE_COUNT_1_BIT;
+    effectAtts[0].loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
+    effectAtts[0].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+    effectAtts[0].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    effectAtts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    effectAtts[0].initialLayout  = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    effectAtts[0].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    // Depth/stencil (shared image — same one the scene RPs use).
+    effectAtts[1].format         = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    effectAtts[1].samples        = VK_SAMPLE_COUNT_1_BIT;
+    effectAtts[1].loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE; // depth unused
+    effectAtts[1].storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    effectAtts[1].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_LOAD;
+    effectAtts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    effectAtts[1].initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    effectAtts[1].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkAttachmentReference effectColorRef = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference effectDSRef    = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
     VkSubpassDescription effectSub {};
-    effectSub.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    effectSub.colorAttachmentCount = 1;
-    effectSub.pColorAttachments    = &effectColorRef;
+    effectSub.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    effectSub.colorAttachmentCount    = 1;
+    effectSub.pColorAttachments       = &effectColorRef;
+    effectSub.pDepthStencilAttachment = &effectDSRef;
 
+    // -----------------------------------------------------------------
+    // Effect RP subpass dependencies — CANONICAL form.
+    //
+    // The effect pass samples a color input (set=0) and writes the color
+    // attachment. It stencil-TESTS against the shared DS attachment but
+    // never writes to it. Still, the DS attachment's LOAD happens at
+    // EARLY_FRAGMENT_TESTS and must wait for the prior scene RP's
+    // stencil writes.
+    // -----------------------------------------------------------------
     VkSubpassDependency effectDeps[2] {};
     effectDeps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
     effectDeps[0].dstSubpass    = 0;
-    effectDeps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    effectDeps[0].dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    effectDeps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    effectDeps[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    effectDeps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                                | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    effectDeps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                | VK_ACCESS_SHADER_READ_BIT
+                                | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    effectDeps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                                | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    effectDeps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                                | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                | VK_ACCESS_SHADER_READ_BIT
+                                | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
     effectDeps[1].srcSubpass    = 0;
     effectDeps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
     effectDeps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    effectDeps[1].dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                                | VK_PIPELINE_STAGE_TRANSFER_BIT;
     effectDeps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    effectDeps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+    effectDeps[1].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                                | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                                | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    effectDeps[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                                | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                                | VK_ACCESS_SHADER_READ_BIT
+                                | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
                                 | VK_ACCESS_TRANSFER_READ_BIT;
 
     VkRenderPassCreateInfo effectRPCI {};
     effectRPCI.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    effectRPCI.attachmentCount = 1;
-    effectRPCI.pAttachments    = &effectAtt;
+    effectRPCI.attachmentCount = 2;
+    effectRPCI.pAttachments    = effectAtts;
     effectRPCI.subpassCount    = 1;
     effectRPCI.pSubpasses      = &effectSub;
     effectRPCI.dependencyCount = 2;
@@ -283,12 +366,17 @@ void SwapchainTarget::createSceneBuffers()
         fci.pAttachments = viewsB;
         vkCreateFramebuffer(d, &fci, nullptr, &sb.framebufferB);
 
-        // Effect framebuffers (1 color attachment). When writing to A we
-        // sample from B, and vice versa.
-        VkImageView effA[1] = { sb.colorA.view() };
-        VkImageView effB[1] = { sb.colorB.view() };
+        // Effect framebuffers now also carry the shared depth/stencil
+        // image — effect pipelines stencil-test against the active clip
+        // state so effects inside a clipToPath/Rectangle are clipped to
+        // that region (the shader writes only where stencil == depth;
+        // outside fragments discard and preserve the destination's LOAD
+        // contents, which Renderer::execute pre-copies from the source
+        // before clipped effects).
+        VkImageView effA[2] = { sb.colorA.view(), sb.depthStencil.view() };
+        VkImageView effB[2] = { sb.colorB.view(), sb.depthStencil.view() };
         fci.renderPass = effectRP_;
-        fci.attachmentCount = 1;
+        fci.attachmentCount = 2;
         fci.pAttachments = effA;
         vkCreateFramebuffer(d, &fci, nullptr, &sb.effectFBtoA);
         fci.pAttachments = effB;

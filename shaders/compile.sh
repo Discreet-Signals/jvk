@@ -22,6 +22,7 @@ $GLSLC -fshader-stage=vert path_sdf.vert   -o path_sdf.vert.spv
 $GLSLC -fshader-stage=frag path_sdf.frag   -o path_sdf.frag.spv
 $GLSLC -fshader-stage=vert clip.vert       -o clip.vert.spv
 $GLSLC -fshader-stage=frag clip.frag       -o clip.frag.spv
+$GLSLC -fshader-stage=frag copy.frag       -o copy.frag.spv
 
 echo "Generating UI2DShaders.h..."
 python3 - << 'PYEOF'
@@ -47,6 +48,7 @@ shaders = [
     ('path_sdf.frag.spv', 'path_sdf_frag_spv'),
     ('clip.vert.spv', 'clip_vert_spv'),
     ('clip.frag.spv', 'clip_frag_spv'),
+    ('copy.frag.spv', 'copy_frag_spv'),
 ]
 
 out = """/*

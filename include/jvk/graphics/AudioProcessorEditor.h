@@ -182,13 +182,28 @@ private:
 
         // Generic post-process pipeline. Runs any single-input fullscreen
         // fragment shader as an intra-frame effect. Configured here for
-        // separable Gaussian blur.
+        // separable Gaussian blur (StencilMode::Inside — writes only
+        // inside the active clip).
         blurEffect_ = std::make_unique<EffectPipeline>();
         blurEffect_->init(*device_,
             target_->effectRenderPass(),
             spv(blur_vert_spv, blur_vert_spvSize),
-            spv(blur_frag_spv, blur_frag_spvSize));
+            spv(blur_frag_spv, blur_frag_spvSize),
+            EffectPipeline::StencilMode::Inside);
         renderer_->setPostProcess(blurEffect_.get());
+
+        // Pre-copy pipeline for clipped effects. Same vertex shader as blur;
+        // the frag just samples the source texture verbatim. StencilMode::
+        // Outside means the pass writes ONLY the pixels outside the active
+        // clip — the immediately-following effect pass then fills the inside.
+        // Together the two passes cover every destination pixel exactly once.
+        copyEffect_ = std::make_unique<EffectPipeline>();
+        copyEffect_->init(*device_,
+            target_->effectRenderPass(),
+            spv(blur_vert_spv, blur_vert_spvSize),
+            spv(copy_frag_spv, copy_frag_spvSize),
+            EffectPipeline::StencilMode::Outside);
+        renderer_->setCopyEffect(copyEffect_.get());
 
         // HSV transform pipeline — one shader, covers every HSV-space
         // operation (saturate, shift hue, lift value, tint-like effects)
@@ -271,6 +286,7 @@ private:
     std::unique_ptr<pipelines::ColorPipeline>         colorPipeline_;
     std::unique_ptr<pipelines::BlendPipeline>         blendPipeline_;
     std::unique_ptr<EffectPipeline>                   blurEffect_;
+    std::unique_ptr<EffectPipeline>                   copyEffect_;
     std::unique_ptr<HSVPipeline>                      hsvPipeline_;
     std::unique_ptr<ShapeBlurPipeline>                shapeBlur_;
     std::unique_ptr<ShaderPipeline>                   shaderPipeline_;

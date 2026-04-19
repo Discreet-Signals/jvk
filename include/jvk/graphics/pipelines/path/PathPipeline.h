@@ -46,6 +46,13 @@ public:
     // bytes (vec4: p0.xy, p1.xy), so 256 KB starts us at 16,384 segments.
     static constexpr VkDeviceSize INITIAL_BUFFER_BYTES = 256 * 1024;
     static constexpr uint32_t     SEGMENT_STRIDE       = 16; // sizeof(vec4)
+    // One SSBO per in-flight frame slot. The fence wait in Renderer's
+    // execute only guarantees THIS slot's previous use is done (2 frames
+    // ago); the OTHER slot's use (1 frame ago) may still be reading its
+    // buffer on the GPU. A shared SSBO would race whenever sub-60 fps
+    // lets frame N-1 overlap with frame N's flushToGPU — manifests as
+    // tile-shaped path corruption on large windows.
+    static constexpr int          MAX_FRAMES           = 2;
 
     PathPipeline() = default;
     ~PathPipeline() { destroy(); }
@@ -81,24 +88,27 @@ public:
         dli.pBindings = &ssboBinding;
         vkCreateDescriptorSetLayout(d, &dli, nullptr, &ssboSetLayout_);
 
-        // --- Descriptor pool + set (1 SSBO, allocated once) --------------
+        // --- Descriptor pool + sets (one SSBO descriptor per frame slot)
         VkDescriptorPoolSize poolSize {};
         poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSize.descriptorCount = 1;
+        poolSize.descriptorCount = MAX_FRAMES;
 
         VkDescriptorPoolCreateInfo dpi {};
         dpi.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dpi.maxSets = 1;
+        dpi.maxSets = MAX_FRAMES;
         dpi.poolSizeCount = 1;
         dpi.pPoolSizes = &poolSize;
         vkCreateDescriptorPool(d, &dpi, nullptr, &descPool_);
 
+        VkDescriptorSetLayout setLayoutsPerSlot[MAX_FRAMES];
+        for (int i = 0; i < MAX_FRAMES; i++) setLayoutsPerSlot[i] = ssboSetLayout_;
+
         VkDescriptorSetAllocateInfo ai {};
         ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         ai.descriptorPool = descPool_;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts = &ssboSetLayout_;
-        vkAllocateDescriptorSets(d, &ai, &ssboDescSet_);
+        ai.descriptorSetCount = MAX_FRAMES;
+        ai.pSetLayouts = setLayoutsPerSlot;
+        vkAllocateDescriptorSets(d, &ai, ssboDescSets_);
 
         // --- Pipeline layout (2 sets + push constants) -------------------
         VkPushConstantRange pcRange {};
@@ -116,8 +126,11 @@ public:
         pli.pPushConstantRanges = &pcRange;
         vkCreatePipelineLayout(d, &pli, nullptr, &layout_);
 
-        // --- Persistent-mapped host-visible storage buffer ---------------
-        createStorageBuffer();
+        // --- Persistent-mapped host-visible storage buffers (one per slot).
+        for (int i = 0; i < MAX_FRAMES; i++) {
+            allocateBuffer(i, INITIAL_BUFFER_BYTES);
+            writeDescriptor(i);
+        }
 
         // --- Build the VkPipeline ----------------------------------------
         pipeline_ = buildPipeline(sceneRenderPass, vertSpv, fragSpv);
@@ -127,16 +140,19 @@ public:
 
     // Called once per frame BEFORE record phase — clears the CPU-side
     // segment staging buffer. Record-time `uploadSegments` appends here,
-    // then `flushToGPU` (called inside Renderer::execute after the frame
-    // fence wait) memcpys the whole staging buffer into the mapped SSBO.
+    // then `flushToGPU(frameSlot)` (called inside Renderer::execute after
+    // the frame fence wait) memcpys the staging buffer into that slot's
+    // mapped SSBO.
     //
-    // Why the CPU side: record phase runs in the JUCE paint tree before
-    // the frame fence is waited on. Writing directly into a single
-    // persistent-mapped SSBO during record would race with the previous
-    // frame's GPU reads (MoltenVK on Apple Silicon shows it as horizontal
-    // streaks of stale segments bleeding into new paths). Staging on the
-    // CPU and flushing once after the fence wait eliminates the hazard
-    // without needing per-frame-slot SSBOs.
+    // Why CPU staging: record runs before the frame fence wait. Writing
+    // directly into a persistent-mapped SSBO during record would race with
+    // the previous frame's GPU reads. CPU-staging defers the GPU-visible
+    // write until after the fence wait.
+    //
+    // Why per-slot SSBOs: the fence wait only guarantees THIS slot's
+    // previous use is done (N-2 frames ago). The OTHER slot's use (N-1)
+    // may still be reading its SSBO on the GPU. A single shared SSBO
+    // races when sub-60 fps lets frame N-1 overlap with frame N's flush.
     void beginFrame() { cpuSegments_.clear(); }
 
     // Append `count` segments (16 bytes each: vec4 p0.xy,p1.xy) to the
@@ -154,18 +170,22 @@ public:
     }
 
     // Called at the top of Renderer::execute (after target_.beginFrame's
-    // fence wait) to push the CPU-staged segments into the mapped SSBO.
-    // If the CPU buffer outgrew the SSBO this frame, we resize the SSBO
-    // (destroy + recreate + rewire the descriptor) before the memcpy.
-    // Safe to destroy because the frame-fence wait above guarantees the
-    // GPU is done reading the previous copy of this buffer.
-    void flushToGPU()
+    // fence wait) to push the CPU-staged segments into the slot's mapped
+    // SSBO. Sets `currentFrameSlot_` as a side effect so subsequent
+    // ssboDescriptorSet() calls return this slot's descriptor.
+    //
+    // If the slot's SSBO is too small, it's grown (destroy + recreate +
+    // rewire the descriptor) — safe because the fence wait above
+    // guarantees THIS slot's previous GPU use is done. The OTHER slot's
+    // buffer is untouched.
+    void flushToGPU(int frameSlot)
     {
+        currentFrameSlot_ = frameSlot;
         if (cpuSegments_.empty()) return;
-        if (cpuSegments_.size() > static_cast<size_t>(bufferCapacity_))
-            growStorageBuffer(cpuSegments_.size());
-        if (mappedPtr_)
-            memcpy(mappedPtr_, cpuSegments_.data(), cpuSegments_.size());
+        if (cpuSegments_.size() > static_cast<size_t>(bufferCapacity_[frameSlot]))
+            growStorageBuffer(frameSlot, cpuSegments_.size());
+        if (mappedPtrs_[frameSlot])
+            memcpy(mappedPtrs_[frameSlot], cpuSegments_.data(), cpuSegments_.size());
     }
 
     // Dispatch a single FillPath draw inside the active scene render pass.
@@ -208,11 +228,11 @@ public:
         // the descriptor and future color ops don't re-bind redundantly).
         state.setColorResource(colorDesc);
 
-        // Set 1 — segments SSBO. Our own descriptor; State doesn't track
-        // it, so bind it directly. The handle is stable for the lifetime
-        // of this pipeline, so this is just a Vulkan-level "use my SSBO".
+        // Set 1 — segments SSBO for the CURRENT frame slot (set by the
+        // most recent flushToGPU). State doesn't track this descriptor,
+        // so bind it directly.
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            layout_, 1, 1, &ssboDescSet_, 0, nullptr);
+            layout_, 1, 1, &ssboDescSets_[currentFrameSlot_], 0, nullptr);
 
         // Push constants — viewport + segment range + fill rule.
         PushConstants pc {};
@@ -236,7 +256,10 @@ public:
         state.invalidate();
     }
 
-    VkDescriptorSet ssboDescriptorSet() const { return ssboDescSet_; }
+    // Returns the SSBO descriptor set for the CURRENT frame slot (set by
+    // the most recent flushToGPU). Used by ClipPipeline's push/pop dispatch
+    // which shares this buffer for path-clip segment reads.
+    VkDescriptorSet ssboDescriptorSet() const { return ssboDescSets_[currentFrameSlot_]; }
 
 private:
     struct PushConstants {
@@ -247,33 +270,32 @@ private:
         float    _pad;
     };
 
-    void createStorageBuffer()
+    // Grow one slot's SSBO to fit `neededBytes` (doubling). Only the
+    // current slot is resized; the OTHER slot's buffer may still be in
+    // flight on the GPU and is left alone (it'll grow when its next
+    // flushToGPU happens, by which time its fence has been waited on).
+    void growStorageBuffer(int frameSlot, size_t neededBytes)
     {
-        allocateBuffer(INITIAL_BUFFER_BYTES);
-        writeDescriptor();
-    }
-
-    // Recreate the SSBO at a capacity that fits `neededBytes` (doubling
-    // from the current capacity so we don't thrash). Safe because this is
-    // only ever called from flushToGPU, which runs after the frame fence
-    // wait — no GPU access to the old buffer can be in flight.
-    void growStorageBuffer(size_t neededBytes)
-    {
-        VkDeviceSize newCap = bufferCapacity_;
+        VkDeviceSize newCap = bufferCapacity_[frameSlot];
         while (static_cast<size_t>(newCap) < neededBytes) newCap *= 2;
 
         VkDevice d = device_->device();
-        if (mappedPtr_) { vkUnmapMemory(d, storageMemory_); mappedPtr_ = nullptr; }
-        if (storageBuffer_ != VK_NULL_HANDLE) vkDestroyBuffer(d, storageBuffer_, nullptr);
-        if (storageMemory_ != VK_NULL_HANDLE) vkFreeMemory(d, storageMemory_, nullptr);
-        storageBuffer_ = VK_NULL_HANDLE;
-        storageMemory_ = VK_NULL_HANDLE;
+        if (mappedPtrs_[frameSlot]) {
+            vkUnmapMemory(d, storageMemory_[frameSlot]);
+            mappedPtrs_[frameSlot] = nullptr;
+        }
+        if (storageBuffer_[frameSlot] != VK_NULL_HANDLE)
+            vkDestroyBuffer(d, storageBuffer_[frameSlot], nullptr);
+        if (storageMemory_[frameSlot] != VK_NULL_HANDLE)
+            vkFreeMemory(d, storageMemory_[frameSlot], nullptr);
+        storageBuffer_[frameSlot] = VK_NULL_HANDLE;
+        storageMemory_[frameSlot] = VK_NULL_HANDLE;
 
-        allocateBuffer(newCap);
-        writeDescriptor();
+        allocateBuffer(frameSlot, newCap);
+        writeDescriptor(frameSlot);
     }
 
-    void allocateBuffer(VkDeviceSize capacityBytes)
+    void allocateBuffer(int frameSlot, VkDeviceSize capacityBytes)
     {
         VkDevice d = device_->device();
 
@@ -282,10 +304,10 @@ private:
         bci.size = capacityBytes;
         bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        vkCreateBuffer(d, &bci, nullptr, &storageBuffer_);
+        vkCreateBuffer(d, &bci, nullptr, &storageBuffer_[frameSlot]);
 
         VkMemoryRequirements mr;
-        vkGetBufferMemoryRequirements(d, storageBuffer_, &mr);
+        vkGetBufferMemoryRequirements(d, storageBuffer_[frameSlot], &mr);
 
         // Host-visible + coherent so CPU writes are immediately visible to
         // GPU without vkFlushMappedMemoryRanges bookkeeping.
@@ -295,27 +317,28 @@ private:
         mi.memoryTypeIndex = Memory::findMemoryType(device_->physicalDevice(),
             mr.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkAllocateMemory(d, &mi, nullptr, &storageMemory_);
-        vkBindBufferMemory(d, storageBuffer_, storageMemory_, 0);
-        vkMapMemory(d, storageMemory_, 0, VK_WHOLE_SIZE, 0, &mappedPtr_);
-        bufferCapacity_ = capacityBytes;
+        vkAllocateMemory(d, &mi, nullptr, &storageMemory_[frameSlot]);
+        vkBindBufferMemory(d, storageBuffer_[frameSlot], storageMemory_[frameSlot], 0);
+        vkMapMemory(d, storageMemory_[frameSlot], 0, VK_WHOLE_SIZE, 0,
+                    &mappedPtrs_[frameSlot]);
+        bufferCapacity_[frameSlot] = capacityBytes;
     }
 
-    void writeDescriptor()
+    void writeDescriptor(int frameSlot)
     {
         VkDevice d = device_->device();
 
-        // (Re)wire the current storage buffer into the descriptor set.
+        // (Re)wire the slot's storage buffer into its own descriptor set.
         // Called on initial allocation AND after each grow — descriptors
         // targeting the old buffer become invalid when it's destroyed.
         VkDescriptorBufferInfo dbi {};
-        dbi.buffer = storageBuffer_;
+        dbi.buffer = storageBuffer_[frameSlot];
         dbi.offset = 0;
         dbi.range  = VK_WHOLE_SIZE;
 
         VkWriteDescriptorSet write {};
         write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = ssboDescSet_;
+        write.dstSet = ssboDescSets_[frameSlot];
         write.dstBinding = 0;
         write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         write.descriptorCount = 1;
@@ -447,25 +470,31 @@ private:
         if (layout_         != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
         if (ssboSetLayout_  != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(d, ssboSetLayout_, nullptr);
         if (descPool_       != VK_NULL_HANDLE) vkDestroyDescriptorPool(d, descPool_, nullptr);
-        if (storageBuffer_  != VK_NULL_HANDLE) vkDestroyBuffer(d, storageBuffer_, nullptr);
-        if (storageMemory_  != VK_NULL_HANDLE) {
-            if (mappedPtr_) vkUnmapMemory(d, storageMemory_);
-            vkFreeMemory(d, storageMemory_, nullptr);
+        for (int i = 0; i < MAX_FRAMES; i++) {
+            if (mappedPtrs_[i]) {
+                vkUnmapMemory(d, storageMemory_[i]);
+                mappedPtrs_[i] = nullptr;
+            }
+            if (storageBuffer_[i] != VK_NULL_HANDLE)
+                vkDestroyBuffer(d, storageBuffer_[i], nullptr);
+            if (storageMemory_[i] != VK_NULL_HANDLE)
+                vkFreeMemory(d, storageMemory_[i], nullptr);
         }
         device_ = nullptr;
     }
 
-    Device*               device_        = nullptr;
-    VkPipelineLayout      layout_        = VK_NULL_HANDLE;
-    VkPipeline            pipeline_      = VK_NULL_HANDLE;
-    VkDescriptorSetLayout ssboSetLayout_ = VK_NULL_HANDLE;
-    VkDescriptorPool      descPool_      = VK_NULL_HANDLE;
-    VkDescriptorSet       ssboDescSet_   = VK_NULL_HANDLE;
-    VkBuffer              storageBuffer_  = VK_NULL_HANDLE;
-    VkDeviceMemory        storageMemory_  = VK_NULL_HANDLE;
-    void*                 mappedPtr_      = nullptr;
-    VkDeviceSize          bufferCapacity_ = 0;   // current SSBO size in bytes
-    std::vector<uint8_t>  cpuSegments_;          // record-phase staging; flushed at execute start
+    Device*               device_            = nullptr;
+    VkPipelineLayout      layout_            = VK_NULL_HANDLE;
+    VkPipeline            pipeline_          = VK_NULL_HANDLE;
+    VkDescriptorSetLayout ssboSetLayout_     = VK_NULL_HANDLE;
+    VkDescriptorPool      descPool_          = VK_NULL_HANDLE;
+    VkDescriptorSet       ssboDescSets_[MAX_FRAMES]  {};
+    VkBuffer              storageBuffer_[MAX_FRAMES] {};
+    VkDeviceMemory        storageMemory_[MAX_FRAMES] {};
+    void*                 mappedPtrs_[MAX_FRAMES]    {};
+    VkDeviceSize          bufferCapacity_[MAX_FRAMES]{};
+    int                   currentFrameSlot_  = 0;
+    std::vector<uint8_t>  cpuSegments_;   // record-phase staging (shared)
 };
 
 } // namespace jvk

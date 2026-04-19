@@ -35,30 +35,62 @@ void Renderer::execute()
         }
     }
     device_.caches().gradientAtlas().stageUploads();
-    // Flush record-phase path/clip segments into the shared SSBO. Safe
-    // now because target_.beginFrame() above waited on the frame fence,
-    // so the GPU is done reading last frame's copy of this buffer.
-    if (pathPipeline_) pathPipeline_->flushToGPU();
+    // Flush record-phase path/clip segments into THIS frame slot's SSBO.
+    // Safe now because target_.beginFrame() above waited on this slot's
+    // fence, so the GPU is done reading this slot's buffer from 2 frames
+    // ago. The OTHER slot's buffer may still be in flight (frame N-1)
+    // and is not touched.
+    if (pathPipeline_) pathPipeline_->flushToGPU(frame.frameSlot);
     device_.flushUploads(frame.cmd);
 
     auto const& sb = target_.sceneBuffers(frame.frameSlot);
 
-    // Ping-pong state. Scene draws go into `current`; an effect samples
-    // `current` and writes into `other`, then the two swap so subsequent
-    // scene draws land on top of the effect's output.
-    VkFramebuffer   currentSceneFB  = sb.framebufferA;  // scene RP writes here
-    VkFramebuffer   currentEffectFB = sb.effectFBtoA;   // effect writes into colorA
-    VkFramebuffer   otherSceneFB    = sb.framebufferB;
-    VkFramebuffer   otherEffectFB   = sb.effectFBtoB;
-    VkDescriptorSet currentSampler  = sb.samplerA;      // samples colorA
-    VkDescriptorSet otherSampler    = sb.samplerB;
-    VkImage         currentImage    = sb.colorA.image();
+    // =========================================================================
+    // Ping-pong model (synchronous, one active buffer at a time).
+    //
+    //   pp[0] is half A, pp[1] is half B. `cur` is the index of the half
+    //   that is currently the active scene target. Normal draws write pp[cur].
+    //
+    //   When a post-process effect runs:
+    //     1. End the active scene RP (finalLayout transitions pp[cur] color
+    //        to SHADER_READ_ONLY; stencil transitions to DS_ATT_OPTIMAL).
+    //     2. Run the effect pass in its own RP: sample pp[cur] color, write
+    //        pp[1-cur] color.
+    //     3. Swap: cur ^= 1. The active half is now the one we just wrote.
+    //     4. Resume scene RP LOAD on pp[cur].sceneFB. Stencil image is the
+    //        SAME physical image (shared between framebufferA and
+    //        framebufferB) so LOAD_OP_LOAD restores the clip state we left.
+    //
+    //   Separable effects (Gaussian blur) do two effect passes and therefore
+    //   two swaps — they naturally land back on the half they started on.
+    //   Non-separable effects (HSV) do one pass and leave cur flipped.
+    //
+    //   At end of frame we blit pp[cur] → swapchain. There is never a race
+    //   between the effect writing and the scene RP LOAD because they target
+    //   DIFFERENT halves; the scene RP LOAD reads the half the effect just
+    //   wrote, whose writes are made visible by the effect RP's outgoing
+    //   subpass dependency.
+    // =========================================================================
+    struct Half {
+        VkFramebuffer   sceneFB;
+        VkFramebuffer   effectFB;
+        VkDescriptorSet sampler;
+        VkImage         image;
+    };
+    Half pp[2] = {
+        { sb.framebufferA, sb.effectFBtoA, sb.samplerA, sb.colorA.image() },
+        { sb.framebufferB, sb.effectFBtoB, sb.samplerB, sb.colorB.image() },
+    };
+    int cur = 0;
 
-    auto beginSceneRP = [&](VkRenderPass rp, VkFramebuffer fb, bool withClears) {
+    VkRenderPass scenePassLoad = target_.sceneRenderPassLoad();
+    VkRenderPass sceneBuildRP  = target_.sceneRenderPassClear(); // compat for build
+
+    auto beginSceneRP = [&](VkRenderPass rp, bool withClears) {
         VkRenderPassBeginInfo rpbi {};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpbi.renderPass = rp;
-        rpbi.framebuffer = fb;
+        rpbi.framebuffer = pp[cur].sceneFB;
         rpbi.renderArea.extent = frame.extent;
 
         VkClearValue clears[2] {};
@@ -81,32 +113,67 @@ void Renderer::execute()
         state_.invalidate();
     };
 
-    beginSceneRP(target_.sceneRenderPassClear(), currentSceneFB, /*withClears=*/true);
+    // Runs a single post-process pass (caller provides the dispatch via
+    // `applyPass`) and swaps the active half. Must be called between a
+    // vkCmdEndRenderPass and the matching resume of the scene RP.
+    auto effectPassAndSwap = [&](auto applyPass) {
+        int dst = cur ^ 1;
+        applyPass(pp[cur].sampler, pp[dst].effectFB);
+        cur = dst;
+    };
+
+    // When a clip is active, the effect pass will discard fragments outside
+    // the clip via stencil test. Those outside-clip destination pixels would
+    // then hold undefined (LOAD'd) data. Running a NOT_EQUAL-stencil copy
+    // pass first fills exactly those outside-clip pixels with the source,
+    // so the two passes together cover the destination without overlap. The
+    // copy does NOT swap — the subsequent effect pass is the one that
+    // flips `cur`.
+    auto preCopyIfClipped = [&](uint8_t stencilDepth) {
+        if (stencilDepth == 0 || !copyEffect_) return;
+        int dst = cur ^ 1;
+        copyEffect_->applyPass(frame.cmd,
+            pp[cur].sampler, pp[dst].effectFB, target_.effectRenderPass(),
+            frame.extent,
+            /*dir unused*/ 0.0f, 0.0f,
+            /*radius unused*/ 0.0f,
+            /*stencilRef*/ stencilDepth);
+    };
+
+    beginSceneRP(target_.sceneRenderPassClear(), /*withClears=*/true);
     state_.begin(frame.cmd, vertices_,
         static_cast<float>(frame.extent.width),
         static_cast<float>(frame.extent.height));
 
-    VkRenderPass scenePassLoad = target_.sceneRenderPassLoad();
-    VkRenderPass sceneBuildRP  = target_.sceneRenderPassClear(); // compat for build
-
     for (auto& cmd : commands_) {
         if (cmd.op == DrawOp::EffectKernel) {
+            // Separable Gaussian blur. Pre-copy if clipped (seeds outside-
+            // clip pixels with source), then H pass + V pass. Each pass
+            // swaps; the two swaps cancel so `cur` lands back on the same
+            // half it started on. Stencil test in the blur pipeline keeps
+            // the H/V writes inside the clip; the pre-copy handled outside.
             vkCmdEndRenderPass(frame.cmd);
-
             if (postProcess_) {
                 auto& bp = arena_.read<BlurParams>(cmd.dataOffset);
-                // Separable Gaussian: horizontal into `other`, vertical back
-                // into `current`. `current` keeps its identity so subsequent
-                // scene draws land on top of the blurred result.
-                postProcess_->applyPass(frame.cmd,
-                    currentSampler, otherEffectFB, target_.effectRenderPass(),
-                    frame.extent, 1.0f, 0.0f, bp.radius);
-                postProcess_->applyPass(frame.cmd,
-                    otherSampler, currentEffectFB, target_.effectRenderPass(),
-                    frame.extent, 0.0f, 1.0f, bp.radius);
+                preCopyIfClipped(cmd.stencilDepth);
+                effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
+                    postProcess_->applyPass(frame.cmd, src, dst,
+                        target_.effectRenderPass(), frame.extent,
+                        1.0f, 0.0f, bp.radius,
+                        static_cast<uint32_t>(cmd.stencilDepth));
+                });
+                // Second pass runs on the freshly-written half. Its clip
+                // state is the same, but the outside-clip pixels of the
+                // new `cur` half haven't been seeded yet — pre-copy again.
+                preCopyIfClipped(cmd.stencilDepth);
+                effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
+                    postProcess_->applyPass(frame.cmd, src, dst,
+                        target_.effectRenderPass(), frame.extent,
+                        0.0f, 1.0f, bp.radius,
+                        static_cast<uint32_t>(cmd.stencilDepth));
+                });
             }
-
-            beginSceneRP(scenePassLoad, currentSceneFB, /*withClears=*/false);
+            beginSceneRP(scenePassLoad, /*withClears=*/false);
             continue;
         }
         if (cmd.op == DrawOp::PushClipRect) {
@@ -215,26 +282,23 @@ void Renderer::execute()
             continue;
         }
         if (cmd.op == DrawOp::EffectHSV) {
-            // Full-screen HSV transform. Ping-pong through `other`:
-            //   pass 1 (A → B) applies the HSV transform
-            //   pass 2 (B → A) identity copy, so `current` stays A for
-            //                  any scene draws after this effect.
+            // Non-separable HSV — single pass + single swap. Pre-copy if
+            // clipped so outside-clip pixels carry source; effect writes
+            // inside-clip.
             vkCmdEndRenderPass(frame.cmd);
-
             if (hsvPipeline_) {
                 auto& hp = arena_.read<HSVParams>(cmd.dataOffset);
                 HSVPipeline::PushConstants pc {};
                 pc.scaleH = hp.scaleH; pc.scaleS = hp.scaleS; pc.scaleV = hp.scaleV;
                 pc.deltaH = hp.deltaH; pc.deltaS = hp.deltaS; pc.deltaV = hp.deltaV;
-                hsvPipeline_->applyPass(frame.cmd,
-                    currentSampler, otherEffectFB, target_.effectRenderPass(),
-                    frame.extent, pc);
-                hsvPipeline_->applyPass(frame.cmd,
-                    otherSampler, currentEffectFB, target_.effectRenderPass(),
-                    frame.extent, HSVPipeline::identity());
+                preCopyIfClipped(cmd.stencilDepth);
+                effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
+                    hsvPipeline_->applyPass(frame.cmd, src, dst,
+                        target_.effectRenderPass(), frame.extent, pc,
+                        static_cast<uint32_t>(cmd.stencilDepth));
+                });
             }
-
-            beginSceneRP(scenePassLoad, currentSceneFB, /*withClears=*/false);
+            beginSceneRP(scenePassLoad, /*withClears=*/false);
             continue;
         }
         if (cmd.op == DrawOp::BlurShape) {
@@ -262,15 +326,20 @@ void Renderer::execute()
 
                 VkRect2D scissor { {0, 0}, frame.extent };
                 VkRenderPass rp = target_.effectRenderPass();
-                shapeBlur_->applyPass(frame.cmd,
-                    currentSampler, otherEffectFB, rp,
-                    frame.extent, scissor, 1.0f, 0.0f, pc);
-                shapeBlur_->applyPass(frame.cmd,
-                    otherSampler, currentEffectFB, rp,
-                    frame.extent, scissor, 0.0f, 1.0f, pc);
+                preCopyIfClipped(cmd.stencilDepth);
+                effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
+                    shapeBlur_->applyPass(frame.cmd, src, dst, rp,
+                        frame.extent, scissor, 1.0f, 0.0f, pc,
+                        static_cast<uint32_t>(cmd.stencilDepth));
+                });
+                preCopyIfClipped(cmd.stencilDepth);
+                effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
+                    shapeBlur_->applyPass(frame.cmd, src, dst, rp,
+                        frame.extent, scissor, 0.0f, 1.0f, pc,
+                        static_cast<uint32_t>(cmd.stencilDepth));
+                });
             }
-
-            beginSceneRP(scenePassLoad, currentSceneFB, /*withClears=*/false);
+            beginSceneRP(scenePassLoad, /*withClears=*/false);
             continue;
         }
         auto* pipeline = pipelineForOp_[static_cast<size_t>(cmd.op)];
@@ -283,6 +352,12 @@ void Renderer::execute()
 
     vkCmdEndRenderPass(frame.cmd);
 
+    // After the command stream, `cur` is the index of whichever ping-pong
+    // half holds the final composited frame. An odd number of single-pass
+    // effects leaves us on B; any other pattern (no effects, separable
+    // effects only) leaves us on A. Blit whatever is current.
+    VkImage currentImage = pp[cur].image;
+
     if (frame.swapImage == VK_NULL_HANDLE) {
         // Offscreen target — no swap image to blit to. Scene content remains
         // in currentImage (SHADER_READ_ONLY_OPTIMAL) for the caller to sample.
@@ -291,13 +366,20 @@ void Renderer::execute()
         return;
     }
 
-    // Blit currentTarget → swap image. currentImage is in SHADER_READ_ONLY
-    // (finalLayout of the scene RP). Transition both images and copy.
+    // Blit currentImage → swap image. currentImage is in SHADER_READ_ONLY
+    // (finalLayout of the last scene RP). Transition both images and copy.
     VkImageMemoryBarrier barriers[2] {};
     barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    // Cover both possible last-use types of colorA: it was either last
+    // written as a color attachment (final scene RP's writes → finalLayout
+    // transition) or last sampled in a shader (if an effect pass ran and
+    // then we re-entered scene RP LOAD). Including both bits eliminates
+    // a subtle write-after-read hazard on tile renderers at slow frame
+    // rates that caused post-effect draws to flicker every other frame.
+    barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT
+                              | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;

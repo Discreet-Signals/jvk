@@ -99,6 +99,7 @@ set(JVK_SHADER_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ui2d.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/clip.vert"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/clip.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/copy.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.vert"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shape_blur.frag"

@@ -209,6 +209,14 @@ public:
     // applies the 2-pass separable effect (e.g. Gaussian blur) before present.
     void setPostProcess(EffectPipeline* ep) { postProcess_ = ep; }
 
+    // Attach the pre-copy pipeline used for clipped effects. It shares
+    // EffectPipeline's plumbing but uses StencilMode::Outside, so the pass
+    // writes only the pixels OUTSIDE the active clip (source passthrough),
+    // leaving the subsequent effect pass to fill the inside. Without this,
+    // clipped effects would leave outside-clip pixels holding garbage
+    // (whatever was in the destination ping-pong half before).
+    void setCopyEffect(EffectPipeline* ep) { copyEffect_ = ep; }
+
     // Attach the HSV transform pipeline — required for EffectHSV ops
     // (g.saturate / g.shiftHue / g.hsv). Ping-pongs through the scene
     // intermediate and returns to `current`.
@@ -284,6 +292,7 @@ private:
 
     Pipeline* pipelineForOp_[static_cast<size_t>(DrawOp::COUNT)] = {};
     EffectPipeline*    postProcess_      = nullptr;
+    EffectPipeline*    copyEffect_       = nullptr;
     HSVPipeline*       hsvPipeline_      = nullptr;
     ShapeBlurPipeline* shapeBlur_        = nullptr;
     ShaderPipeline*    shaderPipeline_   = nullptr;
