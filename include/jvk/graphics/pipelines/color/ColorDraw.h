@@ -227,7 +227,12 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             auto  phys = toPixels(p.rect, p.transform, p.scale);
-            float cs   = p.cornerSize * p.scale;
+            // cornerSize is in LOGICAL pixels — scale it by the composed
+            // transform (affine × displayScale) so corners grow with the
+            // rect under any transform zoom. Using p.scale alone only
+            // covers displayScale and leaves corners under-sized whenever
+            // the caller set a scale > 1 on Graphics::addTransform.
+            float cs   = p.cornerSize * tx.getScaleFactor();
             GradientCtx grad = makeGradientCtx(r, fill, tx);
 
             state.setResources(colorDescFor(grad, r), def);
@@ -274,8 +279,10 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             auto  phys = toPixels(p.rect, p.transform, p.scale);
-            float cs   = p.cornerSize * p.scale;
-            float sw   = p.lineWidth  * p.scale;
+            // Both cornerSize and lineWidth are logical pixels — scale by
+            // the composed transform so they track the rect under zoom.
+            float cs   = p.cornerSize * tx.getScaleFactor();
+            float sw   = p.lineWidth  * tx.getScaleFactor();
             GradientCtx grad = makeGradientCtx(r, fill, tx);
 
             state.setResources(colorDescFor(grad, r), def);
@@ -302,7 +309,9 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             auto  phys = toPixels(p.area, p.transform, p.scale);
-            float sw   = p.lineWidth * p.scale;
+            // lineWidth is in logical pixels — use the composed transform
+            // scale (matches DrawLine's convention).
+            float sw   = p.lineWidth * tx.getScaleFactor();
             GradientCtx grad = makeGradientCtx(r, fill, tx);
 
             state.setResources(colorDescFor(grad, r), def);
