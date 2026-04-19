@@ -113,10 +113,11 @@ float computeRadius(vec2 fragCoord) {
     // Capsule: the shape is unbounded in one direction (by design — it
     // models a line segment), so an SDF-based cap would clamp the whole
     // blur to the narrow cross-section. Leave it uncapped; samples reaching
-    // the texture boundary clamp-to-edge automatically.
+    // the texture boundary are mirrored by sampleSrc below so bright pixels
+    // near the edge don't smear into a full-column flash.
     float cap;
     if (pc.shapeType == 3) {
-        cap = 1e20; // effectively infinite; relies on CLAMP_TO_EDGE sampling
+        cap = 1e20; // effectively infinite; samples beyond the edge mirror back in
     } else {
         float sdfDist = (pc.inverted != 0) ? (d - bandMin) : (bandMax - d);
         sdfDist = max(sdfDist, 0.0);
@@ -124,6 +125,17 @@ float computeRadius(vec2 fragCoord) {
     }
 
     return min(requested, cap);
+}
+
+// Mirror-wrap UVs outside [0,1] back inside (triangle wave). Using this
+// instead of raw texture() avoids the CLAMP_TO_EDGE artifact where a bright
+// edge pixel gets weighted by every out-of-bounds sample in the Gaussian
+// kernel — which looks like a full-column flash when thin bright UI (slider
+// tracks, text) scrolls past the viewport edge. Reflection keeps the scene
+// locally continuous so edge pixels contribute naturally to the blur.
+vec4 sampleSrc(vec2 uv) {
+    vec2 m = uv - 2.0 * floor(uv * 0.5 + 0.5);
+    return texture(srcTexture, abs(m));
 }
 
 void main() {
@@ -156,8 +168,8 @@ void main() {
         float o  = (float(i1) * w1 + float(i2) * w2) / w;
 
         vec2 off = pc.direction * o * texelSize;
-        color += texture(srcTexture, fragUV + off) * w;
-        color += texture(srcTexture, fragUV - off) * w;
+        color += sampleSrc(fragUV + off) * w;
+        color += sampleSrc(fragUV - off) * w;
         totalWeight += 2.0 * w;
     }
 
