@@ -63,6 +63,22 @@ public:
     bool isVulkanAvailable() const { return vulkanAvailable_; }
     Device& getDevice() { return *device_; }
 
+    // Block until the render worker is idle. Call before destroying any
+    // Vulkan resource (jvk::Shader, jvk::ShaderImage, etc.) whose handle
+    // may have been captured into the current frame's command stream —
+    // otherwise the worker can dereference a freed VkPipeline/VkImage and
+    // crash. In release builds on arm64 this shows up as a PAC fault on
+    // the worker thread.
+    //
+    // No-op if Vulkan isn't acquired. Bounded wait (≈ one execute duration).
+    // The timer is unaffected; rendering resumes automatically on the next
+    // tick unless the caller also stops the timer (e.g. via
+    // setVulkanEnabled(false)).
+    void waitForRenderIdle()
+    {
+        if (renderer_) renderer_->waitForIdle();
+    }
+
 protected:
     void paint(juce::Graphics& g) override
     {
@@ -116,18 +132,18 @@ private:
         metalView_.setVisible(true);
         setCachedComponentImage(new NullCachedImage());
 
-        // If we already have a size AND a peer, stand up the swapchain now.
-        // If the peer isn't attached yet, getDisplayScale() would fall back
-        // to 1.0 and create a logical-sized swapchain — defer to
-        // parentHierarchyChanged, which fires once the peer is attached.
-        if (getPeer() != nullptr && !target_) {
-            const float scale = getDisplayScale();
-            const auto w = static_cast<uint32_t>(getWidth()  * scale);
-            const auto h = static_cast<uint32_t>(getHeight() * scale);
-            if (w > 0 && h > 0) {
-                initVulkan(w, h);
-                if (target_) renderTimer_.startTimerHz(60);
-            }
+        // If we already have a size, stand up the swapchain + pipelines
+        // immediately. Otherwise componentMovedOrResized will do it on the
+        // first layout pass. Scale may be 1.0 at this point if the peer
+        // isn't attached yet — that's fine; parentHierarchyChanged /
+        // visibilityChanged will call target_->resize() with the real
+        // per-monitor scale once the peer is live.
+        const float scale = getDisplayScale();
+        const auto w = static_cast<uint32_t>(getWidth()  * scale);
+        const auto h = static_cast<uint32_t>(getHeight() * scale);
+        if (w > 0 && h > 0 && !target_) {
+            initVulkan(w, h);
+            if (target_) renderTimer_.startTimerHz(60);
         } else if (target_) {
             renderTimer_.startTimerHz(60);
         }
@@ -136,6 +152,11 @@ private:
     void teardownVulkan()
     {
         renderTimer_.stopTimer();
+        // Ensure the worker finished any in-flight execute before we
+        // vkDeviceWaitIdle / free resources. Renderer's dtor also stops
+        // the worker, but doing it explicitly here guarantees the queue
+        // is quiescent before any pipeline/target reset runs below.
+        if (renderer_) renderer_->waitForIdle();
         if (device_ && device_->device() != VK_NULL_HANDLE)
             vkDeviceWaitIdle(device_->device());
 
@@ -179,23 +200,37 @@ private:
         updateVulkanTarget();
     }
 
-    // Peer attaches after construction in many flows (standalone + most
-    // hosts). We can't size the swapchain correctly until then — the scale
-    // factor lives on the peer. Retry init here once the peer is available.
+    // Peer attaches after construction in many flows. Standalone's
+    // setContentOwned() attaches the editor to the window BEFORE the window
+    // is shown, so parentHierarchyChanged fires while the peer is still
+    // null. The peer appears when the window is shown, which fires
+    // visibilityChanged rather than parentHierarchyChanged. Hooking both
+    // events covers every peer-attachment path without requiring a
+    // ComponentMovementWatcher. updateVulkanTarget is idempotent: no-op
+    // when target_ already exists, retry otherwise.
     void parentHierarchyChanged() override
     {
         if (target_ == nullptr)
             updateVulkanTarget();
     }
 
+    void visibilityChanged() override
+    {
+        if (target_ == nullptr && isShowing())
+            updateVulkanTarget();
+    }
+
     void updateVulkanTarget()
     {
         if (!vulkanEnabled_) return;
-        // Without a peer we can't resolve the per-monitor DPI scale, so
-        // we'd build a wrong-sized swapchain. Defer; parentHierarchyChanged
-        // will re-enter once the peer lands.
-        if (getPeer() == nullptr) return;
 
+        // Scale may be 1.0 if the peer isn't attached yet (e.g. first
+        // componentMovedOrResized fired by setSize before the window is
+        // shown). We still init at whatever size we can — otherwise the
+        // first render never happens and the window stays blank until the
+        // user manually resizes. When the peer arrives later,
+        // parentHierarchyChanged / visibilityChanged re-enter here and
+        // target_->resize() picks up the corrected physical size.
         float scale = getDisplayScale();
         auto w = static_cast<uint32_t>(getWidth() * scale);
         auto h = static_cast<uint32_t>(getHeight() * scale);
@@ -205,12 +240,24 @@ private:
             initVulkan(w, h);
             if (target_) renderTimer_.startTimerHz(60);
         } else {
+            // resize destroys and recreates the swapchain. The worker must
+            // be idle — otherwise it could be mid-execute holding references
+            // to the swapchain images we're about to free. Brief wait
+            // (bounded by one execute duration) on this infrequent path.
+            renderer_->waitForIdle();
             target_->resize(w, h);
         }
     }
 
     void render()
     {
+        // Renderer::execute() runs on a dedicated worker thread. If it's
+        // still in flight (NVIDIA busy-loop on present can soak a full VSync
+        // interval, longer under DWM drag stalls), skip this tick — we
+        // never block the message thread. Resulting render rate adapts to
+        // what the worker can sustain; input responsiveness stays at 60 Hz.
+        if (renderer_->isBusy()) return;
+
         renderer_->reset();
         device_->caches().beginFrame(frameCounter_++);
         // Wipe the per-frame segment ring for the analytical-SDF path
@@ -223,8 +270,10 @@ private:
         juce::Graphics g(graphics);
         paintEntireComponent(g, true);
 
-        // Phase 2: Execute — prepare pipelines, flush uploads, render pass, replay, present
-        renderer_->execute();
+        // Phase 2: Submit to worker — non-blocking. The worker's execute()
+        // handles prepare pipelines, flush uploads, render pass, replay,
+        // submit, present.
+        renderer_->submit();
     }
 
     void initVulkan(uint32_t w, uint32_t h)

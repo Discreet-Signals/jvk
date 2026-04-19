@@ -182,12 +182,8 @@ private:
 
 class Renderer {
 public:
-    Renderer(Device& device, RenderTarget& target)
-        : device_(device), target_(target),
-          vertices_(device.physicalDevice(), device.device())
-    {}
-
-    ~Renderer() = default;
+    Renderer(Device& device, RenderTarget& target);
+    ~Renderer();
 
     template <typename Params>
     void push(DrawOp op, float zOrder, const juce::Rectangle<int>& clip,
@@ -201,6 +197,46 @@ public:
     }
 
     void registerPipeline(Pipeline& pipeline);
+
+    // ---- Threaded execution -------------------------------------------------
+    //
+    // Frames are executed on a dedicated worker thread so the caller (typically
+    // the JUCE message thread) is never stuck inside vkQueuePresentKHR. NVIDIA's
+    // Windows driver busy-loops the calling thread inside present under FIFO
+    // mode; running that on the message thread pegs the CPU and starves the OS
+    // input/DWM dispatch, freezing window drag and mouse response.
+    //
+    // Contract (strict, 1 frame in flight):
+    //   1. Caller fills the Renderer (reset, beginFrame on caches, paint).
+    //   2. Caller calls submit(). Control returns immediately; the worker runs
+    //      execute() asynchronously. submit() MUST NOT be called while
+    //      isBusy() returns true — caller must guard with an isBusy() check.
+    //   3. Worker clears the busy flag after execute() fully returns.
+    //   4. Caller's next frame must wait until isBusy() == false before
+    //      touching Renderer state again.
+    //
+    // The busy flag's release/acquire pair publishes every CPU-side write
+    // (command list, arena, path SSBO, CPU-mapped Vulkan buffers) so the
+    // worker sees consistent record-phase state.
+
+    // Post the current frame to the worker. Non-blocking. Preconditions: the
+    // caller has just finished the record phase, and isBusy() == false.
+    void submit();
+
+    // True while the worker is mid-execute. Check before recording the next
+    // frame — the caller must not touch Renderer state while this is true.
+    bool isBusy() const { return workerBusy_.load(std::memory_order_acquire); }
+
+    // Block the caller until the worker is idle. Use before operations that
+    // need exclusive access outside the normal record→submit cycle
+    // (SwapchainTarget::resize, teardown). Bounded wait ≈ one execute
+    // duration (~16 ms on VSync).
+    void waitForIdle();
+
+    // The synchronous body of a frame's GPU work. Called internally by the
+    // worker thread. Kept public because some non-windowed consumers (e.g.
+    // benchmark harnesses, offscreen probes) may want a direct synchronous
+    // path — but the normal windowed path must go through submit().
     void execute();
 
     // Attach a post-process helper that handles EffectKernel ops. When set,
@@ -299,6 +335,49 @@ private:
     PathPipeline*      pathPipeline_     = nullptr;
     ClipPipeline*      clipPipeline_     = nullptr;
     uint64_t frameCounter_ = 0;
+
+    // ---- Threading ---------------------------------------------------------
+    // Vulkan's VkQueue requires external synchronization. Multiple editors
+    // share Device's single graphics/present queue, so every queue-submitting
+    // Renderer serializes through this lock. Contention is only across
+    // editors (within one editor the worker is the sole submitter), and only
+    // during the brief submit/present window — not all of execute().
+    static juce::CriticalSection& queueLock()
+    {
+        static juce::CriticalSection lock;
+        return lock;
+    }
+
+    class Worker : public juce::Thread
+    {
+    public:
+        explicit Worker(Renderer& r) : juce::Thread("jvk-render-worker"), owner(r) {}
+        ~Worker() override { stopThread(2000); }
+
+        void run() override
+        {
+            while (! threadShouldExit())
+            {
+                wait(-1);
+                if (threadShouldExit()) break;
+                owner.execute();
+                owner.workerBusy_.store(false, std::memory_order_release);
+            }
+        }
+
+    private:
+        Renderer& owner;
+    };
+
+    // workerBusy_ is the record↔execute gate. Msg thread reads false →
+    // records → store(true, release) before notifying the worker. Worker
+    // store(false, release) only after execute() has fully returned.
+    std::atomic<bool> workerBusy_ { false };
+
+    // Declared last so destruction order stops + joins the worker BEFORE
+    // any other Renderer member is torn down — everything the worker touches
+    // in execute() is still valid until worker_ is destroyed.
+    std::unique_ptr<Worker> worker_;
 };
 
 } // namespace jvk

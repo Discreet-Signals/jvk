@@ -44,9 +44,17 @@ public:
         // blurry output and expensive stretch-path presents that stall the
         // message thread. The scope restores the prior context on exit; a
         // no-op on pre-Win10-1703 where SetThreadDpiAwarenessContext is absent.
+        // No WS_EX_TRANSPARENT — that flag tells DWM the pixels should blend
+        // with what's underneath, forcing a composition-blend path for the
+        // child's DXGI swapchain over the JUCE peer's surface. On Windows
+        // that path serializes DWM composition with window drag + input,
+        // freezing the OS-level move/mouse thread even while the app's
+        // render thread itself is healthy. Mouse pass-through is handled
+        // by HTTRANSPARENT in WindowProc; paint order is irrelevant because
+        // the swapchain fills the whole HWND opaquely.
         ScopedThreadDpiAwareness dpiScope;
         hwnd = CreateWindowEx(
-            WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+            WS_EX_NOACTIVATE,
             className(),
             TEXT("jvk"),
             WS_POPUP,

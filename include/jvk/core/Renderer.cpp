@@ -1,6 +1,46 @@
 namespace jvk {
 
 // =============================================================================
+// Construction / destruction — starts and stops the worker thread.
+// =============================================================================
+
+Renderer::Renderer(Device& device, RenderTarget& target)
+    : device_(device), target_(target),
+      vertices_(device.physicalDevice(), device.device()),
+      worker_(std::make_unique<Worker>(*this))
+{
+    worker_->startThread();
+}
+
+Renderer::~Renderer() = default;
+// Worker is the last-declared member, so it is the first destroyed: its
+// dtor calls stopThread(), which signals exit + notify + joins. All other
+// Renderer members remain valid while the worker is completing its final
+// execute() — guaranteeing no dangling references from the worker thread.
+
+// =============================================================================
+// Threaded-execute control
+// =============================================================================
+
+void Renderer::submit()
+{
+    // Release here publishes every CPU-side write made during record (command
+    // list, arena, path SSBO, mapped Vulkan buffers) to the worker's acquire
+    // load at the top of execute().
+    workerBusy_.store(true, std::memory_order_release);
+    if (worker_) worker_->notify();
+}
+
+void Renderer::waitForIdle()
+{
+    // Used only for resize and teardown — both rare. Yield rather than burn
+    // a CPU core; the wait is bounded by one execute duration (~16 ms on
+    // VSync, longer only under DWM drag stalls).
+    while (workerBusy_.load(std::memory_order_acquire))
+        juce::Thread::yield();
+}
+
+// =============================================================================
 // Pipeline registration
 // =============================================================================
 
@@ -368,7 +408,12 @@ void Renderer::execute()
     if (frame.swapImage == VK_NULL_HANDLE) {
         // Offscreen target — no swap image to blit to. Scene content remains
         // in currentImage (SHADER_READ_ONLY_OPTIMAL) for the caller to sample.
+        // Serialize queue submit+present against other editors sharing the Device's
+    // VkQueue (Vulkan external sync requirement).
+    {
+        const juce::ScopedLock queueSync(queueLock());
         target_.endFrame(frame);
+    }
         frameCounter_++;
         return;
     }
@@ -432,7 +477,12 @@ void Renderer::execute()
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
         0, 0, nullptr, 0, nullptr, 1, &present);
 
-    target_.endFrame(frame);
+    // Serialize queue submit+present against other editors sharing the Device's
+    // VkQueue (Vulkan external sync requirement).
+    {
+        const juce::ScopedLock queueSync(queueLock());
+        target_.endFrame(frame);
+    }
     frameCounter_++;
 }
 
