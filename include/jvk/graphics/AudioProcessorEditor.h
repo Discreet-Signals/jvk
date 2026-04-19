@@ -35,22 +35,21 @@ public:
     ~AudioProcessorEditor() override
     {
         removeComponentListener(this);
-        renderTimer_.stopTimer();
-        renderer_.reset();
-        target_.reset();
+        teardownVulkan();
     }
 
+    // Toggle the Vulkan render path on/off at runtime. When disabled, every
+    // per-editor Vulkan resource — pipelines, renderer, swapchain, surface,
+    // platform subview, and our reference to the shared Device — is released
+    // so this editor keeps no Vulkan footprint. Re-enabling rebuilds them.
+    // (The Device itself is refcounted process-wide via weak_ptr; dropping
+    // our reference only destroys the instance if nothing else holds it.)
     void setVulkanEnabled(bool enabled)
     {
+        if (enabled == vulkanEnabled_) return;
         vulkanEnabled_ = enabled;
-        metalView_.setVisible(enabled);
-        if (enabled) {
-            setCachedComponentImage(new NullCachedImage());
-            renderTimer_.startTimerHz(60);
-        } else {
-            renderTimer_.stopTimer();
-            setCachedComponentImage(nullptr);
-        }
+        if (enabled) acquireVulkan();
+        else         teardownVulkan();
         juce::AudioProcessorEditor::repaint();
     }
 
@@ -58,11 +57,10 @@ public:
     // Reports whether a usable Vulkan device was acquired at construction.
     // `false` means the runtime has no MoltenVK / ICD or the GPU can't
     // expose a compatible device — callers should fall back to JUCE's
-    // native renderer and not attempt to enable Vulkan.
-    bool isVulkanAvailable() const
-    {
-        return device_ != nullptr && device_->device() != VK_NULL_HANDLE;
-    }
+    // native renderer and not attempt to enable Vulkan. Result is cached so
+    // it stays accurate even after setVulkanEnabled(false) has released our
+    // Device reference.
+    bool isVulkanAvailable() const { return vulkanAvailable_; }
     Device& getDevice() { return *device_; }
 
 protected:
@@ -77,24 +75,100 @@ protected:
 #if JUCE_MAC
         return 2.0f;
 #else
-        return static_cast<float>(getDesktopScaleFactor());
+        // Peer's platformScaleFactor is the per-monitor DPI scale — what we
+        // need to size the swapchain in physical pixels so it matches the
+        // HWND (JUCE's HWNDComponent positions the child HWND using this
+        // same value). NOT getDesktopScaleFactor(), which returns
+        // Desktop::getGlobalScaleFactor() — a user-settable multiplier that
+        // defaults to 1.0 and is unrelated to system DPI. Using the wrong
+        // one produces a logical-sized swapchain that the driver stretches
+        // into the physical HWND: blurry output and a slow stretch-blit
+        // present path that starves the message thread.
+        if (auto* peer = getPeer())
+            return static_cast<float>(peer->getPlatformScaleFactor());
+        return 1.0f;
 #endif
     }
 
 private:
     void init()
     {
-        device_ = Device::acquire();
-        device_->initCaches();
-
         addAndMakeVisible(metalView_);
         metalView_.setInterceptsMouseClicks(false, false);
 
-        setCachedComponentImage(new NullCachedImage());
         setOpaque(true);
-
         addComponentListener(this);
         renderTimer_.callback = [this] { if (vulkanEnabled_ && renderer_) render(); };
+
+        // vulkanEnabled_ defaults to true — wire up the Vulkan resources so
+        // construction matches the historical behavior. Subclasses that want
+        // to start disabled can call setVulkanEnabled(false) immediately.
+        acquireVulkan();
+        vulkanAvailable_ = (device_ && device_->device() != VK_NULL_HANDLE);
+    }
+
+    void acquireVulkan()
+    {
+        if (!device_) {
+            device_ = Device::acquire();
+            if (device_) device_->initCaches();
+        }
+        metalView_.setVisible(true);
+        setCachedComponentImage(new NullCachedImage());
+
+        // If we already have a size AND a peer, stand up the swapchain now.
+        // If the peer isn't attached yet, getDisplayScale() would fall back
+        // to 1.0 and create a logical-sized swapchain — defer to
+        // parentHierarchyChanged, which fires once the peer is attached.
+        if (getPeer() != nullptr && !target_) {
+            const float scale = getDisplayScale();
+            const auto w = static_cast<uint32_t>(getWidth()  * scale);
+            const auto h = static_cast<uint32_t>(getHeight() * scale);
+            if (w > 0 && h > 0) {
+                initVulkan(w, h);
+                if (target_) renderTimer_.startTimerHz(60);
+            }
+        } else if (target_) {
+            renderTimer_.startTimerHz(60);
+        }
+    }
+
+    void teardownVulkan()
+    {
+        renderTimer_.stopTimer();
+        if (device_ && device_->device() != VK_NULL_HANDLE)
+            vkDeviceWaitIdle(device_->device());
+
+        // Pipelines hold VkPipeline handles against device_ and render
+        // passes from target_ — must go before both. Reverse registration
+        // order, mirrored from registerPipelines.
+        clipPipeline_.reset();
+        pathPipeline_.reset();
+        shaderPipeline_.reset();
+        shapeBlur_.reset();
+        hsvPipeline_.reset();
+        copyEffect_.reset();
+        blurEffect_.reset();
+        blendPipeline_.reset();
+        colorPipeline_.reset();
+
+        renderer_.reset();
+        target_.reset();
+
+    #if JUCE_MAC
+        metalView_.setView(nullptr);
+        nsViewGen_.reset();
+    #elif JUCE_WINDOWS
+        metalView_.setHWND(nullptr);
+        hwndGen_.reset();
+    #endif
+        metalView_.setVisible(false);
+
+        setCachedComponentImage(nullptr);
+        // Drop our per-editor reference to the shared Device singleton. The
+        // weak_ptr in Device::acquire expires only if no other editor or
+        // ShaderImage is still holding it — so other instances keep running.
+        device_.reset();
     }
 
     // ComponentListener — fires even when subclass overrides resized()
@@ -102,6 +176,25 @@ private:
     {
         if (!wasResized) return;
         metalView_.setBounds(getLocalBounds());
+        updateVulkanTarget();
+    }
+
+    // Peer attaches after construction in many flows (standalone + most
+    // hosts). We can't size the swapchain correctly until then — the scale
+    // factor lives on the peer. Retry init here once the peer is available.
+    void parentHierarchyChanged() override
+    {
+        if (target_ == nullptr)
+            updateVulkanTarget();
+    }
+
+    void updateVulkanTarget()
+    {
+        if (!vulkanEnabled_) return;
+        // Without a peer we can't resolve the per-monitor DPI scale, so
+        // we'd build a wrong-sized swapchain. Defer; parentHierarchyChanged
+        // will re-enter once the peer lands.
+        if (getPeer() == nullptr) return;
 
         float scale = getDisplayScale();
         auto w = static_cast<uint32_t>(getWidth() * scale);
@@ -158,7 +251,10 @@ private:
         VkWin32SurfaceCreateInfoKHR ci {};
         ci.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
         ci.hwnd = childHwnd;
-        ci.hinstance = GetModuleHandle(nullptr);
+        // Must match the HINSTANCE that registered the window class and
+        // created the HWND — i.e. the plugin DLL, not the host process
+        // (GetModuleHandle(nullptr) would return the host .exe).
+        ci.hinstance = jvk::core::windows::HWNDGenerator::moduleHInstance();
         if (vkCreateWin32SurfaceKHR(device_->instance(), &ci, nullptr, &surface) != VK_SUCCESS)
             return;
 #else
@@ -303,6 +399,7 @@ private:
 
     RenderTimer renderTimer_;
     bool vulkanEnabled_ = true;
+    bool vulkanAvailable_ = false;
     uint64_t frameCounter_ = 0;
 };
 
