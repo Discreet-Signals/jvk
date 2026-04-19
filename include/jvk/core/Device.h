@@ -43,6 +43,17 @@ public:
 
     VkSampleCountFlagBits maxMSAA() const { return maxMSAA_; }
 
+    // Process-wide monotonic clock in seconds, anchored when this Device was
+    // constructed. Single source of truth for the `time` push-constant slot
+    // every shader pipeline reads — Renderer snapshots it once per frame so
+    // all shaders within a frame see an identical value, and ShaderImage
+    // samples it per-render so the offscreen path stays in lockstep with the
+    // direct Vulkan path when the user toggles between them.
+    float time() const noexcept
+    {
+        return static_cast<float>(juce::Time::getMillisecondCounterHiRes() / 1000.0 - epoch_);
+    }
+
     ~Device();
 
 private:
@@ -96,6 +107,8 @@ private:
     RetiredResources retired_[MAX_FRAMES];
 
     std::unique_ptr<ResourceCaches> caches_;
+
+    const double epoch_ = juce::Time::getMillisecondCounterHiRes() / 1000.0;
 };
 
 } // namespace jvk

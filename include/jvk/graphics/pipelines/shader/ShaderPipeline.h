@@ -31,8 +31,6 @@ public:
         device_     = &device;
         renderPass_ = sceneRenderPass;
         msaa_       = msaa;
-        startTime_  = std::chrono::duration<double>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
     bool ready() const { return device_ != nullptr; }
@@ -47,12 +45,16 @@ public:
     // dynamic reference + compare mask to match all currently-set bits —
     // identical to ColorPipeline's clip path, so DrawShader composes correctly
     // inside clipToPath / clipToRectangle scopes.
+    // `frameTime` is the per-frame snapshot of jvk::Device::time() taken once
+    // by Renderer::execute() and passed unchanged to every dispatch this frame.
+    // Lands in the built-in `time` push-constant slot every shader sees.
     void dispatch(State& state, VkCommandBuffer cmd,
                   Shader& shader,
                   juce::Rectangle<float> regionPixels,
                   float viewportW, float viewportH,
                   const juce::Rectangle<int>& clipBoundsPixels,
-                  uint8_t stencilDepth)
+                  uint8_t stencilDepth,
+                  float frameTime)
     {
         if (!device_) return;
         shader.ensureCreated(*device_, renderPass_, msaa_);
@@ -91,14 +93,13 @@ public:
         vp.maxDepth = 1.0f;
         vkCmdSetViewport(cmd, 0, 1, &vp);
 
-        const float now = static_cast<float>(
-            std::chrono::duration<double>(
-                std::chrono::steady_clock::now().time_since_epoch()).count()
-            - startTime_);
-
+        // Built-in shader inputs in the shared 7-float push block (matches
+        // shader_region.vert): user shaders read `resolution` and `time` for
+        // free without declaring any uniform. `time` is the per-frame snapshot
+        // captured once by Renderer::execute() so all draws this frame agree.
         const float push[7] = {
             regionPixels.getWidth(),  regionPixels.getHeight(),   // resolution (frag + vert)
-            now,                                                  // time       (frag + vert)
+            frameTime,                                            // time       (frag + vert)
             viewportW,               viewportH,                   // viewport   (vert only)
             regionPixels.getX(),     regionPixels.getY(),         // region XY  (vert only)
         };
@@ -111,6 +112,15 @@ public:
         // VK_NULL_HANDLE and use a zero-set pipeline layout.
         VkDescriptorSet set = shader.descriptorSet();
         if (set != VK_NULL_HANDLE) {
+            // Refresh the GPU-visible uniform/storage buffer from the shader's
+            // CPU shadow before binding — this is what makes set(name, value)
+            // actually reach the GPU each draw. memcpy is cheap (a handful of
+            // bytes typically) and the memory is HOST_COHERENT so no flush is
+            // needed before the descriptor read.
+            if (void* dst = shader.uniformMapped()) {
+                std::memcpy(dst, shader.uniformData(), shader.uniformSize());
+            }
+
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                 shader.layout(), 0, 1, &set, 0, nullptr);
         }
@@ -122,7 +132,6 @@ private:
     Device*               device_     = nullptr;
     VkRenderPass          renderPass_ = VK_NULL_HANDLE;
     VkSampleCountFlagBits msaa_       = VK_SAMPLE_COUNT_1_BIT;
-    double                startTime_  = 0.0;
 };
 
 } // namespace jvk

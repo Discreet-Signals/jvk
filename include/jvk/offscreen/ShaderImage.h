@@ -130,7 +130,6 @@ private:
         float viewportW, viewportH;
         float regionX, regionY;
     };
-    double startTime = 0.0;
 
     // Audio-thread → render-thread float FIFO
     std::unique_ptr<juce::AbstractFifo> fifo;

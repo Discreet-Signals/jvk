@@ -76,8 +76,7 @@ ShaderImage::ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
     : device_(Device::acquire()),
       w(width), h(height),
       fragShaderCode(fragmentSpv, fragmentSpv + fragmentSpvSize),
-      storageSize(storageBufSize),
-      startTime(juce::Time::getMillisecondCounterHiRes() / 1000.0)
+      storageSize(storageBufSize)
 {
     if (storageBufSize > 0)
     {
@@ -730,7 +729,10 @@ void ShaderImage::render()
     PushConstants pc;
     pc.resolutionX = (float)w;
     pc.resolutionY = (float)h;
-    pc.time        = (float)(juce::Time::getMillisecondCounterHiRes() / 1000.0 - startTime);
+    // Built-in `time` slot. Sourced from Device's process-wide clock so the
+    // offscreen path stays phase-aligned with Renderer's per-frame snapshot —
+    // toggling between Vulkan and ShaderImage rendering shows no time jump.
+    pc.time        = device_->time();
     pc.viewportW   = (float)w;
     pc.viewportH   = (float)h;
     pc.regionX     = 0.0f;

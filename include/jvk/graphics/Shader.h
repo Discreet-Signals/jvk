@@ -78,6 +78,69 @@ public:
                 if (!b.bound && b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                     b.boundDescriptor = device.caches().defaultDescriptor();
             }
+
+            // Back the reflected uniform/storage blocks with one host-visible
+            // coherent VkBuffer sized to the total reflected block bytes (the
+            // same total `uniformData_` is sized for). Each UBO/SSBO binding
+            // gets a descriptor write pointing at its slice via offset+range.
+            // Per-draw we memcpy uniformData_ → mapped pointer in
+            // ShaderPipeline::dispatch so set(name, value) reaches the GPU.
+            const VkDeviceSize bufferSize = uniformData_.size() * sizeof(float);
+            if (bufferSize > 0) {
+                VkBufferCreateInfo bci {};
+                bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+                bci.size  = bufferSize;
+                // Mark the buffer with both UBO and SSBO usage so a single
+                // backing buffer can serve every reflected block, regardless
+                // of whether the user shader declared it as `uniform` or
+                // `buffer`. The descriptor type drives how the GPU reads it.
+                bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                          | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+                vkCreateBuffer(d, &bci, nullptr, &uniformBuffer_);
+
+                VkMemoryRequirements req;
+                vkGetBufferMemoryRequirements(d, uniformBuffer_, &req);
+                VkMemoryAllocateInfo ai {};
+                ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+                ai.allocationSize  = req.size;
+                ai.memoryTypeIndex = Memory::findMemoryType(device.physicalDevice(),
+                    req.memoryTypeBits,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                  | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                vkAllocateMemory(d, &ai, nullptr, &uniformMemory_);
+                vkBindBufferMemory(d, uniformBuffer_, uniformMemory_, 0);
+                vkMapMemory(d, uniformMemory_, 0, bufferSize, 0, &uniformMapped_);
+
+                // Initial copy so any set() calls made before ensureCreated
+                // are visible on the GPU's first read.
+                std::memcpy(uniformMapped_, uniformData_.data(), bufferSize);
+            }
+
+            // Wire the descriptor set: one write per binding so the shader
+            // sees its UBO/SSBO buffers and image samplers as soon as it's
+            // bound. Image bindings either use the user-supplied descriptor
+            // (set via set(name, image, caches)) or the default 1x1 fallback.
+            std::vector<VkWriteDescriptorSet>   writes;
+            std::vector<VkDescriptorBufferInfo> bufferInfos;
+            bufferInfos.reserve(bindings_.size());
+            for (auto& b : bindings_) {
+                if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                    b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                    bufferInfos.push_back({ uniformBuffer_, b.offsetInBuffer, b.sizeInBuffer });
+                    VkWriteDescriptorSet w {};
+                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    w.dstSet = descriptorSet_;
+                    w.dstBinding = b.binding;
+                    w.descriptorType = b.type;
+                    w.descriptorCount = 1;
+                    w.pBufferInfo = &bufferInfos.back();
+                    writes.push_back(w);
+                }
+            }
+            if (!writes.empty())
+                vkUpdateDescriptorSets(d, static_cast<uint32_t>(writes.size()),
+                                       writes.data(), 0, nullptr);
         }
 
         // Create pipeline (fullscreen triangle, fragment-only shader)
@@ -224,8 +287,6 @@ public:
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);
 
-        startTime_ = std::chrono::duration<double>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
         created_ = true;
     }
 
@@ -236,17 +297,25 @@ public:
     VkPipelineLayout layout()        const { return layout_; }
     VkDescriptorSet  descriptorSet() const { return descriptorSet_; }
 
-    const float* uniformData() const { return uniformData_.data(); }
-    size_t       uniformSize() const { return uniformData_.size() * sizeof(float); }
+    const float* uniformData()   const { return uniformData_.data(); }
+    size_t       uniformSize()   const { return uniformData_.size() * sizeof(float); }
+    // Persistently-mapped pointer to the GPU-visible uniform/storage buffer
+    // backing every reflected block. Null if the shader declared no UBO/SSBO
+    // bindings. ShaderPipeline::dispatch memcpys uniformData_ into this each
+    // draw so set(name, value) propagates to the GPU.
+    void*        uniformMapped() const { return uniformMapped_; }
 
     ~Shader()
     {
         if (!device_) return;
         VkDevice d = device_->device();
-        if (pipeline_     != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_,     nullptr);
-        if (clipPipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(d, clipPipeline_, nullptr);
-        if (layout_       != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
-        if (descriptorSet_ != VK_NULL_HANDLE) device_->bindings().free(descriptorSet_);
+        if (uniformMapped_  != nullptr)        vkUnmapMemory(d, uniformMemory_);
+        if (uniformBuffer_  != VK_NULL_HANDLE) vkDestroyBuffer(d, uniformBuffer_, nullptr);
+        if (uniformMemory_  != VK_NULL_HANDLE) vkFreeMemory(d, uniformMemory_, nullptr);
+        if (pipeline_       != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_,     nullptr);
+        if (clipPipeline_   != VK_NULL_HANDLE) vkDestroyPipeline(d, clipPipeline_, nullptr);
+        if (layout_         != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
+        if (descriptorSet_  != VK_NULL_HANDLE) device_->bindings().free(descriptorSet_);
     }
 
 private:
@@ -304,7 +373,15 @@ private:
     VkDescriptorSet  descriptorSet_ = VK_NULL_HANDLE;
     Memory::M::LayoutID layoutId_   = 0;
 
-    double startTime_ = 0;
+    // Single host-visible coherent buffer backing every reflected UBO/SSBO
+    // block. NOTE: not double-buffered — fine for shaders drawn once per
+    // frame whose uniforms drift slowly (e.g. a `time` value); for shaders
+    // that draw multiple times per frame with different per-draw uniforms,
+    // a per-frame-slot ring would be needed to avoid GPU-vs-CPU races.
+    VkBuffer       uniformBuffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory uniformMemory_ = VK_NULL_HANDLE;
+    void*          uniformMapped_ = nullptr;
+
     bool   created_   = false;
 };
 

@@ -20,6 +20,12 @@ void Renderer::execute()
     auto frame = target_.beginFrame();
     if (frame.cmd == VK_NULL_HANDLE) return;
 
+    // Snapshot the device clock once per frame so every shader dispatched
+    // during this execute() sees an identical `time` value — guarantees
+    // deterministic per-frame motion and prevents drift between e.g. two
+    // DrawShader ops in the same frame reading slightly different clocks.
+    const float frameTime = device_.time();
+
     vertices_.beginFrame(frame.frameSlot);
     device_.flushRetired(frame.frameSlot);
 
@@ -276,7 +282,8 @@ void Renderer::execute()
                         static_cast<float>(frame.extent.width),
                         static_cast<float>(frame.extent.height),
                         cmd.clipBounds,
-                        cmd.stencilDepth);
+                        cmd.stencilDepth,
+                        frameTime);
                 }
             }
             continue;

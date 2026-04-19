@@ -15,16 +15,21 @@
 namespace jvk {
 
 // =============================================================================
-// HSVPipeline — fullscreen HSV scale/delta post-process.
+// HSVPipeline — fullscreen perceptual-colour scale/delta post-process.
 //
-// Sibling of EffectPipeline. One shader (hsv.frag) handles every HSV-space
-// operation via the MULTIPLY-then-ADD formula:
+// Sibling of EffectPipeline. Despite the "HSV" name kept for backward
+// compatibility, the shader (hsv.frag) runs in **Oklch** (polar Oklab) so
+// desaturation preserves perceptual contrast — pure blue collapses to a dark
+// grey, not the same bright grey as white. The H/S/V push-constant slots
+// map to Oklch's (h, C, L) respectively:
 //
-//   hsv *= (scaleH, scaleS, scaleV);
+//   hsv *= (scaleH, scaleS, scaleV);     // h, C, L
 //   hsv += (deltaH, deltaS, deltaV);
 //
 // Identity = scales 1.0, deltas 0.0. Common helpers in jvk::Graphics
-// (`saturate`, `shiftHue`, ...) just set a subset of the six fields.
+// (`saturate`, `shiftHue`, ...) still just set a subset of the six fields —
+// the semantics transfer: `saturate(a)` scales chroma, `shiftHue(t)` rotates
+// hue by `t` cycles.
 //
 // Used with a ping-pong pair of framebuffers — pass 1 applies the transform
 // A→B; pass 2 runs the identity transform B→A so `current` keeps its

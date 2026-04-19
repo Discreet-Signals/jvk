@@ -55,6 +55,14 @@ public:
     }
 
     bool isVulkanEnabled() const { return vulkanEnabled_; }
+    // Reports whether a usable Vulkan device was acquired at construction.
+    // `false` means the runtime has no MoltenVK / ICD or the GPU can't
+    // expose a compatible device — callers should fall back to JUCE's
+    // native renderer and not attempt to enable Vulkan.
+    bool isVulkanAvailable() const
+    {
+        return device_ != nullptr && device_->device() != VK_NULL_HANDLE;
+    }
     Device& getDevice() { return *device_; }
 
 protected:

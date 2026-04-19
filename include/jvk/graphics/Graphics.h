@@ -515,7 +515,11 @@ public:
     }
 
     // =========================================================================
-    // HSV transforms — one primitive, a handful of specialised helpers.
+    // Perceptual-colour transforms — one primitive, a handful of specialised
+    // helpers. The fragment shader (hsv.frag) runs in Oklch (polar Oklab)
+    // rather than classical HSV so desaturation/brightness ops respect human
+    // luminance perception; the H/S/V parameter names are kept for source
+    // compatibility and map to Oklch's (h, C, L).
     //
     // `hsv` is the universal form: `hsv *= (scaleH, scaleS, scaleV);
     //                                hsv += (deltaH, deltaS, deltaV);`
