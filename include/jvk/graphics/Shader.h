@@ -48,8 +48,9 @@ public:
     void set(const juce::String& name, std::span<const float> data)
     {
         for (auto& b : bindings_) {
-            if (b.name == name && b.offsetInBuffer + data.size_bytes() <= uniformData_.size() * sizeof(float)) {
-                memcpy(&uniformData_[b.offsetInBuffer / sizeof(float)], data.data(), data.size_bytes());
+            if (b.name == name) {
+                if (b.offsetInBuffer + data.size_bytes() <= uniformData_.size() * sizeof(float))
+                    memcpy(&uniformData_[b.offsetInBuffer / sizeof(float)], data.data(), data.size_bytes());
                 return;
             }
         }
@@ -368,15 +369,32 @@ private:
         uint32_t bufferOffset = 0;
         for (auto* rb : reflBindings) {
             BindingInfo info;
-            info.name = rb->name ? rb->name : "";
+            // Use CharPointer_UTF8 rather than the raw-char-ptr String ctor so
+            // we sidestep juce_String.cpp:327's ASCII-validity jassert — SPIRV-
+            // Reflect can hand back pointers into bytecode where non-ASCII
+            // bytes (or empty/unset name fields) trip it in Debug builds.
+            info.name = rb->name != nullptr
+                         ? juce::String(juce::CharPointer_UTF8(rb->name))
+                         : juce::String();
             info.binding = rb->binding;
             info.type = static_cast<VkDescriptorType>(rb->descriptor_type);
 
             if (rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
                 rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+                // SPIRV-Reflect zeros block.size for every storage buffer (it
+                // assumes they contain a runtime-sized array). Recover the
+                // actual size by walking members — the last member's offset +
+                // padded_size is the concrete block footprint for fixed-size
+                // declarations like `float data[15]`. If padded_size is also 0
+                // (true runtime array), fall back to size.
+                uint32_t blockSize = rb->block.size;
+                if (blockSize == 0 && rb->block.member_count > 0) {
+                    const auto& last = rb->block.members[rb->block.member_count - 1];
+                    blockSize = last.offset + (last.padded_size != 0 ? last.padded_size : last.size);
+                }
                 info.offsetInBuffer = bufferOffset;
-                info.sizeInBuffer = rb->block.size;
-                bufferOffset += rb->block.size;
+                info.sizeInBuffer   = blockSize;
+                bufferOffset       += blockSize;
             }
             bindings_.push_back(info);
         }
