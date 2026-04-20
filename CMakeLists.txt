@@ -83,6 +83,30 @@ if (APPLE AND NOT DEFINED ENV{VULKAN_SDK})
     endif()
 endif()
 
+# Windows cross-compile: an ARM64-host Vulkan SDK ships x64 binaries in
+# Lib-x64/Bin-x64 alongside the native ARM64 Lib/Bin. FindVulkan picks Lib/
+# for any 64-bit target, which would hand the x64 linker an ARM64 .lib and
+# produce unresolved-external errors. Steer to the x64 paths explicitly.
+if (WIN32 AND DEFINED ENV{VULKAN_SDK}
+    AND CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "x64"
+    AND EXISTS "$ENV{VULKAN_SDK}/Lib-x64/vulkan-1.lib")
+
+    set(Vulkan_LIBRARY "$ENV{VULKAN_SDK}/Lib-x64/vulkan-1.lib"
+        CACHE FILEPATH "x64 Vulkan loader for cross-compile" FORCE)
+
+    if (EXISTS "$ENV{VULKAN_SDK}/Bin-x64/glslc.exe")
+        set(Vulkan_GLSLC_EXECUTABLE "$ENV{VULKAN_SDK}/Bin-x64/glslc.exe"
+            CACHE FILEPATH "x64 glslc for cross-compile" FORCE)
+    endif()
+    if (EXISTS "$ENV{VULKAN_SDK}/Bin-x64/glslangValidator.exe")
+        set(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE
+            "$ENV{VULKAN_SDK}/Bin-x64/glslangValidator.exe"
+            CACHE FILEPATH "x64 glslangValidator for cross-compile" FORCE)
+    endif()
+
+    message(STATUS "jvk: Cross-compile x64 on ARM64 host → using Lib-x64/Bin-x64")
+endif()
+
 find_package(Vulkan REQUIRED)
 target_link_libraries(jvk INTERFACE Vulkan::Vulkan)
 
@@ -149,16 +173,14 @@ if (APPLE)
 
     if (DEFINED ENV{VULKAN_SDK})
         set(_DS_VK_MVK_LIB "$ENV{VULKAN_SDK}/lib/libMoltenVK.dylib")
-        set(_DS_VK_LOADER   "$ENV{VULKAN_SDK}/lib/libvulkan.1.dylib")
+        set(_DS_VK_LOADER  "$ENV{VULKAN_SDK}/lib/libvulkan.1.dylib")
     endif()
 
     if (_DS_VK_MVK_LIB AND EXISTS "${_DS_VK_MVK_LIB}")
         target_link_libraries(jvk INTERFACE "${_DS_VK_MVK_LIB}")
-    endif()
 
-    if (_DS_VK_MVK_LIB AND EXISTS "${_DS_VK_MVK_LIB}")
         set(DS_VULKAN_MVK_LIB "${_DS_VK_MVK_LIB}" CACHE INTERNAL "Path to libMoltenVK.dylib")
-        set(DS_VULKAN_LOADER  "${_DS_VK_LOADER}"   CACHE INTERNAL "Path to libvulkan.1.dylib")
+        set(DS_VULKAN_LOADER  "${_DS_VK_LOADER}"  CACHE INTERNAL "Path to libvulkan.1.dylib")
 
         set(_DS_VK_ICD_JSON "${CMAKE_CURRENT_BINARY_DIR}/MoltenVK_icd.json")
         file(WRITE "${_DS_VK_ICD_JSON}" [=[{
@@ -170,31 +192,6 @@ if (APPLE)
     }
 }]=])
         set(DS_VULKAN_ICD_JSON "${_DS_VK_ICD_JSON}" CACHE INTERNAL "Path to bundled ICD manifest")
-
-        function(jvk_bundle TARGET)
-            add_custom_command(TARGET ${TARGET} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E make_directory
-                    "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${DS_VULKAN_MVK_LIB}"
-                    "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks/libMoltenVK.dylib"
-                COMMENT "jvk: Bundling MoltenVK into ${TARGET}"
-            )
-            if (EXISTS "${DS_VULKAN_LOADER}")
-                add_custom_command(TARGET ${TARGET} POST_BUILD
-                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                        "${DS_VULKAN_LOADER}"
-                        "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks/libvulkan.1.dylib"
-                )
-            endif()
-            add_custom_command(TARGET ${TARGET} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E make_directory
-                    "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Resources/vulkan/icd.d"
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${DS_VULKAN_ICD_JSON}"
-                    "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Resources/vulkan/icd.d/MoltenVK_icd.json"
-            )
-        endfunction()
     endif()
 
 elseif (WIN32)
@@ -206,6 +203,44 @@ elseif (UNIX)
         target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_XLIB_KHR)
     endif()
 endif()
+
+# ==============================================================================
+# jvk_bundle — per plugin-format target runtime setup. Call from the consuming
+# project after juce_add_plugin (or any target that produces a bundle/exe).
+#   macOS:   copy libMoltenVK + loader + ICD manifest into the bundle.
+#   Windows: explicit PRIVATE link to Vulkan::Vulkan. JUCE's per-format
+#            _SharedCode static libs don't reliably propagate the INTERFACE
+#            Vulkan dep through to the final .exe / .vst3 under MSVC.
+#   Linux:   no-op (system loader handles Vulkan at runtime).
+# ==============================================================================
+function(jvk_bundle TARGET)
+    if (APPLE AND DS_VULKAN_MVK_LIB)
+        add_custom_command(TARGET ${TARGET} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DS_VULKAN_MVK_LIB}"
+                "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks/libMoltenVK.dylib"
+            COMMENT "jvk: Bundling MoltenVK into ${TARGET}"
+        )
+        if (EXISTS "${DS_VULKAN_LOADER}")
+            add_custom_command(TARGET ${TARGET} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${DS_VULKAN_LOADER}"
+                    "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks/libvulkan.1.dylib"
+            )
+        endif()
+        add_custom_command(TARGET ${TARGET} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E make_directory
+                "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Resources/vulkan/icd.d"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${DS_VULKAN_ICD_JSON}"
+                "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Resources/vulkan/icd.d/MoltenVK_icd.json"
+        )
+    elseif (WIN32 AND TARGET Vulkan::Vulkan)
+        target_link_libraries(${TARGET} PRIVATE Vulkan::Vulkan)
+    endif()
+endfunction()
 
 # ==============================================================================
 # Examples — EXCLUDE_FROM_ALL: show up as IDE targets, don't build by default.
