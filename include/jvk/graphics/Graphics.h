@@ -604,10 +604,27 @@ public:
 
     void drawShader(Shader& shader, juce::Rectangle<float> region = {})
     {
-        if (region.isEmpty()) region = state().clipBounds.toFloat();
+        if (isClipEmpty()) return;
         auto& s = state();
+        // Fold the full paint transform (setOrigin + addTransform stack) and
+        // displayScale into the region at record time, matching the convention
+        // used by fillRect / darken / tint — the pipeline receives a
+        // physical-pixel rect and the shader_region.vert math lines up with
+        // the physical-pixel viewport. For rotated/skewed transforms this uses
+        // the AABB of the transformed rect (toPixels semantics); axis-aligned
+        // transforms are exact.
+        juce::Rectangle<float> regionPx;
+        if (region.isEmpty()) {
+            regionPx = s.clipBounds.toFloat();
+        } else {
+            auto transformed = region.transformedBy(s.transform);
+            regionPx = { transformed.getX()      * displayScale_,
+                         transformed.getY()      * displayScale_,
+                         transformed.getWidth()  * displayScale_,
+                         transformed.getHeight() * displayScale_ };
+        }
         renderer_.push(DrawOp::DrawShader, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            DrawShaderParams { &shader, region, displayScale_ });
+            DrawShaderParams { &shader, regionPx, displayScale_ });
     }
 
     Renderer& getRenderer() { return renderer_; }
