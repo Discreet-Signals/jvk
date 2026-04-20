@@ -14,6 +14,7 @@
 
 #pragma once
 #include <msdfgen.h>
+#include <core/ShapeDistanceFinder.h>
 
 // =============================================================================
 // jvk::msdf — standalone MSDF generator for arbitrary juce::Path input.
@@ -30,11 +31,18 @@
 //                                 we emit the explicit lineTo back to each
 //                                 subpath's start).
 //   2. shape.normalize()        — msdfgen convergent-edge handling.
-//   3. normaliseContourWinding  — shoelace signed-area + bbox-containment
-//                                 depth; enforces outer-CCW / hole-CW. Fixes
-//                                 single-contour non-convex glyphs (e.g. 't')
-//                                 that msdfgen's scanline-based orientContours
-//                                 can leave unreversed.
+//   3. normaliseContourWinding  — canonical msdfgen / msdf-atlas-gen approach:
+//                                 trust the source's relative per-contour
+//                                 windings (outer vs hole, encoded in the font
+//                                 itself and preserved through JUCE's internal
+//                                 scale(1, -1) Y-flip), compute true distance
+//                                 at a far-outside probe point, and globally
+//                                 reverse every contour iff the overall sense
+//                                 is inverted. No per-contour heuristic —
+//                                 avoids both the 't' case that msdfgen's
+//                                 Shape::orientContours mishandles AND the
+//                                 bbox-nesting false-positive that filled 'g'
+//                                 counters before.
 //   4. edgeColoringByDistance   — picks per-edge colours so the three MSDF
 //                                 channels disagree only where their median
 //                                 resolves correctly. Handles tight interior
@@ -48,11 +56,18 @@
 //                                 FILL_ODD rule. Rewrites the sign of pixels
 //                                 whose per-contour distance combiner output
 //                                 disagreed with the true inside/outside test.
-//                                 Fixes pinhole/stripe artefacts in glyphs
-//                                 with overlapping same-winding contours.
-//   7. msdfErrorCorrection      — fast median-coherence pass with
-//                                 DO_NOT_CHECK_DISTANCE (step 6 already did
-//                                 the exact solve). Cleans edge-coloring seams.
+//                                 Note this only flips ALL three channels
+//                                 together (based on median), so it cannot
+//                                 fix a single rogue channel — that's step 7.
+//   7. msdfErrorCorrection      — error-correction with CHECK_DISTANCE_AT_EDGE
+//                                 so per-channel pinholes whose median already
+//                                 agreed with the scanline (step 6 a no-op for
+//                                 them) but whose true shape distance disagrees
+//                                 are still caught and equalized to median.
+//                                 This is msdfgen's main.cpp default; msdf-
+//                                 atlas-gen downgrades to DO_NOT_CHECK_DISTANCE
+//                                 for batch-render speed, which we don't need
+//                                 for an on-demand glyph atlas.
 // =============================================================================
 
 namespace jvk::msdf
@@ -156,48 +171,27 @@ inline msdfgen::Shape jucePathToShape(const juce::Path& path)
 }
 
 // -----------------------------------------------------------------------------
-// Winding normalisation. Replaces msdfgen's Shape::orientContours() which uses
-// a scanline sampled at ~0.618 of each contour's vertical extent — for non-
-// convex single-contour glyphs (e.g. 't') that ray can hit the cross-bar and
-// produce intersections whose dy signs cancel, leaving the contour unreversed
-// and therefore inverted in the output.
-//
-// Shoelace signed area is robust for any closed polygon. Bbox-containment
-// depth approximates nesting cheaply (exact for the common non-overlapping
-// case: letter with holes, rings, nested islands). Forced orientation:
-//   even depth (outer / island nested in hole)   → CCW (winding = +1)
-//   odd  depth (hole  / hole-nested-in-island)   → CW  (winding = -1)
-// This matches msdfgen's expected "outer filled, hole empty" fragment output
-// for Y-flipped JUCE path data.
+// Winding normalisation — canonical msdfgen / msdf-atlas-gen approach: trust
+// the source's RELATIVE per-contour windings (outer vs hole, encoded in the
+// font and preserved through JUCE's scale(1, -1) Y-flip) and only fix the
+// GLOBAL sense. Pick a point guaranteed to be outside the shape's bounds,
+// query true signed distance; a positive result means msdfgen sees that far-
+// outside point as inside, i.e. the overall orientation is inverted — reverse
+// every contour.
 // -----------------------------------------------------------------------------
 inline void normaliseContourWinding(msdfgen::Shape& shape)
 {
     if (shape.contours.empty()) return;
 
-    std::vector<msdfgen::Shape::Bounds> bounds;
-    bounds.reserve(shape.contours.size());
-    for (auto& c : shape.contours)
-    {
-        msdfgen::Shape::Bounds b { +INFINITY, +INFINITY, -INFINITY, -INFINITY };
-        c.bound(b.l, b.b, b.r, b.t);
-        bounds.push_back(b);
-    }
+    auto bounds = shape.getBounds();
+    msdfgen::Point2 outerPoint(
+        bounds.l - (bounds.r - bounds.l) - 1.0,
+        bounds.b - (bounds.t - bounds.b) - 1.0);
 
-    for (size_t i = 0; i < shape.contours.size(); ++i)
-    {
-        int depth = 0;
-        for (size_t j = 0; j < shape.contours.size(); ++j)
-        {
-            if (i == j) continue;
-            const auto& bi = bounds[i];
-            const auto& bj = bounds[j];
-            if (bj.l <= bi.l && bj.b <= bi.b && bj.r >= bi.r && bj.t >= bi.t)
-                ++depth;
-        }
-        const int expected = (depth & 1) ? -1 : +1;
-        if (shape.contours[i].winding() != expected)
-            shape.contours[i].reverse();
-    }
+    const double d = msdfgen::SimpleTrueShapeDistanceFinder::oneShotDistance(shape, outerPoint);
+    if (d > 0)
+        for (auto& c : shape.contours)
+            c.reverse();
 }
 
 // -----------------------------------------------------------------------------
@@ -256,9 +250,16 @@ inline Result rasteriseJucePath(const juce::Path& path, const Config& cfg)
         : msdfgen::FILL_ODD;
     msdfgen::distanceSignCorrection(msdf, shape, projection, msdfRule);
 
+    // CHECK_DISTANCE_AT_EDGE: distanceSignCorrection above flips all three
+    // channels together (based on median) and so can't fix a pixel whose
+    // median already agrees with the scanline fill but whose individual
+    // channels straddle the boundary — a median-coherent pinhole. Running
+    // error correction with exact shape-distance checking at edges catches
+    // those. Matches msdfgen main.cpp's default; msdf-atlas-gen downgrades
+    // to DO_NOT_CHECK_DISTANCE purely for batch-render speed.
     msdfgen::MSDFGeneratorConfig ecCfg;
     ecCfg.errorCorrection.distanceCheckMode =
-        msdfgen::ErrorCorrectionConfig::DO_NOT_CHECK_DISTANCE;
+        msdfgen::ErrorCorrectionConfig::CHECK_DISTANCE_AT_EDGE;
     msdfgen::msdfErrorCorrection(msdf, shape, projection,
                                  msdfgen::Range(rangeInShapeUnits), ecCfg);
 
