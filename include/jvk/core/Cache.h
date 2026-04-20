@@ -251,6 +251,25 @@ public:
         return h;
     }
 
+    // Hash a juce::Image by the actual pixel-buffer address of its top-left
+    // pixel plus dimensions and line stride. Stable across the ephemeral
+    // SubsectionPixelData wrappers that JUCE builds for 9-arg drawImage calls
+    // (those wrappers sit on the stack and get reused at the same address,
+    // which makes getPixelData().get() useless as a cache key). BitmapData::data
+    // for a subsection points into the parent's buffer at the subsection origin,
+    // so different source-Y offsets hash differently while identical draws of
+    // the same subsection hash the same.
+    static uint64_t hashImage(const juce::Image& img)
+    {
+        if (!img.isValid()) return 0;
+        juce::Image::BitmapData bd(img, juce::Image::BitmapData::readOnly);
+        uint64_t h = reinterpret_cast<uint64_t>(bd.data);
+        h ^= (static_cast<uint64_t>(static_cast<uint32_t>(img.getWidth())) << 32)
+           |  static_cast<uint64_t>(static_cast<uint32_t>(img.getHeight()));
+        h ^= static_cast<uint64_t>(bd.lineStride) * 0x9e3779b97f4a7c15ULL;
+        return h;
+    }
+
     VkDescriptorSet getTexture(uint64_t hash, const juce::Image& img)
     {
         if (auto* cached = textures_.find(hash))
@@ -317,6 +336,8 @@ public:
     VkDescriptorSet gradientDescriptor() const { return gradientAtlas_.descriptorSet(); }
 
     VkDescriptorSet defaultDescriptor() const { return blackPixel_.descriptorSet; }
+    VkImageView     defaultImageView() const { return blackPixel_.image.view(); }
+    VkSampler       defaultSampler()   const { return blackPixel_.image.sampler(); }
 
     void beginFrame(uint64_t frameId)
     {

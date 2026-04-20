@@ -362,7 +362,7 @@ public:
     {
         if (isClipEmpty() || !img.isValid()) return;
         auto& s = state();
-        uint64_t hash = reinterpret_cast<uint64_t>(img.getPixelData().get());
+        uint64_t hash = ResourceCaches::hashImage(img);
 
         renderer_.caches().getTexture(hash, img);
 
