@@ -12,18 +12,23 @@ public:
         reflectShader();
     }
 
-    // Image bindings: resolved through ResourceCaches immediately
+    // Image bindings: ensure the image is registered in ResourceCaches, then
+    // stash its view+sampler on the binding. If the shader is already live
+    // the write is applied immediately; otherwise ensureCreated() picks it up.
     void set(const juce::String& name, const juce::Image& image, ResourceCaches& caches)
     {
         for (auto& b : bindings_) {
             if (b.name == name && b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-                uint64_t hash = reinterpret_cast<uint64_t>(image.getPixelData().get());
+                uint64_t hash = ResourceCaches::hashImage(image);
+                caches.getTexture(hash, image);
                 auto* tc = caches.textures().find(hash);
-                auto desc = tc ? tc->descriptorSet : VK_NULL_HANDLE;
-                if (desc != VK_NULL_HANDLE) {
-                    b.boundDescriptor = desc;
-                    b.bound = true;
-                }
+                if (tc == nullptr) return;
+                b.imageView = tc->image.view();
+                b.sampler   = tc->image.sampler();
+                b.bound     = true;
+                if (created_ && descriptorSet_ != VK_NULL_HANDLE)
+                    Memory::M::writeImage(device_->device(), descriptorSet_,
+                                          b.binding, b.imageView, b.sampler);
                 return;
             }
         }
@@ -73,10 +78,13 @@ public:
             descriptorSet_ = device.bindings().alloc(layoutId_);
             setLayout = device.bindings().getLayout(layoutId_);
 
-            // Bind defaults (1x1 black pixel) for unset image bindings
+            // Bind defaults (1x1 black pixel) for unset image bindings so the
+            // descriptor slot is never sampled uninitialized.
             for (auto& b : bindings_) {
-                if (!b.bound && b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                    b.boundDescriptor = device.caches().defaultDescriptor();
+                if (!b.bound && b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                    b.imageView = device.caches().defaultImageView();
+                    b.sampler   = device.caches().defaultSampler();
+                }
             }
 
             // Back the reflected uniform/storage blocks with one host-visible
@@ -123,7 +131,9 @@ public:
             // (set via set(name, image, caches)) or the default 1x1 fallback.
             std::vector<VkWriteDescriptorSet>   writes;
             std::vector<VkDescriptorBufferInfo> bufferInfos;
+            std::vector<VkDescriptorImageInfo>  imageInfos;
             bufferInfos.reserve(bindings_.size());
+            imageInfos.reserve(bindings_.size());
             for (auto& b : bindings_) {
                 if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
                     b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
@@ -135,6 +145,18 @@ public:
                     w.descriptorType = b.type;
                     w.descriptorCount = 1;
                     w.pBufferInfo = &bufferInfos.back();
+                    writes.push_back(w);
+                }
+                else if (b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                    imageInfos.push_back({ b.sampler, b.imageView,
+                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
+                    VkWriteDescriptorSet w {};
+                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    w.dstSet = descriptorSet_;
+                    w.dstBinding = b.binding;
+                    w.descriptorType = b.type;
+                    w.descriptorCount = 1;
+                    w.pImageInfo = &imageInfos.back();
                     writes.push_back(w);
                 }
             }
@@ -325,7 +347,8 @@ private:
         VkDescriptorType type;
         uint32_t         offsetInBuffer = 0;
         uint32_t         sizeInBuffer = 0;
-        VkDescriptorSet  boundDescriptor = VK_NULL_HANDLE;
+        VkImageView      imageView = VK_NULL_HANDLE;
+        VkSampler        sampler   = VK_NULL_HANDLE;
         bool             bound = false;
     };
 
