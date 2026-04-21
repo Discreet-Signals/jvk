@@ -364,7 +364,7 @@ void Renderer::execute()
                 pc.lineBY     = sp.lineB[1];
                 pc.maxRadius     = sp.maxRadius;
                 pc.falloff       = sp.falloff;
-                pc.displayScale  = sp.displayScale;
+                pc.blurStep      = sp.blurStep;
                 pc.cornerRadius  = sp.cornerRadius;
                 pc.lineThickness = sp.lineThickness;
                 pc.shapeType     = static_cast<int>(sp.shapeType);
@@ -373,18 +373,92 @@ void Renderer::execute()
 
                 VkRect2D scissor { {0, 0}, frame.extent };
                 VkRenderPass rp = target_.effectRenderPass();
-                preCopyIfClipped(cmd.stencilDepth);
-                effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                    shapeBlur_->applyPass(frame.cmd, src, dst, rp,
-                        frame.extent, scissor, 1.0f, 0.0f, pc,
-                        static_cast<uint32_t>(cmd.stencilDepth));
-                });
-                preCopyIfClipped(cmd.stencilDepth);
-                effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                    shapeBlur_->applyPass(frame.cmd, src, dst, rp,
-                        frame.extent, scissor, 0.0f, 1.0f, pc,
-                        static_cast<uint32_t>(cmd.stencilDepth));
-                });
+                // mode: 0 (Low)    → 2 separable passes (H, V). Cheap, but
+                //                    chained variable-radius passes produce
+                //                    streaks along whichever direction holds
+                //                    a larger effective radius.
+                //       1 (Medium) → 1 pass, 32-tap Poisson-disc blue-noise
+                //                    kernel. Constant cost regardless of
+                //                    radius. No streaks — anisotropic noise
+                //                    reads as stochastic texture, not a
+                //                    directional smear.
+                //       2 (High)   → 1 pass, true 2D Gaussian using the 2D
+                //                    Linear Sampling Trick (¼ the taps of a
+                //                    naïve N² loop, mathematically exact).
+                //                    No streaks.
+                //
+                // Medium + High both read the scene source directly; only
+                // one tile-resolve. For small-N blurs this can beat Low.
+                const int32_t kt = (sp.mode == 0) ? 0
+                                 : (sp.mode == 1) ? 1 : 2;
+                const uint32_t passCount = (sp.mode == 0) ? 2u : 1u;
+                pc.kernelType = kt;
+                for (uint32_t passIx = 0; passIx < passCount; passIx++) {
+                    float dx, dy;
+                    if (kt != 0) {
+                        // 2D kernels ignore direction; pass any unit vector.
+                        dx = 1.0f; dy = 0.0f;
+                    } else {
+                        // Separable H then V.
+                        dx = (passIx == 0) ? 1.0f : 0.0f;
+                        dy = (passIx == 0) ? 0.0f : 1.0f;
+                    }
+                    preCopyIfClipped(cmd.stencilDepth);
+                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
+                        shapeBlur_->applyPass(frame.cmd, src, dst, rp,
+                            frame.extent, scissor, dx, dy, pc,
+                            static_cast<uint32_t>(cmd.stencilDepth));
+                    });
+                }
+            }
+            beginSceneRP(scenePassLoad, /*withClears=*/false);
+            continue;
+        }
+        if (cmd.op == DrawOp::BlurPath) {
+            vkCmdEndRenderPass(frame.cmd);
+
+            if (pathBlur_ && pathPipeline_) {
+                auto& bp = arena_.read<BlurPathParams>(cmd.dataOffset);
+
+                PathBlurPipeline::PushConstants pc {};
+                pc.maxRadius       = bp.maxRadius;
+                pc.falloff         = bp.falloff;
+                pc.strokeHalfWidth = bp.strokeHalfWidth;
+                pc.segmentStart    = bp.segmentStart;
+                pc.segmentCount    = bp.segmentCount;
+                pc.fillRule        = bp.fillRule;
+                pc.edgePlacement   = static_cast<int32_t>(bp.edgePlacement);
+                pc.inverted        = static_cast<int32_t>(bp.inverted);
+
+                // PathPipeline::ssboDescriptorSet() returns the descriptor
+                // for the CURRENT frame slot (set by the most recent
+                // flushToGPU in execute's prologue). That's the slot whose
+                // SSBO holds this frame's segments — including those we
+                // uploaded in Graphics::{draw,fill}BlurredPath.
+                VkDescriptorSet pathDesc = pathPipeline_->ssboDescriptorSet();
+
+                VkRect2D scissor { {0, 0}, frame.extent };
+                VkRenderPass rp = target_.effectRenderPass();
+                // Same mode layout as BlurShape above — see that comment.
+                const int32_t kt = (bp.mode == 0) ? 0
+                                 : (bp.mode == 1) ? 1 : 2;
+                const uint32_t passCount = (bp.mode == 0) ? 2u : 1u;
+                pc.kernelType = kt;
+                for (uint32_t passIx = 0; passIx < passCount; passIx++) {
+                    float dx, dy;
+                    if (kt != 0) {
+                        dx = 1.0f; dy = 0.0f;
+                    } else {
+                        dx = (passIx == 0) ? 1.0f : 0.0f;
+                        dy = (passIx == 0) ? 0.0f : 1.0f;
+                    }
+                    preCopyIfClipped(cmd.stencilDepth);
+                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
+                        pathBlur_->applyPass(frame.cmd, src, pathDesc, dst, rp,
+                            frame.extent, scissor, dx, dy, pc,
+                            static_cast<uint32_t>(cmd.stencilDepth));
+                    });
+                }
             }
             beginSceneRP(scenePassLoad, /*withClears=*/false);
             continue;

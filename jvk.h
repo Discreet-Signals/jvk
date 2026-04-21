@@ -76,6 +76,7 @@
 #include "include/jvk/graphics/pipelines/effect/HSVPipeline.h"
 #include "include/jvk/graphics/pipelines/effect/ShapeBlurPipeline.h"
 #include "include/jvk/graphics/pipelines/path/PathPipeline.h"
+#include "include/jvk/graphics/pipelines/effect/PathBlurPipeline.h"
 #include "include/jvk/graphics/pipelines/clip/ClipPipeline.h"
 #include "include/jvk/graphics/Graphics.h"
 #include "include/jvk/graphics/Shader.h"

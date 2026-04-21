@@ -7,6 +7,7 @@ class RenderTarget;
 class EffectPipeline;
 class HSVPipeline;
 class ShapeBlurPipeline;
+class PathBlurPipeline;
 class ShaderPipeline;
 class PathPipeline;
 class ClipPipeline;
@@ -38,6 +39,7 @@ enum class DrawOp : uint8_t {
     EffectKernel,
     EffectHSV,          // full-screen HSV scale/delta (saturate, shiftHue, etc.)
     BlurShape,
+    BlurPath,          // analytical path SDF blur (fill or stroke ring)
     PushClipRect, PopClipRect,      // scissor-only clips (State-side stack)
     PushClipPath, PopClipPath,      // stencil INCR/DECR via ClipPipeline
     COUNT
@@ -259,8 +261,15 @@ public:
     void setHSVPipeline(HSVPipeline* hp) { hsvPipeline_ = hp; }
 
     // Attach the shape-aware blur pipeline. Required for BlurShape draw ops
-    // (g.blurEllipse / blurRect / blurRoundedRectangle / blurLine).
+    // (Graphics::{draw,fill}Blurred{Rectangle,RoundedRectangle,Ellipse} +
+    // drawBlurredLine).
     void setShapeBlur(ShapeBlurPipeline* sb) { shapeBlur_ = sb; }
+
+    // Attach the path-blur pipeline. Required for BlurPath draw ops
+    // (Graphics::{draw,fill}BlurredPath). Shares PathPipeline's per-frame
+    // segment SSBO — must be set AFTER setPathPipeline() so the dispatch
+    // can grab that descriptor.
+    void setPathBlur(PathBlurPipeline* pb) { pathBlur_ = pb; }
 
     // Attach the DrawShader dispatcher. Required for DrawShader draw ops
     // (g.drawShader). User shaders own their own VkPipeline; this module
@@ -331,6 +340,7 @@ private:
     EffectPipeline*    copyEffect_       = nullptr;
     HSVPipeline*       hsvPipeline_      = nullptr;
     ShapeBlurPipeline* shapeBlur_        = nullptr;
+    PathBlurPipeline*  pathBlur_         = nullptr;
     ShaderPipeline*    shaderPipeline_   = nullptr;
     PathPipeline*      pathPipeline_     = nullptr;
     ClipPipeline*      clipPipeline_     = nullptr;

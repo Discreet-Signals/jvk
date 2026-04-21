@@ -12,6 +12,47 @@ enum class BlurEdge : uint32_t {
     Outside  = 2,
 };
 
+// Blur kernel strategy. Picks the trade-off between speed and directional
+// artefact tolerance:
+//
+//   Low    — 2 separable passes at 0° and 90°. Cheapest. Visible streaks
+//            at `t` boundaries because each pass reads the previous pass's
+//            variable-radius output; the axis-aligned streak direction
+//            usually aligns with rectangular shape edges so it tucks into
+//            the geometry, but for arbitrary shapes a cross artefact is
+//            visible. Fine for most UI overlays at small radius.
+//   Medium — 3 separable passes at 0°, 60°, 120°. Redistributes the
+//            streak across 3 angles (6-fold). Trades the axis-aligned
+//            cross for a faint hex; better on organic shapes but worse
+//            on rectangles (streaks no longer align with edges).
+//   High   — 1 pass, **true 2D** Gaussian — samples every physical pixel
+//            in the kernel neighbourhood directly from the scene source,
+//            no chained passes. Zero separable-blur artefacts. Cost is
+//            O(N²) per fragment vs O(N) per pass, so reserve for hero
+//            elements where Low / Medium streak visibly and the blur
+//            radius is modest.
+//
+// TODO: this enum will grow into a real "blur type" selector. Candidates:
+//   - Streaky / Anisotropic — deliberately non-isotropic directional
+//     blur (Gaussian with a separable-axis imbalance) for frosted / hair-
+//     line / motion-glass looks. The "tighter falloff at higher quality"
+//     bug we just fixed produced a textured glass effect that's worth
+//     revisiting as a proper mode.
+//   - Box                    — cheap uniform-radius box filter.
+//   - Kawase / DualKawase    — rotated 4-tap patterns; opt-in when we
+//                              have a batched command plan that makes
+//                              the pyramid setup worthwhile.
+//   - BokehHex / BokehDisc   — bokeh-aesthetic non-separable kernels
+//                              for DOF-style background content.
+// When adding those, consider renaming the enum values to namespace-
+// prefixed (GaussianLow, GaussianHigh, ..., Streaky, Box, etc.) so the
+// type (Gaussian vs Kawase vs Box) is explicit at call sites.
+enum class BlurMode : uint32_t {
+    Low    = 0,
+    Medium = 1,
+    High   = 2,
+};
+
 // =============================================================================
 // Parameter structs — POD only, packed into Arena via memcpy.
 // Non-POD types (Font, FillType) stored in Renderer side vectors by index.
@@ -176,20 +217,23 @@ struct HSVParams {
 
 // Shape-aware variable-radius blur. Pre-packed in the layout the fragment
 // shader's push-constant block expects, minus viewport/direction which the
-// pipeline fills in per-pass. Distances are in LOGICAL pixels; the shader
-// multiplies by `displayScale` when converting to physical sample offsets.
+// pipeline fills in per-pass. Distances are in USER-LOGICAL pixels
+// (pre-transform); the shader converts kernel sample offsets to physical
+// texels via `blurStep`.
 struct BlurShapeParams {
     float    invXform[6];          // inverse affine: frag (physical) → shape-local (logical)
     float    shapeHalf[2];         // rect/rrect/ellipse halfsize (logical)
     float    lineB[2];             // line: endpoint B in shape-local (A is origin)
-    float    maxRadius;            // logical pixels
-    float    falloff;              // logical pixels
-    float    displayScale;
+    float    maxRadius;            // user-logical pixels
+    float    falloff;              // user-logical pixels
+    float    blurStep;             // physical texels per user-logical pixel
+                                   // (= transformScale * displayScale)
     float    cornerRadius;         // rrect only
     float    lineThickness;        // line only
     uint32_t shapeType;            // 0=rect, 1=rrect, 2=ellipse, 3=line
     uint32_t edgePlacement;        // BlurEdge as uint32
     uint32_t inverted;             // 0 or 1
+    uint32_t mode;                 // BlurMode as uint32 (pass count / type lives here)
 };
 
 struct EffectResolveParams {
@@ -197,6 +241,23 @@ struct EffectResolveParams {
     uint32_t               type;
     juce::Rectangle<float> region;
     float                  scale;
+};
+
+// Analytical path SDF blur. Graphics::{draw,fill}BlurredPath flattens the
+// path to line segments in PHYSICAL pixels (same as FillPath) and uploads
+// them via PathPipeline::uploadSegments. All distances below are also in
+// PHYSICAL pixels — the C++ caller pre-multiplies by transformScale ×
+// displayScale so the shader runs in one coord space (step = 1 texel).
+struct BlurPathParams {
+    uint32_t segmentStart;
+    uint32_t segmentCount;
+    uint32_t fillRule;        // 0 = non-zero, 1 = even-odd
+    float    maxRadius;       // physical px
+    float    falloff;         // physical px
+    float    strokeHalfWidth; // physical px — 0 for fill, >0 for stroke
+    uint32_t edgePlacement;   // BlurEdge as uint32
+    uint32_t inverted;        // 0 or 1
+    uint32_t mode;            // BlurMode as uint32 (pass count / type lives here)
 };
 
 } // namespace jvk

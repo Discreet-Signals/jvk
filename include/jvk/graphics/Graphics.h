@@ -554,53 +554,137 @@ public:
     }
 
     // =========================================================================
-    // Shape-aware variable-radius blur. Inside the shape blurs at `blurRadius`;
-    // the effective radius ramps down to 0 across `falloffRadius` logical px.
-    // `edge` controls where the falloff band sits relative to the shape edge.
-    // `inverted = true` blurs OUTSIDE the shape instead (ramp direction flips).
+    // Shape-aware variable-radius blur — JUCE-style draw/fill split.
+    //
+    //   draw*Blurred…  — stroke variants; `lineThickness` controls the ring
+    //                    width. The blur band is centred on the shape's edge
+    //                    (the stroke's zero-crossing) rather than the interior.
+    //   fill*Blurred…  — fill variants; blur ramps from `blurRadius` inside
+    //                    the shape down to 0 across `falloffRadius`. An
+    //                    optional trailing `inverted` flips the fill to the
+    //                    complement ("blur everything OUTSIDE the shape").
+    //
+    // `edge` controls where the falloff band sits relative to the shape's
+    // boundary (the ring boundary for strokes, SDF=0 for fills).
     // All distances are logical pixels; displayScale is folded in per-pixel.
     // =========================================================================
 
-    void blurRect(const juce::Rectangle<float>& rect,
-                  float blurRadius, float falloffRadius,
-                  bool inverted = false, BlurEdge edge = BlurEdge::Centered)
-    {
-        pushBlurShape(rect, 0.0f, /*shapeType*/ 0,
-                      blurRadius, falloffRadius, inverted, edge,
-                      /*lineB*/ {0,0}, /*lineThickness*/ 0.0f);
-    }
+    // Stroke variants --------------------------------------------------------
 
-    void blurRoundedRectangle(const juce::Rectangle<float>& rect, float cornerSize,
-                              float blurRadius, float falloffRadius,
-                              bool inverted = false, BlurEdge edge = BlurEdge::Centered)
-    {
-        pushBlurShape(rect, cornerSize, /*shapeType*/ 1,
-                      blurRadius, falloffRadius, inverted, edge,
-                      {0,0}, 0.0f);
-    }
-
-    void blurEllipse(const juce::Rectangle<float>& area,
-                     float blurRadius, float falloffRadius,
-                     bool inverted = false, BlurEdge edge = BlurEdge::Centered)
-    {
-        pushBlurShape(area, 0.0f, /*shapeType*/ 2,
-                      blurRadius, falloffRadius, inverted, edge,
-                      {0,0}, 0.0f);
-    }
-
-    void blurLine(const juce::Line<float>& line, float thickness,
-                  float blurRadius, float falloffRadius,
-                  bool inverted = false, BlurEdge edge = BlurEdge::Centered)
+    void drawBlurredLine(const juce::Line<float>& line, float lineThickness,
+                         float blurRadius, float falloffRadius,
+                         BlurEdge edge = BlurEdge::Centered,
+                         BlurMode mode = BlurMode::Low)
     {
         // Shape-local anchor at endpoint A; B is stored relative to A.
         auto a = line.getStart();
         auto b = line.getEnd();
         juce::Rectangle<float> anchor { a.x, a.y, 0.0f, 0.0f };
         juce::Point<float> bRel { b.x - a.x, b.y - a.y };
+        // Capsule's `lineThickness` shader field is cross-section radius.
         pushBlurShape(anchor, 0.0f, /*shapeType*/ 3,
-                      blurRadius, falloffRadius, inverted, edge,
-                      { bRel.x, bRel.y }, thickness * 0.5f);
+                      blurRadius, falloffRadius, /*inverted*/ false, edge,
+                      { bRel.x, bRel.y }, lineThickness * 0.5f, mode);
     }
+
+    void drawBlurredRectangle(const juce::Rectangle<float>& rect, float lineThickness,
+                              float blurRadius, float falloffRadius,
+                              BlurEdge edge = BlurEdge::Centered,
+                              BlurMode mode = BlurMode::Low)
+    {
+        pushBlurShape(rect, 0.0f, /*shapeType*/ 0,
+                      blurRadius, falloffRadius, /*inverted*/ false, edge,
+                      {0, 0}, strokeFloor(lineThickness), mode);
+    }
+
+    void drawBlurredRoundedRectangle(const juce::Rectangle<float>& rect,
+                                     float cornerSize, float lineThickness,
+                                     float blurRadius, float falloffRadius,
+                                     BlurEdge edge = BlurEdge::Centered,
+                                     BlurMode mode = BlurMode::Low)
+    {
+        pushBlurShape(rect, cornerSize, /*shapeType*/ 1,
+                      blurRadius, falloffRadius, /*inverted*/ false, edge,
+                      {0, 0}, strokeFloor(lineThickness), mode);
+    }
+
+    void drawBlurredEllipse(const juce::Rectangle<float>& area, float lineThickness,
+                            float blurRadius, float falloffRadius,
+                            BlurEdge edge = BlurEdge::Centered,
+                            BlurMode mode = BlurMode::Low)
+    {
+        pushBlurShape(area, 0.0f, /*shapeType*/ 2,
+                      blurRadius, falloffRadius, /*inverted*/ false, edge,
+                      {0, 0}, strokeFloor(lineThickness), mode);
+    }
+
+    // Fill variants ----------------------------------------------------------
+
+    void fillBlurredRectangle(const juce::Rectangle<float>& rect,
+                              float blurRadius, float falloffRadius,
+                              bool inverted = false,
+                              BlurEdge edge = BlurEdge::Centered,
+                              BlurMode mode = BlurMode::Low)
+    {
+        pushBlurShape(rect, 0.0f, /*shapeType*/ 0,
+                      blurRadius, falloffRadius, inverted, edge,
+                      {0, 0}, 0.0f, mode);
+    }
+
+    void fillBlurredRoundedRectangle(const juce::Rectangle<float>& rect, float cornerSize,
+                                     float blurRadius, float falloffRadius,
+                                     bool inverted = false,
+                                     BlurEdge edge = BlurEdge::Centered,
+                                     BlurMode mode = BlurMode::Low)
+    {
+        pushBlurShape(rect, cornerSize, /*shapeType*/ 1,
+                      blurRadius, falloffRadius, inverted, edge,
+                      {0, 0}, 0.0f, mode);
+    }
+
+    void fillBlurredEllipse(const juce::Rectangle<float>& area,
+                            float blurRadius, float falloffRadius,
+                            bool inverted = false,
+                            BlurEdge edge = BlurEdge::Centered,
+                            BlurMode mode = BlurMode::Low)
+    {
+        pushBlurShape(area, 0.0f, /*shapeType*/ 2,
+                      blurRadius, falloffRadius, inverted, edge,
+                      {0, 0}, 0.0f, mode);
+    }
+
+    // Path variants — route through PathBlurPipeline (ping-pong effect pass
+    // on the scene target), which walks the same per-frame segment SSBO
+    // PathPipeline owns for fillPath. The path is flattened to physical-px
+    // line segments here and uploaded for the GPU's per-fragment SDF loop.
+
+    void drawBlurredPath(const juce::Path& path, float lineThickness,
+                         float blurRadius, float falloffRadius,
+                         BlurEdge edge = BlurEdge::Centered,
+                         BlurMode mode = BlurMode::Low,
+                         const juce::AffineTransform& t = {})
+    {
+        pushBlurPath(path, t,
+                     blurRadius, falloffRadius,
+                     /*inverted*/ false, edge,
+                     /*strokeHalfWidth*/ strokeFloor(lineThickness) * 0.5f,
+                     mode);
+    }
+
+    void fillBlurredPath(const juce::Path& path,
+                         float blurRadius, float falloffRadius,
+                         bool inverted = false,
+                         BlurEdge edge = BlurEdge::Centered,
+                         BlurMode mode = BlurMode::Low,
+                         const juce::AffineTransform& t = {})
+    {
+        pushBlurPath(path, t,
+                     blurRadius, falloffRadius,
+                     inverted, edge,
+                     /*strokeHalfWidth*/ 0.0f,
+                     mode);
+    }
+
 
     void drawShader(Shader& shader, juce::Rectangle<float> region = {})
     {
@@ -662,6 +746,14 @@ private:
         if (s.stencilDepth > 0) s.stencilDepth--;
     }
 
+    // Clamp the stroke thickness to one physical pixel. Anything thinner
+    // aliases badly inside the `abs(d) - thickness*0.5` stroke SDF (the ring
+    // becomes sub-pixel and the falloff smoothstep degenerates).
+    float strokeFloor(float lineThickness) const
+    {
+        return juce::jmax(lineThickness, 1.0f / juce::jmax(displayScale_, 1.0f));
+    }
+
     // Pack a BlurShape draw command. Handles the inverse-affine computation
     // that maps physical fragment coords back into shape-local logical space.
     void pushBlurShape(const juce::Rectangle<float>& boundsRect,
@@ -669,7 +761,8 @@ private:
                        uint32_t shapeType,
                        float blurRadius, float falloffRadius,
                        bool inverted, BlurEdge edge,
-                       juce::Point<float> lineB, float lineThickness)
+                       juce::Point<float> lineB, float lineThickness,
+                       BlurMode mode)
     {
         if (isClipEmpty()) return;
         if (blurRadius <= 0.0f && falloffRadius <= 0.0f) return;
@@ -699,17 +792,81 @@ private:
         p.lineB[0]     = lineB.x;
         p.lineB[1]     = lineB.y;
 
+        // blurStep = physical texels per user-logical pixel. Folds in both
+        // the user's transform scale AND displayScale so the shader's kernel
+        // step converts 1 user-logical pixel to the right number of physical
+        // texels — which means the blur respects addTransform(scale(...))
+        // AND the loop count stays fixed regardless of displayScale (2x
+        // retina just samples every other physical pixel, same tap count).
+        const float transformScale = s.transform.getScaleFactor();
+
         p.maxRadius     = blurRadius;
         p.falloff       = juce::jmax(0.001f, falloffRadius);
-        p.displayScale  = displayScale_;
+        p.blurStep      = transformScale * displayScale_;
         p.cornerRadius  = cornerSize;
         p.lineThickness = lineThickness;
 
         p.shapeType     = shapeType;
         p.edgePlacement = static_cast<uint32_t>(edge);
         p.inverted      = inverted ? 1u : 0u;
+        p.mode          = static_cast<uint32_t>(mode);
 
         renderer_.push(DrawOp::BlurShape, s.zOrder, s.clipBounds,
+                       s.stencilDepth, s.scopeDepth, p);
+    }
+
+    // Pack a BlurPath draw command. Flattens the path to line segments
+    // (physical pixels), uploads them to PathPipeline's per-frame SSBO,
+    // then emits a BlurPath op carrying the segment range + blur params
+    // (all distances in physical pixels — the caller's logical units
+    // were multiplied by displayScale here so the shader stays in one
+    // coord space).
+    void pushBlurPath(const juce::Path& path,
+                      const juce::AffineTransform& t,
+                      float blurRadius, float falloffRadius,
+                      bool inverted, BlurEdge edge,
+                      float strokeHalfWidth,
+                      BlurMode mode)
+    {
+        if (isClipEmpty() || path.isEmpty()) return;
+        if (blurRadius <= 0.0f && falloffRadius <= 0.0f) return;
+
+        auto* pp = renderer_.pathPipeline();
+        if (!pp) return;
+
+        auto& s = state();
+        auto pathBounds = path.getBounds();
+        if (pathBounds.isEmpty()) return;
+
+        auto combined = t.followedBy(s.transform).scaled(displayScale_);
+
+        scratchSegments_.clear();
+        flattenPathToSegments(path, combined, scratchSegments_);
+        if (scratchSegments_.empty()) return;
+
+        uint32_t segStart = pp->uploadSegments(
+            scratchSegments_.data(),
+            static_cast<uint32_t>(scratchSegments_.size()));
+
+        // Pre-multiply radius params to physical pixels so the shader runs
+        // entirely in one coord space (segments are already physical too).
+        // `blurStep` folds both the user's transform scale and displayScale,
+        // so the on-screen blur respects addTransform(scale(...)) as well
+        // as retina.
+        const float blurStep = s.transform.getScaleFactor() * displayScale_;
+
+        BlurPathParams p {};
+        p.segmentStart    = segStart;
+        p.segmentCount    = static_cast<uint32_t>(scratchSegments_.size());
+        p.fillRule        = path.isUsingNonZeroWinding() ? 0u : 1u;
+        p.maxRadius       = blurRadius       * blurStep;
+        p.falloff         = juce::jmax(0.001f, falloffRadius * blurStep);
+        p.strokeHalfWidth = strokeHalfWidth  * blurStep;
+        p.edgePlacement   = static_cast<uint32_t>(edge);
+        p.inverted        = inverted ? 1u : 0u;
+        p.mode            = static_cast<uint32_t>(mode);
+
+        renderer_.push(DrawOp::BlurPath, s.zOrder, s.clipBounds,
                        s.stencilDepth, s.scopeDepth, p);
     }
 

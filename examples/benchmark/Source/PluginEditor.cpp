@@ -700,12 +700,12 @@ void BenchmarkEditor::sceneBlur(juce::Graphics& g, float w, float h, float t, fl
             float cx = w * 0.5f;
             float cy = h * 0.5f;
             float r  = 100.0f;
-            vk->blurEllipse({ cx - r, cy - r, r * 2.0f, r * 2.0f },
-                            shapeBlurRadius, 24.0f);
+            vk->fillBlurredEllipse({ cx - r, cy - r, r * 2.0f, r * 2.0f },
+                                   shapeBlurRadius, 24.0f);
 
             // Vertical line hugging the right edge, 48 px thick, 24 px falloff.
             juce::Line<float> rightEdge { w - 24.0f, 0.0f, w - 24.0f, h };
-            vk->blurLine(rightEdge, 48.0f, shapeBlurRadius, 24.0f);
+            vk->drawBlurredLine(rightEdge, 48.0f, shapeBlurRadius, 24.0f);
         }
     }
 

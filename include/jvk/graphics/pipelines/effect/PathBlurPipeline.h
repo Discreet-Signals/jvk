@@ -3,62 +3,64 @@
 namespace jvk {
 
 // =============================================================================
-// ShapeBlurPipeline — variable-radius Gaussian blur whose per-pixel radius is
-// driven by the signed distance to an analytic shape. Runs the same separable
-// H/V ping-pong as EffectPipeline; the only difference is the push-constant
-// payload (shape + falloff params) and the fragment shader.
+// PathBlurPipeline — analytical-path variable-radius Gaussian blur. Structurally
+// identical to ShapeBlurPipeline (separable H/V ping-pong, same blur.vert
+// fullscreen-triangle, LOAD-variant render pass), but the fragment shader walks
+// a per-frame line-segment SSBO to compute the path SDF instead of sampling an
+// analytic shape.
 //
-// Supports four shape types: axis-aligned rectangle, rounded rectangle,
-// ellipse, and capsule (for lines). Each `blur*` API on Graphics packs a
-// BlurShapeParams into the arena; Renderer::execute() does the 2-pass replay.
+// Set 0 — scene source texture (IMAGE_SAMPLER), bound by the dispatcher from
+//         the ping-pong source half, identical to ShapeBlur / Blur.
+// Set 1 — segment SSBO, shared with PathPipeline — uses its ssboSetLayout()
+//         at init time so the descriptor set PathPipeline::ssboDescriptorSet()
+//         returns is binding-compatible with this layout.
+//
+// All distances in push constants are PHYSICAL pixels; the caller converts
+// from logical at record time so the fragment shader lives in a single coord
+// space (the segments are already physical too).
 // =============================================================================
 
-class ShapeBlurPipeline {
+class PathBlurPipeline {
 public:
     struct PushConstants {
-        float viewportW, viewportH;   // 8
-        float dirX, dirY;             // 8
+        float    viewportW, viewportH;  // 8
+        float    dirX, dirY;            // 8  (1,0) H pass | (0,1) V pass
 
-        float invCol0X, invCol0Y;     // 8  (affine frag.xy → shape-local)
-        float invCol1X, invCol1Y;     // 8
-        float invCol2X, invCol2Y;     // 8
+        float    maxRadius;             // 4  physical px
+        float    falloff;               // 4  physical px
+        float    strokeHalfWidth;       // 4  physical px — 0 for fill
 
-        float shapeHalfX, shapeHalfY; // 8
-        float lineBX, lineBY;         // 8  (line only)
+        uint32_t segmentStart;          // 4
+        uint32_t segmentCount;          // 4
+        uint32_t fillRule;              // 4  0=non-zero, 1=even-odd
 
-        float maxRadius;              // 4  user-logical px
-        float falloff;                // 4  user-logical px
-        float blurStep;               // 4  physical texels per user-logical px
-        float cornerRadius;           // 4
-        float lineThickness;          // 4
+        int32_t  edgePlacement;         // 4  0=centered, 1=inside, 2=outside
+        int32_t  inverted;              // 4  0 or 1
 
-        int   shapeType;              // 4  0=rect,1=rrect,2=ellipse,3=line
-        int   edgePlacement;          // 4  0=centered,1=inside,2=outside
-        int   inverted;               // 4
-        int   kernelType;               // 4  0 = 1D separable pass along
-                                      //     pc.direction (Low / Medium modes);
-                                      //     1 = single-pass true 2D Gaussian
-                                      //     reading every physical pixel in
-                                      //     the kernel neighbourhood (High).
-        float _pad0;                  // 4  keep block a 16-byte multiple
-    };                                // total: 96 bytes
+        int32_t  kernelType;              // 4  0 = 1D separable pass, 1 = 2D kernel
 
-    ShapeBlurPipeline() = default;
-    ~ShapeBlurPipeline() { destroy(); }
+        float    _pad0, _pad1, _pad2;   // 12  pad block to 64 bytes
+    };                                  // total: 64 bytes
 
-    ShapeBlurPipeline(const ShapeBlurPipeline&) = delete;
-    ShapeBlurPipeline& operator=(const ShapeBlurPipeline&) = delete;
+    PathBlurPipeline() = default;
+    ~PathBlurPipeline() { destroy(); }
+
+    PathBlurPipeline(const PathBlurPipeline&) = delete;
+    PathBlurPipeline& operator=(const PathBlurPipeline&) = delete;
 
     void init(Device& device,
               VkRenderPass compatibleRenderPass,
+              VkDescriptorSetLayout pathSsboSetLayout,
               std::span<const uint32_t> vertSpv,
               std::span<const uint32_t> fragSpv)
     {
         device_ = &device;
         VkDevice d = device.device();
 
-        VkDescriptorSetLayout setLayout =
+        VkDescriptorSetLayout sceneSetLayout =
             device.bindings().getLayout(Memory::M::IMAGE_SAMPLER);
+
+        VkDescriptorSetLayout setLayouts[2] = { sceneSetLayout, pathSsboSetLayout };
 
         VkPushConstantRange pcRange {};
         pcRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -67,8 +69,8 @@ public:
 
         VkPipelineLayoutCreateInfo pli {};
         pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pli.setLayoutCount = 1;
-        pli.pSetLayouts = &setLayout;
+        pli.setLayoutCount = 2;
+        pli.pSetLayouts = setLayouts;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pcRange;
         vkCreatePipelineLayout(d, &pli, nullptr, &layout_);
@@ -175,12 +177,12 @@ public:
         vkDestroyShaderModule(d, fragMod, nullptr);
     }
 
-    // One separable pass. Caller provides direction (1,0) or (0,1), the
-    // pre-packed shape params, and a physical-pixel scissor rectangle. The
-    // render pass is assumed to be the LOAD variant, so pixels outside the
-    // scissor keep their pre-pass contents (passthrough = original scene).
+    // One separable pass. Caller provides the scene-source descriptor (set 0)
+    // AND the path-SSBO descriptor (set 1 — PathPipeline's current-frame-slot
+    // descriptor set). Params contain everything else.
     void applyPass(VkCommandBuffer cmd,
                    VkDescriptorSet srcDesc,
+                   VkDescriptorSet pathSsboDesc,
                    VkFramebuffer   dstFramebuffer,
                    VkRenderPass    dstRenderPass,
                    VkExtent2D      extent,
@@ -198,12 +200,10 @@ public:
         rpbi.pClearValues = nullptr;
         vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
-        // Bind pipeline first, then dynamic state + push constants. Some
-        // drivers invalidate dynamic state on pipeline bind; ordering this
-        // way guarantees all state is fresh for the draw.
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+        VkDescriptorSet sets[2] = { srcDesc, pathSsboDesc };
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            layout_, 0, 1, &srcDesc, 0, nullptr);
+            layout_, 0, 2, sets, 0, nullptr);
         vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilRef);
 
         PushConstants pc = params;

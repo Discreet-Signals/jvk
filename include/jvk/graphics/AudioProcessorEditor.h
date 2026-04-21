@@ -164,6 +164,7 @@ private:
         // passes from target_ — must go before both. Reverse registration
         // order, mirrored from registerPipelines.
         clipPipeline_.reset();
+        pathBlur_.reset();
         pathPipeline_.reset();
         shaderPipeline_.reset();
         shapeBlur_.reset();
@@ -370,9 +371,9 @@ private:
         renderer_->setHSVPipeline(hsvPipeline_.get());
 
         // Shape-aware blur — variable per-pixel radius driven by the shape's
-        // SDF. Used by Graphics::blurRect / blurRoundedRectangle / blurEllipse
-        // / blurLine. Reuses the fullscreen-triangle vertex shader from the
-        // standard blur.
+        // SDF. Used by Graphics::{draw,fill}Blurred{Rectangle,RoundedRectangle,
+        // Ellipse} and Graphics::drawBlurredLine. Reuses the fullscreen-
+        // triangle vertex shader from the standard blur.
         shapeBlur_ = std::make_unique<ShapeBlurPipeline>();
         shapeBlur_->init(*device_,
             target_->effectRenderPass(),
@@ -397,6 +398,17 @@ private:
             spv(path_sdf_vert_spv, path_sdf_vert_spvSize),
             spv(path_sdf_frag_spv, path_sdf_frag_spvSize));
         renderer_->setPathPipeline(pathPipeline_.get());
+
+        // Path-aware blur — reuses PathPipeline's per-frame segment SSBO
+        // (shares its descriptor-set layout). Must be initialised AFTER
+        // pathPipeline_ so ssboSetLayout() is ready.
+        pathBlur_ = std::make_unique<PathBlurPipeline>();
+        pathBlur_->init(*device_,
+            target_->effectRenderPass(),
+            pathPipeline_->ssboSetLayout(),
+            spv(blur_vert_spv, blur_vert_spvSize),
+            spv(path_blur_frag_spv, path_blur_frag_spvSize));
+        renderer_->setPathBlur(pathBlur_.get());
 
         // Clip-stencil pipeline. Shares PathPipeline's segment SSBO for
         // arbitrary-path clips; rrect clips are purely analytical (no SSBO
@@ -444,6 +456,7 @@ private:
     std::unique_ptr<ShapeBlurPipeline>                shapeBlur_;
     std::unique_ptr<ShaderPipeline>                   shaderPipeline_;
     std::unique_ptr<PathPipeline>                     pathPipeline_;
+    std::unique_ptr<PathBlurPipeline>                 pathBlur_;
     std::unique_ptr<ClipPipeline>                     clipPipeline_;
 
     RenderTimer renderTimer_;

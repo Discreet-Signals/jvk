@@ -261,6 +261,13 @@ public:
     // which shares this buffer for path-clip segment reads.
     VkDescriptorSet ssboDescriptorSet() const { return ssboDescSets_[currentFrameSlot_]; }
 
+    // The descriptor-set layout that backs `ssboDescriptorSet()`. PathBlur
+    // shares it so its own pipeline layout is guaranteed identical to this
+    // one — the descriptor set above can then be bound against PathBlur's
+    // pipeline without relying on cross-layout "identically-defined"
+    // compatibility rules.
+    VkDescriptorSetLayout ssboSetLayout() const { return ssboSetLayout_; }
+
 private:
     struct PushConstants {
         float    viewportW, viewportH;
