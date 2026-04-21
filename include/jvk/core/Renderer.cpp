@@ -4,19 +4,53 @@ namespace jvk {
 // Construction / destruction — starts and stops the worker thread.
 // =============================================================================
 
+// Process-wide registry of live Renderer instances. Maintained on the
+// message thread (Renderer ctor/dtor are message-thread-only) but read
+// from FrameRetained destructors that may run on the same thread; the
+// CriticalSection is there for hygiene rather than contention.
+juce::CriticalSection& Renderer::registryLock()
+{
+    static juce::CriticalSection lk;
+    return lk;
+}
+
+std::vector<Renderer*>& Renderer::registry()
+{
+    static std::vector<Renderer*> r;
+    return r;
+}
+
 Renderer::Renderer(Device& device, RenderTarget& target)
     : device_(device), target_(target),
       vertices_(device.physicalDevice(), device.device()),
       worker_(std::make_unique<Worker>(*this))
 {
+    {
+        const juce::ScopedLock lk(registryLock());
+        registry().push_back(this);
+    }
     worker_->startThread();
 }
 
-Renderer::~Renderer() = default;
-// Worker is the last-declared member, so it is the first destroyed: its
-// dtor calls stopThread(), which signals exit + notify + joins. All other
-// Renderer members remain valid while the worker is completing its final
-// execute() — guaranteeing no dangling references from the worker thread.
+// Worker is the last-declared member, so under default destruction it would
+// be the first destroyed (stopThread + notify + join), letting its final
+// execute() run against still-valid Renderer members. We need an explicit
+// body so we can also drop ourselves from the global registry FIRST (so
+// no FrameRetained dtor running concurrently can see us mid-teardown),
+// then join the worker, then drain the FrameRetained pin counts. The
+// caller is contractually required to have vkDeviceWaitIdle'd before
+// destroying us (see teardownVulkan), so the GPU is also done with
+// everything we're about to release the pin on.
+Renderer::~Renderer()
+{
+    {
+        const juce::ScopedLock lk(registryLock());
+        auto& r = registry();
+        r.erase(std::remove(r.begin(), r.end(), this), r.end());
+    }
+    if (worker_) worker_.reset();
+    flushRetains();
+}
 
 // =============================================================================
 // Threaded-execute control
@@ -40,6 +74,86 @@ void Renderer::waitForIdle()
         juce::Thread::yield();
 }
 
+void Renderer::flushRetains()
+{
+    for (auto& list : retainsBySlot_)
+    {
+        for (auto* obj : list) obj->unpin();
+        list.clear();
+    }
+    for (auto* obj : recordingRetains_) obj->unpin();
+    recordingRetains_.clear();
+}
+
+void Renderer::forceDrainAll()
+{
+    // Snapshot the registry under lock so we don't iterate while a
+    // sibling Renderer ctor/dtor mutates it. After this point we operate
+    // on the snapshot — any Renderer destroyed concurrently has already
+    // removed itself, so the snapshot can only contain still-live ones
+    // (the assumption is registry mutation runs on the message thread,
+    // same as our caller — destructors can't interleave on a single
+    // thread).
+    std::vector<Renderer*> snapshot;
+    {
+        const juce::ScopedLock lk(registryLock());
+        snapshot = registry();
+    }
+
+    // Phase 1: idle every worker. Once each workerBusy_ goes false, no
+    // further pin/unpin will happen via execute() — we have a stable
+    // view of every retainsBySlot_ bucket.
+    for (auto* r : snapshot) r->waitForIdle();
+
+    // Phase 2: vkDeviceWaitIdle once per unique Device. After this every
+    // submission referencing pinned objects has retired on the GPU, so
+    // dropping the pins below can't strand the GPU mid-sample of a
+    // freed VkPipeline / VkDescriptorSet.
+    std::set<VkDevice> seen;
+    for (auto* r : snapshot)
+    {
+        VkDevice d = r->device().device();
+        if (d != VK_NULL_HANDLE && seen.insert(d).second)
+            vkDeviceWaitIdle(d);
+    }
+
+    // Phase 3: drop every pin. After this the in-flight counter on every
+    // FrameRetained is zero and the destructor that called us can fall
+    // straight through.
+    for (auto* r : snapshot) r->flushRetains();
+}
+
+// =============================================================================
+// FrameRetained — out-of-line so waitUntilUnretained can call into Renderer
+// without forcing FrameRetained.h to know Renderer's full definition.
+// =============================================================================
+
+FrameRetained::~FrameRetained()
+{
+    waitUntilUnretained();
+}
+
+void FrameRetained::waitUntilUnretained() const noexcept
+{
+    if (inFlight_.load(std::memory_order_acquire) == 0) return;
+
+    // Pins are still held — typically because the destructor is running
+    // on the message thread between render ticks, and the per-slot
+    // drain inside Renderer::execute() can't fire because we're the
+    // very thread that would have queued the next frame. Force every
+    // live Renderer to drain synchronously (worker idle + GPU idle +
+    // flushRetains) so the count drops to zero.
+    Renderer::forceDrainAll();
+
+    // Safety net: forceDrainAll should have brought us to zero. Spin
+    // briefly just in case a Renderer joined the registry after our
+    // snapshot and pinned us in a frame already in flight (extremely
+    // unlikely on the single-message-thread plugin model, but cheap to
+    // cover).
+    while (inFlight_.load(std::memory_order_acquire) > 0)
+        juce::Thread::yield();
+}
+
 // =============================================================================
 // Pipeline registration
 // =============================================================================
@@ -58,7 +172,25 @@ void Renderer::registerPipeline(Pipeline& pipeline)
 void Renderer::execute()
 {
     auto frame = target_.beginFrame();
-    if (frame.cmd == VK_NULL_HANDLE) return;
+    if (frame.cmd == VK_NULL_HANDLE) {
+        // Frame skipped (e.g. swapchain out of date). The recording retains
+        // were pinned but no GPU command buffer ever referenced them, so
+        // it's safe to unpin immediately. Without this they'd leak across
+        // every skipped frame and indefinitely block any matching dtor.
+        for (auto* obj : recordingRetains_) obj->unpin();
+        recordingRetains_.clear();
+        return;
+    }
+
+    // target_.beginFrame() above waited on this slot's fence, so the GPU
+    // has now finished every command buffer it submitted the LAST time
+    // this slot was used. That's the moment it's safe to drop the pin on
+    // FrameRetained objects we bucketed against this slot back then.
+    {
+        auto& bucket = retainsBySlot_[frame.frameSlot % kRetainSlots];
+        for (auto* obj : bucket) obj->unpin();
+        bucket.clear();
+    }
 
     // Snapshot the device clock once per frame so every shader dispatched
     // during this execute() sees an identical `time` value — guarantees
@@ -488,6 +620,8 @@ void Renderer::execute()
         const juce::ScopedLock queueSync(queueLock());
         target_.endFrame(frame);
     }
+        retainsBySlot_[frame.frameSlot % kRetainSlots] = std::move(recordingRetains_);
+        recordingRetains_.clear();
         frameCounter_++;
         return;
     }
@@ -557,6 +691,8 @@ void Renderer::execute()
         const juce::ScopedLock queueSync(queueLock());
         target_.endFrame(frame);
     }
+    retainsBySlot_[frame.frameSlot % kRetainSlots] = std::move(recordingRetains_);
+    recordingRetains_.clear();
     frameCounter_++;
 }
 

@@ -2,7 +2,7 @@
 
 namespace jvk {
 
-class Shader {
+class Shader : public FrameRetained {
 public:
     Shader() = default;
 
@@ -328,8 +328,16 @@ public:
     // draw so set(name, value) propagates to the GPU.
     void*        uniformMapped() const { return uniformMapped_; }
 
-    ~Shader()
+    ~Shader() override
     {
+        // Block until every Renderer that pinned us in a recent frame has
+        // rotated past the GPU fence — otherwise the worker could still be
+        // mid-dispatch holding our Shader pointer, or the GPU could still
+        // be sampling our descriptor set / executing our pipeline. Once
+        // this returns, no thread (CPU or GPU) is referencing any of the
+        // handles we're about to destroy.
+        waitUntilUnretained();
+
         if (!device_) return;
         VkDevice d = device_->device();
         if (uniformMapped_  != nullptr)        vkUnmapMemory(d, uniformMemory_);

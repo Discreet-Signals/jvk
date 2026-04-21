@@ -63,20 +63,28 @@ public:
     bool isVulkanAvailable() const { return vulkanAvailable_; }
     Device& getDevice() { return *device_; }
 
-    // Block until the render worker is idle. Call before destroying any
-    // Vulkan resource (jvk::Shader, jvk::ShaderImage, etc.) whose handle
-    // may have been captured into the current frame's command stream —
-    // otherwise the worker can dereference a freed VkPipeline/VkImage and
-    // crash. In release builds on arm64 this shows up as a PAC fault on
-    // the worker thread.
+    // Block until the renderer is fully quiescent: worker thread idle, GPU
+    // idle, and every FrameRetained pin released. After this returns, any
+    // Vulkan-touching resource captured into the recent command stream
+    // (jvk::Shader and other FrameRetained subclasses) can be destroyed
+    // immediately on this thread — Shader's destructor would otherwise
+    // spin until those pins drop the natural way (next time their slot is
+    // used), which never happens once the timer is stopped.
     //
-    // No-op if Vulkan isn't acquired. Bounded wait (≈ one execute duration).
-    // The timer is unaffected; rendering resumes automatically on the next
-    // tick unless the caller also stops the timer (e.g. via
-    // setVulkanEnabled(false)).
+    // The Shader destructor's own waitUntilUnretained call is enough for
+    // the steady-state case where frames keep flowing; this method exists
+    // for teardown / mode-switch paths that stop submitting new frames
+    // before destroying GPU-backed objects.
+    //
+    // No-op if Vulkan isn't acquired. The timer is unaffected; rendering
+    // resumes automatically on the next tick unless the caller also stops
+    // the timer (e.g. via setVulkanEnabled(false)).
     void waitForRenderIdle()
     {
         if (renderer_) renderer_->waitForIdle();
+        if (device_ && device_->device() != VK_NULL_HANDLE)
+            vkDeviceWaitIdle(device_->device());
+        if (renderer_) renderer_->flushRetains();
     }
 
 protected:

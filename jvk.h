@@ -30,12 +30,16 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <deque>
 #include <map>
 #include <span>
 #include <optional>
 #include <functional>
+#include <type_traits>
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>
 #include <juce_data_structures/juce_data_structures.h>
@@ -53,6 +57,7 @@
 #include "include/jvk/core/Memory.h"
 #include "include/jvk/core/Resource.h"
 #include "include/jvk/core/Device.h"
+#include "include/jvk/core/FrameRetained.h"
 #include "include/jvk/core/Renderer.h"
 #include "include/jvk/core/Pipeline.h"
 #include "include/jvk/core/RenderTarget.h"

@@ -198,6 +198,30 @@ public:
         });
     }
 
+    // Pin a FrameRetained so its destructor will block until the GPU is
+    // done with the frame this record is being assembled into. Called by
+    // record-time hooks in jvk::Graphics for any payload that captures a
+    // raw pointer to a user-owned GPU object (currently jvk::Shader). The
+    // matching unpin runs from execute() once the slot's fence has been
+    // waited on — so user code can free the object from the message
+    // thread at any time without coordinating with the worker.
+    //
+    // Defined as a template so callers don't need the full definition of
+    // FrameRetained's subclass at the point that records the command —
+    // Graphics.h only forward-declares jvk::Shader, and the base-class
+    // conversion has to be checked where the caller has already pulled in
+    // Shader.h via the umbrella.
+    template <typename T>
+    void retain(T* obj)
+    {
+        static_assert(std::is_base_of_v<FrameRetained, T>,
+            "Renderer::retain(T*) requires T to inherit from jvk::FrameRetained");
+        if (!obj) return;
+        FrameRetained* base = obj;
+        base->pin();
+        recordingRetains_.push_back(base);
+    }
+
     void registerPipeline(Pipeline& pipeline);
 
     // ---- Threaded execution -------------------------------------------------
@@ -234,6 +258,33 @@ public:
     // (SwapchainTarget::resize, teardown). Bounded wait ≈ one execute
     // duration (~16 ms on VSync).
     void waitForIdle();
+
+    // Drop every FrameRetained pin held by this Renderer (recording bucket
+    // + every per-slot bucket). Used by teardown / mode-switch paths that
+    // stop submitting new frames — without this the matching unpins would
+    // never run and any subsequent ~Shader (or other FrameRetained) would
+    // deadlock spinning on its in-flight counter.
+    //
+    // CALLER CONTRACT: GPU must already be idle for any submission that
+    // referenced these pins. waitForIdle() guarantees the worker is done,
+    // but the worker's final submit may still have GPU work in flight —
+    // the caller is responsible for vkDeviceWaitIdle (or equivalent fence
+    // wait) before invoking this.
+    void flushRetains();
+
+    // Force every live Renderer to a fully-quiescent state and drop all
+    // FrameRetained pins. Walks the process-wide registry, idles each
+    // worker, calls vkDeviceWaitIdle once per unique Device, then runs
+    // flushRetains on each. After this returns, every FrameRetained's
+    // in-flight counter is zero and every GPU submission referencing
+    // pinned objects has retired.
+    //
+    // Called by FrameRetained::waitUntilUnretained when the natural
+    // per-slot drain can't be relied on — most commonly when the
+    // destructor is itself running on the message thread (e.g. inside a
+    // chain refresh) and would otherwise prevent any future render tick
+    // from firing.
+    static void forceDrainAll();
 
     // The synchronous body of a frame's GPU work. Called internally by the
     // worker thread. Kept public because some non-windowed consumers (e.g.
@@ -334,6 +385,24 @@ private:
     // Non-POD captures (proper RAII, cleared each frame)
     std::vector<juce::Font>     fonts_;
     std::vector<juce::FillType> fills_;
+
+    // FrameRetained pins gathered during record (msg thread). At execute
+    // time these are moved into retainsBySlot_[slot]; they get unpinned the
+    // next time that slot rolls around — i.e. after target_.beginFrame()
+    // has waited on the slot's fence and the GPU has provably finished
+    // consuming any command buffer that referenced them.
+    std::vector<FrameRetained*> recordingRetains_;
+    static constexpr int kRetainSlots = 2; // matches MAX_FRAMES_IN_FLIGHT
+    std::array<std::vector<FrameRetained*>, kRetainSlots> retainsBySlot_;
+
+    // Process-wide registry of live Renderer instances. Walked by
+    // forceDrainAll (invoked from FrameRetained destructors) so a
+    // destruction running on the message thread can synchronously drain
+    // every renderer's pin counts without depending on the next render
+    // tick — which would never come, because the message thread is the
+    // very thread blocked in the destructor.
+    static juce::CriticalSection& registryLock();
+    static std::vector<Renderer*>& registry();
 
     Pipeline* pipelineForOp_[static_cast<size_t>(DrawOp::COUNT)] = {};
     EffectPipeline*    postProcess_      = nullptr;

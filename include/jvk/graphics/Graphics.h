@@ -689,6 +689,13 @@ public:
     void drawShader(Shader& shader, juce::Rectangle<float> region = {})
     {
         if (isClipEmpty()) return;
+        // Pin the Shader for this frame. Renderer holds the pin until the
+        // GPU is done with the command buffer that will reference the
+        // shader's VkPipeline / VkDescriptorSet — at which point Shader's
+        // dtor (waiting on FrameRetained::waitUntilUnretained) is free to
+        // proceed. Lets the user reset the owning component from anywhere
+        // on the message thread without coordinating with the worker.
+        renderer_.retain(&shader);
         auto& s = state();
         // Fold the full paint transform (setOrigin + addTransform stack) and
         // displayScale into the region at record time, matching the convention
