@@ -260,7 +260,7 @@ public:
         auto fi = renderer_.captureFill(s.fill);
         // Stage gradient LUT upload if this is a gradient fill
         if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
+            renderer_.registerGradient(*s.fill.gradient);
         renderer_.push(DrawOp::FillRect, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
             FillRectParams { r, fi, s.transform, s.opacity, displayScale_ });
     }
@@ -317,7 +317,7 @@ public:
         // this frame's staging pass. makeGradientCtx below also registers
         // idempotently — we mirror the fillRect convention here anyway.
         if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
+            renderer_.registerGradient(*s.fill.gradient);
 
         // Build the per-vertex colour source the same way ColorDraw's
         // primitive ops do: solid colour folded into the vertex attribute,
@@ -364,10 +364,15 @@ public:
         auto& s = state();
         uint64_t hash = ResourceCaches::hashImage(img);
 
-        renderer_.caches().getTexture(hash, img);
+        // Resolve the texture now (message thread — safe around the shared
+        // cache's inserts/evictions), pin the entry on this Renderer so it
+        // survives sibling eviction, and capture the descriptor directly
+        // into the draw command. The worker thread never touches the cache
+        // map for this draw.
+        auto desc = renderer_.caches().getTexture(hash, img, renderer_);
 
         renderer_.push(DrawOp::DrawImage, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            DrawImageParams { hash, t.followedBy(s.transform), s.opacity, displayScale_,
+            DrawImageParams { desc, t.followedBy(s.transform), s.opacity, displayScale_,
                               img.getWidth(), img.getHeight() });
     }
 
@@ -382,7 +387,7 @@ public:
         auto& s = state();
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
+            renderer_.registerGradient(*s.fill.gradient);
         renderer_.push(DrawOp::DrawLine, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
             DrawLineParams { line, lineThickness, fi, s.transform, s.opacity, displayScale_ });
     }
@@ -397,7 +402,7 @@ public:
         if (isClipEmpty() || glyphs.empty()) return;
         auto& s = state();
         if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
+            renderer_.registerGradient(*s.fill.gradient);
         DrawGlyphsParams params;
         params.glyphCount = static_cast<uint32_t>(glyphs.size());
         params.transform = t.followedBy(s.transform);
@@ -418,7 +423,7 @@ public:
         auto& s = state();
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
+            renderer_.registerGradient(*s.fill.gradient);
         renderer_.push(DrawOp::FillRoundedRect, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
             FillRoundedRectParams { r, cornerSize, fi, s.transform, s.opacity, displayScale_ });
     }
@@ -429,7 +434,7 @@ public:
         auto& s = state();
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
+            renderer_.registerGradient(*s.fill.gradient);
         renderer_.push(DrawOp::FillEllipse, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
             FillEllipseParams { area, fi, s.transform, s.opacity, displayScale_ });
     }
@@ -441,7 +446,7 @@ public:
         auto& s = state();
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
+            renderer_.registerGradient(*s.fill.gradient);
         renderer_.push(DrawOp::StrokeRoundedRect, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
             StrokeRoundedRectParams { rect, cornerSize, lineThickness, fi, s.transform,
                                       s.opacity, displayScale_ });
@@ -459,7 +464,7 @@ public:
         auto& s = state();
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
+            renderer_.registerGradient(*s.fill.gradient);
         renderer_.push(DrawOp::StrokeEllipse, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
             StrokeEllipseParams { area, lineThickness, fi, s.transform, s.opacity, displayScale_ });
     }

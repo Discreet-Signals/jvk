@@ -49,7 +49,7 @@ public:
 
     GlyphAtlas& atlas() { return atlas_; }
 
-    void prepare() override { atlas_.stageDirtyPages(); }
+    void prepare(Renderer& r) override { atlas_.stageDirtyPages(r); }
     void execute(Renderer& r, const Arena& arena, const DrawCommand& cmd) override;
 
 private:

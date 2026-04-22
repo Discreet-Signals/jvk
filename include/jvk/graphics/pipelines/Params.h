@@ -103,7 +103,15 @@ struct StrokeEllipseParams {
 };
 
 struct DrawImageParams {
-    uint64_t               imageHash;
+    // Pre-resolved descriptor set for the cached texture. Captured at record
+    // time (inside Graphics::drawImage via renderer_.caches().getTexture)
+    // so the worker thread doesn't re-look-up in the shared texture map —
+    // avoids a data race against concurrent inserts / evictions on that
+    // std::unordered_map from sibling editors' message-thread activity.
+    // The same getTexture call also pins the CachedImage via FrameRetained
+    // so this VkDescriptorSet (and its backing VkImageView) stays valid for
+    // the life of the draw.
+    VkDescriptorSet        textureDesc;
     juce::AffineTransform  transform;
     float                  opacity;
     float                  scale;

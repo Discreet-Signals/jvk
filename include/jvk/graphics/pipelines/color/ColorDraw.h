@@ -40,7 +40,7 @@ inline GradientCtx makeGradientCtx(Renderer& r, const juce::FillType& fill,
 
     // Idempotent w.r.t. the hash — if Graphics.h already registered the
     // gradient during recording, this just re-reads the cached row.
-    c.rowNorm = r.caches().registerGradient(g);
+    c.rowNorm = r.registerGradient(g);
 
     auto gradT = fill.transform.followedBy(physical);
     float x1 = g.point1.x, y1 = g.point1.y;
@@ -95,7 +95,7 @@ inline VkDescriptorSet colorDescFor(const GradientCtx& grad, Renderer& r)
 {
     // All active gradients share the atlas; solids get the 1x1 default which
     // the shader doesn't sample when gradientInfo.z == 0.
-    return grad.active() ? r.caches().gradientDescriptor()
+    return grad.active() ? r.gradientDescriptor()
                          : r.caches().defaultDescriptor();
 }
 
@@ -332,8 +332,9 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
 
         case DrawOp::DrawImage: {
             auto& p     = arena.read<DrawImageParams>(cmd.dataOffset);
-            auto* tcache = r.caches().textures().find(p.imageHash);
-            auto  shapeDesc = tcache ? tcache->descriptorSet : def;
+            // Descriptor was resolved + pinned at record time (see
+            // Graphics::drawImage); no shared-cache lookup from the worker.
+            auto  shapeDesc = p.textureDesc ? p.textureDesc : def;
             // Images are self-colored; color LUT is ignored (solid white tint).
             state.setResources(def, shapeDesc);
             auto  tx = toPhysical(p.transform, p.scale);

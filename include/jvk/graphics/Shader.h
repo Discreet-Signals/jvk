@@ -12,23 +12,52 @@ public:
         reflectShader();
     }
 
-    // Image bindings: ensure the image is registered in ResourceCaches, then
-    // stash its view+sampler on the binding. If the shader is already live
-    // the write is applied immediately; otherwise ensureCreated() picks it up.
-    void set(const juce::String& name, const juce::Image& image, ResourceCaches& caches)
+    // Image bindings: ensure the image is registered in the Renderer's
+    // texture cache, then stash its view+sampler on the binding. Takes the
+    // Renderer (not just ResourceCaches) because the cache insert queues its
+    // pixel upload onto that Renderer's upload list — so the copy runs in
+    // the same frame as the draw that uses it, and two editors never share
+    // the upload queue. If the shader is already live the descriptor write
+    // is applied immediately; otherwise ensureCreated() picks it up.
+    void set(const juce::String& name, const juce::Image& image, Renderer& r)
     {
         for (auto& b : bindings_) {
             if (b.name == name && b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                auto& caches = r.caches();
                 uint64_t hash = ResourceCaches::hashImage(image);
-                caches.getTexture(hash, image);
+                caches.getTexture(hash, image, r);
                 auto* tc = caches.textures().find(hash);
                 if (tc == nullptr) return;
+
+                // Swap the durable pin: release the previous CachedImage
+                // (if any), pin the new one. This keeps the entry alive
+                // against the cache's LRU eviction for as long as this
+                // Shader binding holds its view+sampler.
+                if (b.pinnedTexture) b.pinnedTexture->unpin();
+                tc->pin();
+                b.pinnedTexture = tc;
+
                 b.imageView = tc->image.view();
                 b.sampler   = tc->image.sampler();
                 b.bound     = true;
-                if (created_ && descriptorSet_ != VK_NULL_HANDLE)
+
+                // If the shader is already live, updating descriptorSet_
+                // races against any command buffer that bound it and is
+                // still pending on the GPU (Vulkan §14.2.1 UB — the
+                // layout was created without UPDATE_AFTER_BIND_BIT, so
+                // the binding is "statically used"). Gate the write on
+                // GPU idle. Heavy-handed (one stall per rebind) but
+                // correct without requiring descriptor-indexing feature
+                // setup. If dynamic per-frame rebinding becomes a
+                // perf issue, switch to UPDATE_AFTER_BIND_BIT on
+                // Memory::M's image-sampler layout + pool, or
+                // double-buffer descriptorSet_ per frame slot.
+                if (created_ && descriptorSet_ != VK_NULL_HANDLE) {
+                    const juce::ScopedLock queueSync(Renderer::queueLock());
+                    vkDeviceWaitIdle(device_->device());
                     Memory::M::writeImage(device_->device(), descriptorSet_,
                                           b.binding, b.imageView, b.sampler);
+                }
                 return;
             }
         }
@@ -338,6 +367,18 @@ public:
         // handles we're about to destroy.
         waitUntilUnretained();
 
+        // Release durable pins on every texture we had bound. Each
+        // corresponding CachedImage can now be evicted by the shared
+        // cache's LRU. Do this BEFORE destroying our own descriptor +
+        // pipeline so the order matches set()'s acquisition order in
+        // reverse.
+        for (auto& b : bindings_) {
+            if (b.pinnedTexture) {
+                b.pinnedTexture->unpin();
+                b.pinnedTexture = nullptr;
+            }
+        }
+
         if (!device_) return;
         VkDevice d = device_->device();
         if (uniformMapped_  != nullptr)        vkUnmapMemory(d, uniformMemory_);
@@ -359,6 +400,14 @@ private:
         VkImageView      imageView = VK_NULL_HANDLE;
         VkSampler        sampler   = VK_NULL_HANDLE;
         bool             bound = false;
+        // Durable pin on the shared-cache CachedImage whose view+sampler
+        // are baked into this Shader's descriptorSet_. Without this, the
+        // cache's 120-frame LRU could evict the entry (no one re-hits
+        // getTexture for a Shader-bound image — drawShader only binds the
+        // Shader's own descriptor set), freeing the VkImage/View/Sampler
+        // while our descriptor still references them → UB on next draw.
+        // Pinned in set(), swapped on rebind, released in ~Shader.
+        CachedImage*     pinnedTexture = nullptr;
     };
 
     void reflectShader()

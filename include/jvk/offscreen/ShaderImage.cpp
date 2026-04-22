@@ -93,9 +93,15 @@ ShaderImage::ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
     createDescriptors();
     createPipeline();
 
+    VkCommandPoolCreateInfo cpci {};
+    cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cpci.queueFamilyIndex = device_->graphicsFamily();
+    cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    vkCreateCommandPool(device_->device(), &cpci, nullptr, &commandPool_);
+
     VkCommandBufferAllocateInfo cbai {};
     cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cbai.commandPool = device_->commandPool();
+    cbai.commandPool = commandPool_;
     cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cbai.commandBufferCount = 2;
     vkAllocateCommandBuffers(device_->device(), &cbai, commandBuffer);
@@ -120,8 +126,11 @@ ShaderImage::~ShaderImage()
     for (int i = 0; i < 2; i++)
         if (fence[i]) vkDestroyFence(dev, fence[i], nullptr);
 
-    if (commandBuffer[0] || commandBuffer[1])
-        vkFreeCommandBuffers(dev, device_->commandPool(), 2, commandBuffer);
+    // Destroying the command pool auto-frees both command buffers.
+    if (commandPool_ != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(dev, commandPool_, nullptr);
+        commandPool_ = VK_NULL_HANDLE;
+    }
 
     destroyPipeline();
     destroyDescriptors();
@@ -760,7 +769,14 @@ void ShaderImage::render()
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer[curr];
-    vkQueueSubmit(device_->graphicsQueue(), 1, &submitInfo, fence[curr]);
+    {
+        // VkQueue external-sync: this runs on ShaderImage's own render timer
+        // (message thread) and shares Device::graphicsQueue_ with every
+        // editor's jvk-render-worker and with Device::submitImmediate. All
+        // queue-touching paths serialize through Renderer::queueLock().
+        const juce::ScopedLock queueSync(Renderer::queueLock());
+        vkQueueSubmit(device_->graphicsQueue(), 1, &submitInfo, fence[curr]);
+    }
 
     frameIndex = prev;
 }

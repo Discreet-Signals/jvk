@@ -20,7 +20,7 @@ namespace jvk {
 
 class RenderTarget {
 public:
-    virtual ~RenderTarget() = default;
+    virtual ~RenderTarget();
 
     // Per-frame scene-buffer set. Colors A/B ping-pong as effect source/dest;
     // the depth-stencil image is shared across all segments within the frame
@@ -64,9 +64,19 @@ public:
 
     virtual const SceneBuffers& sceneBuffers(int frameSlot) const = 0;
 
+    // Each RenderTarget owns a dedicated VkCommandPool. Vulkan command pools
+    // are externally synchronized — every vkCmd* recording call on any
+    // buffer from the pool counts as use. Sharing a single pool across
+    // plugin instances means each editor's jvk-render-worker thread can
+    // race on MoltenVK's internal pool state; a torn pointer there caused
+    // a byte-write into __DATA_CONST (SIGBUS) in multi-instance hosts.
+    // One pool per target = one pool per worker thread, no contention.
+    VkCommandPool commandPool() const { return commandPool_; }
+
 protected:
     Device& device_;
-    RenderTarget(Device& device) : device_(device) {}
+    VkCommandPool commandPool_ = VK_NULL_HANDLE;
+    RenderTarget(Device& device);
 };
 
 

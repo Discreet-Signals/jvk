@@ -69,6 +69,11 @@ public:
 
     Allocation alloc(VkMemoryRequirements req, VkMemoryPropertyFlags properties)
     {
+        // Shared across instances: message-thread image-cache inserts can
+        // overlap a sibling Renderer's worker destroying Images from its
+        // deferred-deletion queue (which frees L1 allocations). Lock covers
+        // both sides.
+        const juce::ScopedLock lk(lock_);
         uint32_t memType = findMemoryType(physDevice, req.memoryTypeBits, properties);
         VkDeviceSize alignment = std::max(req.alignment, bufferImageGranularity);
         auto& blocks = pools[memType];
@@ -119,6 +124,7 @@ public:
     void free(Allocation a)
     {
         if (a.memory == VK_NULL_HANDLE) return;
+        const juce::ScopedLock lk(lock_);
         auto it = pools.find(a.memoryType);
         if (it == pools.end() || a.blockIndex >= it->second.size()) return;
 
@@ -157,6 +163,7 @@ private:
     VkPhysicalDevice physDevice = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VkDeviceSize bufferImageGranularity = 1;
+    mutable juce::CriticalSection lock_;
 
     void destroy()
     {
@@ -172,6 +179,16 @@ private:
 
 // =============================================================================
 // L2 — Staging (host-visible, CPU→GPU transfer, linear bump allocator)
+//
+// Every mutator takes `lock_`. L2 is used in two shapes:
+//   1. Per-Renderer (Renderer::staging_): record-phase allocs on the message
+//      thread, worker-phase allocs on the render-worker thread. The
+//      isBusy() gate *should* keep these disjoint within one instance, but
+//      the internal lock is cheap and defends against any future caller
+//      that forgets the contract.
+//   2. On Device::staging_: used only by ResourceCaches::createBlackPixel
+//      at init. Message-thread only today, but the lock keeps the type
+//      safe to share more broadly later.
 // =============================================================================
 
 class L2 {
@@ -189,6 +206,8 @@ public:
 
     ~L2() { destroy(); }
 
+    // Locks are not movable. Move the underlying state and let lock_ be
+    // default-constructed on the moved-to instance.
     L2(L2&& o) noexcept
         : activeBlocks(std::move(o.activeBlocks)), freeBlocks(std::move(o.freeBlocks)),
           physDevice(o.physDevice), device(o.device)
@@ -212,6 +231,7 @@ public:
 
     Allocation alloc(VkDeviceSize size)
     {
+        const juce::ScopedLock lk(lock_);
         if (!activeBlocks.empty()) {
             auto& b = activeBlocks.back();
             if (b.writeHead + size <= b.capacity) {
@@ -253,12 +273,14 @@ public:
 
     void moveActiveTo(std::vector<Block>& used)
     {
+        const juce::ScopedLock lk(lock_);
         for (auto& b : activeBlocks) used.push_back(std::move(b));
         activeBlocks.clear();
     }
 
     void recycle(std::vector<Block>& used)
     {
+        const juce::ScopedLock lk(lock_);
         for (auto& b : used) freeBlocks.push_back(std::move(b));
         used.clear();
     }
@@ -270,6 +292,7 @@ private:
     std::vector<Block> freeBlocks;
     VkPhysicalDevice physDevice = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
+    mutable juce::CriticalSection lock_;
 
     void createBlock(Block& b, VkDeviceSize cap)
     {
@@ -318,6 +341,11 @@ private:
 // M — Bindings (descriptor set pool, multi-layout, growable)
 // =============================================================================
 
+// Shared across all plugin instances. Every mutating call (registerLayout /
+// alloc / free / internal growPool) takes `lock_` so two editors' message
+// threads — plus any worker-thread caller we might add later — can't race
+// on `pools`, `layouts`, or the VkDescriptorPool itself (which Vulkan
+// requires to be externally synchronized per §13.2.3).
 class M {
 public:
     using LayoutID = uint32_t;
@@ -337,6 +365,8 @@ public:
 
     ~M() { destroy(); }
 
+    // Locks are not movable — but the members we actually care about are.
+    // Leave lock_ default-constructed on the moved-to instance.
     M(M&& o) noexcept
         : device(o.device), layouts(std::move(o.layouts)), pools(std::move(o.pools))
     { o.device = VK_NULL_HANDLE; }
@@ -358,6 +388,7 @@ public:
 
     LayoutID registerLayout(const VkDescriptorSetLayoutBinding* bindings, uint32_t count)
     {
+        const juce::ScopedLock lk(lock_);
         LayoutEntry entry;
         for (uint32_t i = 0; i < count; i++) {
             auto& b = bindings[i];
@@ -379,10 +410,15 @@ public:
         return id;
     }
 
+    // Layouts are immutable after registerLayout returns — no lock needed to
+    // read them (the registerLayout lock publishes the entry via happens-
+    // before on the vector append, and our callers only look up ids they
+    // already received from registerLayout).
     VkDescriptorSetLayout getLayout(LayoutID id) const { return layouts[id].layout; }
 
     VkDescriptorSet alloc(LayoutID id = IMAGE_SAMPLER)
     {
+        const juce::ScopedLock lk(lock_);
         auto& entry = layouts[id];
         VkDescriptorSetAllocateInfo ai {};
         ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -407,6 +443,7 @@ public:
 
     void free(VkDescriptorSet set)
     {
+        const juce::ScopedLock lk(lock_);
         for (auto& pool : pools)
             if (vkFreeDescriptorSets(device, pool, 1, &set) == VK_SUCCESS)
                 return;
@@ -460,7 +497,9 @@ private:
     VkDevice device = VK_NULL_HANDLE;
     std::vector<LayoutEntry> layouts;
     std::vector<VkDescriptorPool> pools;
+    mutable juce::CriticalSection lock_;
 
+    // Caller holds lock_.
     void growPool(const std::vector<VkDescriptorPoolSize>& sizes)
     {
         std::vector<VkDescriptorPoolSize> scaled = sizes;

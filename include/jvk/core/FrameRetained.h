@@ -60,10 +60,33 @@ protected:
     // destruction in a batch (subsequent destructors see count==0).
     void waitUntilUnretained() const noexcept;
 
-private:
-    friend class Renderer;
+public:
+    // True iff any Renderer currently holds a pin on this object. Safe to
+    // call concurrently; observed value may race with a worker-thread
+    // unpin but never with a pin (pins only happen on the single JUCE
+    // message thread via Renderer::retain). Used by cache eviction to
+    // skip entries still referenced by any editor's in-flight frame
+    // instead of synchronously draining the GPU.
+    bool isPinned() const noexcept
+    {
+        return inFlight_.load(std::memory_order_acquire) != 0;
+    }
+
+    // Durable pin/unpin — increments/decrements the in-flight counter
+    // directly, outside the per-frame retain ring. Use when the owner
+    // needs to hold a reference for longer than a single frame rotation.
+    // Example: Shader stashing a cached Image's VkImageView+VkSampler
+    // into its descriptor set must keep the CachedImage alive past the
+    // next eviction tick, which Renderer::retain's slot-based rotation
+    // would not do. Must be balanced with an equal number of unpin()
+    // calls before the object is destroyed (otherwise ~FrameRetained
+    // blocks in waitUntilUnretained forever — forceDrainAll only drops
+    // frame-scoped pins, not durable ones).
     void pin()   noexcept { inFlight_.fetch_add(1, std::memory_order_acq_rel); }
     void unpin() noexcept { inFlight_.fetch_sub(1, std::memory_order_acq_rel); }
+
+private:
+    friend class Renderer;
 
     mutable std::atomic<uint32_t> inFlight_ { 0 };
 };
