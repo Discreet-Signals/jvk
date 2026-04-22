@@ -59,6 +59,10 @@
 #include "include/jvk/core/Device.h"
 #include "include/jvk/core/FrameRetained.h"
 #include "include/jvk/core/Renderer.h"
+// CommandScheduler.h is included AFTER Params.h below because its fusion
+// scratch buffer holds concatenated GeometryPrimitive runs. Renderer.h
+// forward-declares CommandScheduler so the std::unique_ptr member there is
+// fine at this point.
 #include "include/jvk/core/Pipeline.h"
 #include "include/jvk/core/RenderTarget.h"
 #include "include/jvk/core/Cache.h"
@@ -74,14 +78,14 @@
 #include "include/jvk/graphics/MSDF.h"
 #include "include/jvk/graphics/GlyphAtlas.h"
 #include "include/jvk/graphics/pipelines/Params.h"
-#include "include/jvk/graphics/pipelines/color/ColorPipeline.h"
-#include "include/jvk/graphics/pipelines/color/ColorDraw.h"
+// Needs GeometryPrimitive from Params.h for its fusion scratch vector.
+#include "include/jvk/core/CommandScheduler.h"
 #include "include/jvk/graphics/pipelines/blend/BlendPipeline.h"
 #include "include/jvk/graphics/pipelines/effect/EffectPipeline.h"
 #include "include/jvk/graphics/pipelines/effect/HSVPipeline.h"
-#include "include/jvk/graphics/pipelines/effect/ShapeBlurPipeline.h"
 #include "include/jvk/graphics/pipelines/path/PathPipeline.h"
-#include "include/jvk/graphics/pipelines/effect/PathBlurPipeline.h"
+#include "include/jvk/graphics/pipelines/fill/FillPipeline.h"
+#include "include/jvk/graphics/pipelines/effect/BlurPipeline.h"
 #include "include/jvk/graphics/pipelines/clip/ClipPipeline.h"
 #include "include/jvk/graphics/Graphics.h"
 #include "include/jvk/graphics/Shader.h"

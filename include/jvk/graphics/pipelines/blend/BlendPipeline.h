@@ -48,7 +48,21 @@ public:
         float w = p.region.getWidth() * p.scale;
         float h = p.region.getHeight() * p.scale;
         glm::vec4 color(p.r, p.g, p.b, 1.0f);
-        emitQuad(state, cmd, x, y, w, h, color);
+        // Flat fill with neutral shape / gradient fields. BlendPipeline
+        // shares ColorPipeline's ui2d vertex layout but runs with
+        // BlendMode::Multiply (dst *= src) — darken/brighten/tint land here.
+        // Inlined here so the ColorDraw.h helpers can retire.
+        glm::vec4 shape(0.0f);
+        glm::vec4 grad(0.0f);
+        UIVertex verts[6] = {
+            { {x,     y    }, color, {0, 0}, shape, grad },
+            { {x + w, y    }, color, {1, 0}, shape, grad },
+            { {x + w, y + h}, color, {1, 1}, shape, grad },
+            { {x,     y    }, color, {0, 0}, shape, grad },
+            { {x + w, y + h}, color, {1, 1}, shape, grad },
+            { {x,     y + h}, color, {0, 1}, shape, grad },
+        };
+        state.draw(cmd, verts, 6);
     }
 };
 

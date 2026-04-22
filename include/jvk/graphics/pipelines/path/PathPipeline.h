@@ -205,7 +205,7 @@ public:
     {
         if (!ready() || vertexCount == 0) return;
 
-        state.setCustomPipeline(pipeline_, layout_);
+        state.setCustomPipeline(pipeline_, layout_, drawCmd.stencilDepth);
 
         // Scissor and viewport — use the command's clipBounds for scissor.
         auto clip = drawCmd.clipBounds;

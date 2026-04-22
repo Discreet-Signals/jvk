@@ -58,138 +58,37 @@ enum class BlurMode : uint32_t {
 // Non-POD types (Font, FillType) stored in Renderer side vectors by index.
 // =============================================================================
 
-struct FillRectParams {
-    juce::Rectangle<float> rect;
-    uint32_t               fillIndex;
-    juce::AffineTransform  transform;
-    float                  opacity;
-    float                  scale;
-};
-
-struct FillRoundedRectParams {
-    juce::Rectangle<float> rect;
-    float                  cornerSize;
-    uint32_t               fillIndex;
-    juce::AffineTransform  transform;
-    float                  opacity;
-    float                  scale;
-};
-
-struct FillEllipseParams {
-    juce::Rectangle<float> area;
-    uint32_t               fillIndex;
-    juce::AffineTransform  transform;
-    float                  opacity;
-    float                  scale;
-};
-
-struct StrokeRoundedRectParams {
-    juce::Rectangle<float> rect;
-    float                  cornerSize;
-    float                  lineWidth;
-    uint32_t               fillIndex;
-    juce::AffineTransform  transform;
-    float                  opacity;
-    float                  scale;
-};
-
-struct StrokeEllipseParams {
-    juce::Rectangle<float> area;
-    float                  lineWidth;
-    uint32_t               fillIndex;
-    juce::AffineTransform  transform;
-    float                  opacity;
-    float                  scale;
-};
-
-struct DrawImageParams {
-    uint64_t               imageHash;
-    juce::AffineTransform  transform;
-    float                  opacity;
-    float                  scale;
-    int                    imageWidth;
-    int                    imageHeight;
-};
-
-struct DrawGlyphsParams {
-    uint32_t               glyphCount;
-    juce::AffineTransform  transform;
-    uint32_t               fontIndex;
-    uint32_t               fillIndex;
-    float                  opacity;
-    float                  scale;
-    // followed in arena by: uint16_t[glyphCount] + Point<float>[glyphCount]
-};
-
-struct DrawLineParams {
-    juce::Line<float>      line;
-    float                  lineWidth;
-    uint32_t               fillIndex;
-    juce::AffineTransform  transform;
-    float                  opacity;
-    float                  scale;
-};
-
 struct DrawShaderParams {
     void*                  shader; // Shader*
     juce::Rectangle<float> region;
     float                  scale;
 };
 
-// Analytical SDF path fill. Graphics::fillPath flattens the path to line
-// segments in physical-pixel space, uploads them to PathPipeline's storage
-// buffer ring (via uploadSegments()), and packs the cover-quad vertices +
-// segment range here for later replay. The fragment shader then iterates
-// `segmentCount` segments starting at `segmentStart` in the SSBO.
-//
-// `quadVerts[6]` is a triangle-list quad in physical pixels covering the
-// path bounds + 1 AA pixel. The quad carries the fill colour in vertex
-// attrs. `fillRule` matches juce::Path::isUsingNonZeroWinding() — 0 for
-// non-zero, 1 for even-odd.
-struct FillPathParams {
-    UIVertex quadVerts[6];  // color + gradientInfo pre-baked per corner
-    uint32_t segmentStart;
-    uint32_t segmentCount;
-    uint32_t fillRule;      // 0 = non-zero winding, 1 = even-odd
-    uint32_t fillIndex;     // renderer.getFill() slot → chooses colorLUT descriptor
-};
-
 struct PushClipRectParams {
     juce::Rectangle<int>   rect;
 };
 
-// Clip shape for the stencil push/pop pipelines. One payload shared by both
-// DrawOp::PushClipPath and DrawOp::PopClip — the shapes must match exactly
-// so the INCR on push and DECR on pop cancel (same fragments touched, same
-// stencil op applied symmetrically).
+// Clip dispatch reference for the stencil push / pop pipelines. One ref
+// shared by both DrawOp::PushClipPath and DrawOp::PopClipPath — the SAME
+// GeometryPrimitive is used for both dispatches so the INCR on push and
+// DECR on pop cancel exactly (same fragments touched, same op symmetric).
+// Graphics::clipToPath remembers the ref on its pathClipStack; the matching
+// restoreState → recordPopClip dispatches with the same firstInstance +
+// primCount.
 //
 // Axis-aligned rectangle clips NEVER appear here — they fast-path through
-// Graphics::clipToRectangle to a plain scissor rect. This payload covers
-// the two stencil-backed cases:
+// Graphics::clipToRectangle to a plain scissor update.
 //
-//   shapeType == 1  Rounded rectangle
-//     centerX/Y + halfW/H + cornerRadius encode the shape in physical
-//     pixels; the clip fragment shader evaluates roundedRectSDF and
-//     discards outside pixels before the stencil op.
-//
-//   shapeType == 2  Arbitrary path
-//     segmentStart/segmentCount index into the shared per-frame segment
-//     SSBO (owned by PathPipeline). fillRule selects non-zero (0) or
-//     even-odd (1) winding; the clip frag shader walks the segments and
-//     computes the winding number per fragment.
-//
-// coverRect is the bounding box + 1px AA margin in physical pixels —
-// emitted as a 6-vertex quad so the clip fragment shader runs for every
-// pixel the shape could occupy.
-struct ClipShapeParams {
-    uint32_t               shapeType;       // 1 = rrect, 2 = path
-    float                  centerX, centerY; // rrect only (physical px)
-    float                  halfW, halfH;     // rrect only (physical px)
-    float                  cornerRadius;     // rrect only (physical px)
-    uint32_t               segmentStart;     // path only
-    uint32_t               segmentCount;     // path only
-    uint32_t               fillRule;         // path only
-    juce::Rectangle<float> coverRect;        // quad to cover in physical px
+// `coverRect` is the shape's physical-pixel bounding box (+ 1px AA margin).
+// Used only by Graphics to compute the pop command's writesPx/readsPx
+// scheduling metadata — the dispatch itself drives scissor from
+// DrawCommand::clipBounds and quad cover from the primitive's bbox.
+struct ClipDispatchRef {
+    uint32_t               firstInstance;   // [prefix]
+    uint32_t               primCount;       // [prefix]
+    uint32_t               arenaOffset;     // [prefix]
+    uint32_t               _pad;
+    juce::Rectangle<float> coverRect;
 };
 
 struct EffectBlendParams {
@@ -215,27 +114,6 @@ struct HSVParams {
     float scale;
 };
 
-// Shape-aware variable-radius blur. Pre-packed in the layout the fragment
-// shader's push-constant block expects, minus viewport/direction which the
-// pipeline fills in per-pass. Distances are in USER-LOGICAL pixels
-// (pre-transform); the shader converts kernel sample offsets to physical
-// texels via `blurStep`.
-struct BlurShapeParams {
-    float    invXform[6];          // inverse affine: frag (physical) → shape-local (logical)
-    float    shapeHalf[2];         // rect/rrect/ellipse halfsize (logical)
-    float    lineB[2];             // line: endpoint B in shape-local (A is origin)
-    float    maxRadius;            // user-logical pixels
-    float    falloff;              // user-logical pixels
-    float    blurStep;             // physical texels per user-logical pixel
-                                   // (= transformScale * displayScale)
-    float    cornerRadius;         // rrect only
-    float    lineThickness;        // line only
-    uint32_t shapeType;            // 0=rect, 1=rrect, 2=ellipse, 3=line
-    uint32_t edgePlacement;        // BlurEdge as uint32
-    uint32_t inverted;             // 0 or 1
-    uint32_t mode;                 // BlurMode as uint32 (pass count / type lives here)
-};
-
 struct EffectResolveParams {
     float                  param;
     uint32_t               type;
@@ -243,21 +121,209 @@ struct EffectResolveParams {
     float                  scale;
 };
 
-// Analytical path SDF blur. Graphics::{draw,fill}BlurredPath flattens the
-// path to line segments in PHYSICAL pixels (same as FillPath) and uploads
-// them via PathPipeline::uploadSegments. All distances below are also in
-// PHYSICAL pixels — the C++ caller pre-multiplies by transformScale ×
-// displayScale so the shader runs in one coord space (step = 1 texel).
-struct BlurPathParams {
-    uint32_t segmentStart;
-    uint32_t segmentCount;
-    uint32_t fillRule;        // 0 = non-zero, 1 = even-odd
-    float    maxRadius;       // physical px
-    float    falloff;         // physical px
-    float    strokeHalfWidth; // physical px — 0 for fill, >0 for stroke
-    uint32_t edgePlacement;   // BlurEdge as uint32
-    uint32_t inverted;        // 0 or 1
-    uint32_t mode;            // BlurMode as uint32 (pass count / type lives here)
+// Common prefix for every dispatch ref emitted into the arena by a
+// geometry-abstracted push site. Enables generic ref rewrite from the
+// CommandScheduler's Fuse emit path (which doesn't know about op-specific
+// tail fields) and from the Renderer's post-scheduler upload pass (which
+// fills in `firstInstance` once the primitives are uploaded to the
+// pipeline SSBO in scheduled order). Every DispatchRef below starts with
+// these three u32s IN THIS ORDER; op-specific fields follow.
+//
+//   firstInstance  — SSBO index of the first primitive. Written post-
+//                    scheduler by the upload pass. Undefined at record.
+//   primCount      — number of consecutive primitives (for a single-op
+//                    dispatch this is 1; Fuse mode may bump it after
+//                    concatenating a run of compatible primitives).
+//   arenaOffset    — byte offset in Arena where primCount consecutive
+//                    GeometryPrimitive records live. Set at record time;
+//                    Fuse may rewrite it to point at a newly-allocated
+//                    concatenated span.
+struct DispatchRefPrefix {
+    uint32_t firstInstance;
+    uint32_t primCount;
+    uint32_t arenaOffset;
 };
+
+// Arena payload for DrawOp::BlurShape / DrawOp::BlurPath. `mode` (kernel
+// selector) lives on the ref because the scheduler gates fusion by stateKey
+// which already encodes mode — so every primitive in a fused dispatch
+// agrees on kernelType / passCount.
+struct BlurDispatchRef {
+    uint32_t firstInstance;   // [prefix] SSBO index of the first primitive
+    uint32_t primCount;       // [prefix] number of consecutive primitives
+    uint32_t arenaOffset;     // [prefix] first primitive's offset in arena
+    uint32_t mode;            // BlurMode as uint32 (0=Low / 1=Medium / 2=High)
+};
+
+// Arena payload for most FillPipeline dispatches (SDF shapes, strokes,
+// lines, path). `fillIndex` resolves the colour-LUT descriptor at dispatch
+// time (gradient atlas row for gradient fills, 1×1 default for solid).
+struct FillDispatchRef {
+    uint32_t firstInstance;   // [prefix]
+    uint32_t primCount;       // [prefix]
+    uint32_t arenaOffset;     // [prefix]
+    uint32_t fillIndex;       // Renderer::getFill() slot — colour LUT source
+};
+
+// DrawImage dispatch — image texture descriptor is looked up via imageHash
+// in ResourceCaches's texture cache at dispatch time. imageHash is u64, so
+// it's placed after a pad word to keep 8-byte alignment.
+struct FillImageDispatchRef {
+    uint32_t firstInstance;   // [prefix]
+    uint32_t primCount;       // [prefix]
+    uint32_t arenaOffset;     // [prefix]
+    uint32_t _pad;
+    uint64_t imageHash;
+};
+
+// DrawGlyphs dispatch. Today each glyph is one primitive; the atlas page
+// can vary per glyph, so the dispatcher iterates `primCount` primitives in
+// the uploaded batch and rebinds the shape sampler when the page changes.
+// The arena layout is:
+//
+//     FillGlyphsDispatchRef  (this struct)
+//     uint32_t[primCount]    — atlas page indices (one per glyph primitive)
+//
+// Scheduler fusion can merge runs of same-page glyphs into one contiguous
+// dispatch without extra per-command state — the page-indices array
+// concatenates naturally.
+struct FillGlyphsDispatchRef {
+    uint32_t firstInstance;   // [prefix]
+    uint32_t primCount;       // [prefix]  glyph count
+    uint32_t arenaOffset;     // [prefix]
+    uint32_t fillIndex;       // Renderer::getFill() slot
+};
+
+// =============================================================================
+// GeometryPrimitive — unified per-instance record consumed by every geometry-
+// abstracted pipeline (Blur today, Fill/Clip in later phases). One primitive =
+// one GPU quad; a batch of N primitives becomes one vkCmdDraw(6, N, 0, first).
+//
+// Layout is std430-mirrored exactly in shaders/geometry.glsl (same field
+// order, same vec4/uvec4 alignment); memcpy from the C++ side into the
+// pipeline's per-frame primitive SSBO is verbatim.
+//
+// The core geometry fields are SHARED across pipelines — they describe WHAT
+// shape to draw, not WHAT to do with it. Per-pipeline op-specific data lives
+// in extraB + payload (overlaid, documented per pipeline).
+//
+//   bbox            Physical-pixel AABB (post-transform + AA margin). The
+//                   vertex shader expands this directly into a 6-vertex quad;
+//                   no forward transform runs in the vertex stage. CPU
+//                   precomputes bbox as transform(shapeLocal).expanded(aa).
+//
+//   flags           x = geometryTag (see table below)
+//                   y = shapeFlags  (bit0 inverted, bits1-2 edge, bits3-4
+//                                    fillRule, bit5 stroke-vs-fill)
+//                   z = pathStart   (tag=5 only — index into segment SSBO)
+//                   w = pathCount   (tag=5 only — segment count)
+//
+//   invXform01/23_half
+//                   Inverse affine mapping FRAG.xy (physical pixels) back
+//                   into shape-local (logical) coords. Fragment shader uses
+//                   it to evaluate SDFs in the shape's native space, so the
+//                   caller's juce::AffineTransform never has to be baked
+//                   into per-vertex data on the CPU. Layout:
+//                     invXform01[4]      = m00, m10, m01, m11
+//                     invXform23_half[4] = m02, m12, shapeHalf.x, shapeHalf.y
+//                   shapeHalf is co-packed to save a vec4 — it's in logical
+//                   units (pre-transform), consumed by the SDF call in tags
+//                   0..3. For tag 5 (path) shapeHalf is unused.
+//
+// Geometry tags (flags.x):
+//   0 — Rect                                  (SDF, shapeHalf)
+//   1 — Rounded rect                          (SDF, shapeHalf + cornerRadius)
+//   2 — Ellipse                               (SDF, shapeHalf = radii)
+//   3 — Capsule / line                        (SDF, lineB + lineThickness)
+//   4 — MSDF glyph                            (atlas UV in extraB, gradient in extraA if used)
+//   5 — Path sub-shape                        (segments via flags.zw)
+//   6 — Image                                 (sampler + atlas UV in extraB)
+//
+// shapeFlags (flags.y) bits:
+//   bit 0     inverted           (flip shape-mask alpha, blur-only)
+//   bits 1-2  edgePlacement      (blur falloff band placement)
+//   bits 3-4  fillRule           (path: 0=non-zero, 1=even-odd)
+//   bit 5     stroke             (stroke the shape's SDF instead of fill)
+//   bits 6-7  colorSource        (0=solid, 1=linear-gradient, 2=radial-gradient)
+//
+// Per-pipeline payload conventions (see shaders/geometry.glsl for the
+// matching shader side):
+//
+//   Fill pipeline (SDF shapes, tag 0..3 and tag 5 path):
+//     extraA  = (cornerRadius, strokeWidth, lineB.x, lineB.y)
+//     extraB  = (colorSource != 0) gradient coeffs: (origin.x, origin.y,
+//               dir.x_or_invRadius, dir.y_or_zero)
+//     payload = (colorSource != 0) gradient coeffs: (invLen2_or_zero,
+//               rowNorm, 0, 0)
+//     color   = solid RGBA, or (1,1,1,opacity) when a gradient / sampler
+//               supplies RGB
+//
+//   Fill pipeline (tag 4 MSDF glyph):
+//     extraA  = (colorSource != 0) gradient coeffs as above
+//     extraB  = atlas UV rect (u0, v0, u1, v1)
+//     payload = (invLen2_or_zero, rowNorm, screenPxRange, 0)
+//     color   = RGBA (solid) or (1,1,1,opacity) for gradient
+//
+//   Fill pipeline (tag 6 Image):
+//     extraA  = unused (may hold gradient coeffs for tinted images — not used today)
+//     extraB  = atlas UV rect (u0, v0, u1, v1)
+//     payload = unused
+//     color   = (1,1,1,opacity) — texture supplies RGB, alpha scaled by .a
+//
+//   Blur pipeline (tags 0..3 + 5):
+//     extraA  = (cornerRadius, lineThickness, lineB.x, lineB.y)
+//     extraB  = (maxRadius,    falloff,       blurStep, strokeHalfWidth)
+//     payload = unused
+//     color   = unused
+//
+//   Clip pipeline (tags 1 rrect / 5 path):
+//     everything but bbox / flags / invXform* / extraA.x (cornerRadius) / flags.zw
+//     is unused. The fragment shader discards outside the SDF and never writes color.
+// =============================================================================
+
+struct GeometryPrimitive {
+    float    bbox[4];              // 16  physical-pixel AABB (post-transform + AA)
+    uint32_t flags[4];             // 16  (tag, shapeFlags, pathStart, pathCount)
+    float    invXform01[4];        // 16  m00, m10, m01, m11   (physical → local)
+    float    invXform23_half[4];   // 16  m02, m12, shapeHalf.x, shapeHalf.y
+    float    extraA[4];            // 16  geometry-type / colorSource extras
+    float    extraB[4];            // 16  op-specific payload A
+    float    payload[4];           // 16  op-specific payload B
+    float    color[4];             // 16  RGBA — solid or (1,1,1,opacity) mask
+};
+static_assert(sizeof(GeometryPrimitive) == 128,
+              "GeometryPrimitive must be 128 B to match shaders/geometry.glsl std430 layout.");
+
+// Tag values. Mirrored in shaders/geometry.glsl.
+enum class GeometryTag : uint32_t {
+    Rect     = 0,
+    RoundRect = 1,
+    Ellipse  = 2,
+    Capsule  = 3,
+    MSDFGlyph = 4,
+    Path     = 5,
+    Image    = 6,
+};
+
+enum class ColorSource : uint32_t {
+    Solid    = 0,
+    Linear   = 1,
+    Radial   = 2,
+};
+
+// Packed shapeFlags encoder — use at record time to build flags.y.
+// Unpacking convention is documented in shaders/geometry.glsl.
+inline uint32_t packShapeFlags(bool        inverted,
+                               BlurEdge    edge,
+                               uint32_t    fillRule,     // 0 = non-zero, 1 = even-odd
+                               bool        stroke,
+                               ColorSource cs = ColorSource::Solid) noexcept
+{
+    return (inverted ? 1u : 0u)
+         | ((static_cast<uint32_t>(edge) & 0x3u)  << 1)
+         | ((fillRule & 0x3u)                     << 3)
+         | ((stroke ? 1u : 0u)                    << 5)
+         | ((static_cast<uint32_t>(cs) & 0x3u)    << 6);
+}
 
 } // namespace jvk

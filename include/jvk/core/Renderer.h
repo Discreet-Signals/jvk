@@ -6,11 +6,12 @@ class Pipeline;
 class RenderTarget;
 class EffectPipeline;
 class HSVPipeline;
-class ShapeBlurPipeline;
-class PathBlurPipeline;
+class BlurPipeline;
+class FillPipeline;
 class ShaderPipeline;
 class PathPipeline;
 class ClipPipeline;
+class CommandScheduler;
 
 // =============================================================================
 // UIVertex — shared vertex format for 2D pipelines
@@ -46,7 +47,91 @@ enum class DrawOp : uint8_t {
 };
 
 // =============================================================================
+// Scope — one entry per clip push (rect or path). Indexed by `DrawCommand::scopeId`.
+//
+// Scopes form a tree rooted at id 0 (the full viewport). A command inside scope
+// S writes only to pixels in scopes[S].bounds (and transitively, only inside
+// scopes[S].subtreeBounds for any command deeper in S's subtree). This is the
+// hierarchical bbox the CommandScheduler uses to prune overlap queries.
+//
+//   bounds         set at push time — clip's physical-pixel rect at that scope.
+//   subtreeBounds  computed once per frame by Renderer::finalizeScopes() after
+//                  recording but before the scheduler runs. Equal to the union
+//                  of writesPx over every command in this scope and every
+//                  descendant scope.
+// =============================================================================
+
+struct Scope {
+    uint32_t             parentId = 0;   // 0 == root is its own parent
+    juce::Rectangle<int> bounds   {};    // clip bounds at this scope
+};
+
+// =============================================================================
+// StateKey — 64-bit fusion-compatibility hash. Layout:
+//   [ 8b op | 24b pipelineHint | 16b resourceKey | 16b blendKey ]
+// pipelineHint differentiates within an op class where a pipeline variant
+// differs (e.g. BlurShape with different `mode` uses a different shader).
+// resourceKey is a per-op cheap hash of the bound resources. blendKey bundles
+// blend + edge placement + inversion for effects. Not cryptographic: collisions
+// inside an op just mean the scheduler will attempt fusion that the DAG
+// independence check at emit time will then correctly reject.
+// =============================================================================
+
+namespace state_key {
+
+inline uint64_t make(DrawOp    op,
+                     uint32_t  pipelineHint = 0,   // 24b used
+                     uint16_t  resourceKey  = 0,
+                     uint16_t  blendKey     = 0) noexcept
+{
+    uint64_t k = 0;
+    k |=  static_cast<uint64_t>(op)                        & 0xFFULL;
+    k |= (static_cast<uint64_t>(pipelineHint) & 0xFFFFFFULL) <<  8;
+    k |= (static_cast<uint64_t>(resourceKey)  & 0xFFFFULL)   << 32;
+    k |= (static_cast<uint64_t>(blendKey)     & 0xFFFFULL)   << 48;
+    return k;
+}
+
+// Truncate a 64-bit hash (like ResourceCaches::hashImage) into a 16-bit
+// resourceKey slot. Collisions cause over-splitting in rare cases —
+// correctness-preserving.
+inline uint16_t truncHash(uint64_t h) noexcept
+{
+    return static_cast<uint16_t>((h ^ (h >> 16) ^ (h >> 32) ^ (h >> 48)) & 0xFFFFULL);
+}
+
+} // namespace state_key
+
+// =============================================================================
 // DrawCommand — one entry in the command vector
+//
+// Scheduling metadata (writesPx, readsPx, stateKey, scopeId, isOpaque,
+// recordOrder) populates at push time and is consumed by CommandScheduler.
+// It's all conservative — callers that don't know a tight value can pass
+// sentinels (empty rect, 0) and push() fills in safe defaults derived from
+// `clipBounds`. When the scheduler runs in Identity mode the metadata is
+// recorded but unused, preserving exact current behaviour.
+//
+//   writesPx   tight physical-pixel bbox of the pixels this command writes.
+//              Subset of clipBounds; equal to clipBounds when the caller
+//              hasn't computed a shape AABB.
+//
+//   readsPx    tight physical-pixel bbox of pixels this command reads from
+//              the scene buffer. Equal to writesPx for non-effect ops.
+//              For blurs: writesPx dilated by the kernel reach.
+//
+//   stateKey   see Scope.h / state_key::make — the fusion-compatibility hash.
+//
+//   scopeId    index into Renderer::scopes_. Commands inherit the scope
+//              currently active at push time; clip push/pop transitions
+//              this via Renderer::pushScope / popScope.
+//
+//   isOpaque   true iff this command writes alpha=1 everywhere in writesPx.
+//              Used by the SortCull pass to delete fully-covered earlier ops.
+//              Conservative: default false.
+//
+//   recordOrder  original insertion index. Stable tiebreaker for scheduler
+//                heuristics and reproducible debug dumps.
 // =============================================================================
 
 struct DrawCommand {
@@ -54,9 +139,22 @@ struct DrawCommand {
     DrawOp               op;
     uint32_t             dataOffset;
     uint32_t             dataSize;
-    juce::Rectangle<int> clipBounds;
+    juce::Rectangle<int> clipBounds;     // active scissor at record time
     uint8_t              stencilDepth;
     uint32_t             scopeDepth;
+
+    // Scheduler metadata (Step 1 — see CommandScheduler.md).
+    juce::Rectangle<int> writesPx;
+    juce::Rectangle<int> readsPx;
+    uint64_t             stateKey     = 0;
+    uint32_t             scopeId      = 0;
+    uint32_t             recordOrder  = 0;
+    // Peer-tree depth — computed as a CommandScheduler pre-pass from scopeId
+    // + writesPx. Left at 0 by the renderer. Siblings at the same component-
+    // hierarchy layer that are spatially disjoint share a peerDepth, which
+    // the scheduler uses to cluster them for batching.
+    uint32_t             peerDepth    = 0;
+    bool                 isOpaque     = false;
 };
 
 // =============================================================================
@@ -95,6 +193,12 @@ public:
     }
 
     template <typename T>
+    T& readMut(uint32_t offset)
+    {
+        return *reinterpret_cast<T*>(buffer_.data() + offset);
+    }
+
+    template <typename T>
     std::span<const T> readSpan(uint32_t offset, uint32_t count) const
     {
         return { reinterpret_cast<const T*>(buffer_.data() + offset), count };
@@ -129,8 +233,17 @@ class State {
 public:
     State() = default;
 
-    void setPipeline(Pipeline* pipeline);
-    void setCustomPipeline(VkPipeline pipeline, VkPipelineLayout layout);
+    // Bind the stock 2D pipeline. stencilDepth comes from the command so
+    // the clip variant is picked per-draw — this is what lets the scheduler
+    // reorder commands across PushClipPath boundaries. State's tracked
+    // stencilDepth_ is kept as bookkeeping but no longer consulted for
+    // pipeline choice or stencilRef.
+    void setPipeline(Pipeline* pipeline, uint8_t stencilDepth);
+
+    // User-shader / custom pipeline bind, also parameterised by per-command
+    // stencil depth for the same reason.
+    void setCustomPipeline(VkPipeline pipeline, VkPipelineLayout layout,
+                           uint8_t stencilDepth);
     // set 0 = color source (solid default or gradient LUT), set 1 = shape source
     // (1x1 default, MSDF atlas page, or image texture). Each dirty-tracked.
     void setResources(VkDescriptorSet colorSet, VkDescriptorSet shapeSet);
@@ -187,16 +300,63 @@ public:
     Renderer(Device& device, RenderTarget& target);
     ~Renderer();
 
+    // Record one draw command. Captures the current scopeId from the renderer
+    // and a recordOrder tiebreaker; everything else is caller-supplied. Empty
+    // writesPx/readsPx fall back to `clip`; stateKey==0 falls back to
+    // state_key::make(op). Most call sites have a tight shape AABB and a
+    // proper resource key and should pass them explicitly — the defaults
+    // exist for ops where no tighter value is cheaply computable.
     template <typename Params>
-    void push(DrawOp op, float zOrder, const juce::Rectangle<int>& clip,
-              uint8_t stencilDepth, uint32_t scopeDepth, const Params& params)
+    void push(DrawOp op, float zOrder,
+              const juce::Rectangle<int>& clip,
+              uint8_t stencilDepth, uint32_t scopeDepth,
+              const Params& params,
+              const juce::Rectangle<int>& writesPx = {},
+              const juce::Rectangle<int>& readsPx  = {},
+              uint64_t stateKey = 0,
+              bool isOpaque = false)
     {
         uint32_t offset = arena_.push(params);
-        commands_.push_back({
-            zOrder, op, offset, static_cast<uint32_t>(sizeof(Params)),
-            clip, stencilDepth, scopeDepth
-        });
+        DrawCommand cmd {};
+        cmd.zOrder       = zOrder;
+        cmd.op           = op;
+        cmd.dataOffset   = offset;
+        cmd.dataSize     = static_cast<uint32_t>(sizeof(Params));
+        cmd.clipBounds   = clip;
+        cmd.stencilDepth = stencilDepth;
+        cmd.scopeDepth   = scopeDepth;
+        cmd.writesPx     = writesPx.isEmpty() ? clip         : writesPx;
+        cmd.readsPx      = readsPx.isEmpty()  ? cmd.writesPx : readsPx;
+        cmd.stateKey     = stateKey ? stateKey : state_key::make(op);
+        cmd.scopeId      = currentScopeId_;
+        cmd.recordOrder  = static_cast<uint32_t>(commands_.size());
+        cmd.isOpaque     = isOpaque;
+        commands_.push_back(cmd);
     }
+
+    // ---- Scope management (clip-push/pop on Graphics calls into these) -----
+    // Push a new scope with the supplied clip bounds (physical pixels). Returns
+    // the new scope id, which becomes the currentScopeId_ until popScope().
+    uint32_t pushScope(const juce::Rectangle<int>& bounds)
+    {
+        uint32_t id = static_cast<uint32_t>(scopes_.size());
+        Scope s {};
+        s.parentId = currentScopeId_;
+        s.bounds   = bounds;
+        scopes_.push_back(s);
+        currentScopeId_ = id;
+        return id;
+    }
+
+    // Pop back to the parent scope. Safe to call redundantly at scope 0 (root
+    // is its own parent, so currentScopeId_ stays at 0).
+    void popScope()
+    {
+        currentScopeId_ = scopes_[currentScopeId_].parentId;
+    }
+
+    uint32_t currentScopeId() const { return currentScopeId_; }
+    const std::vector<Scope>& scopes() const { return scopes_; }
 
     // Pin a FrameRetained so its destructor will block until the GPU is
     // done with the frame this record is being assembled into. Called by
@@ -311,16 +471,20 @@ public:
     // intermediate and returns to `current`.
     void setHSVPipeline(HSVPipeline* hp) { hsvPipeline_ = hp; }
 
-    // Attach the shape-aware blur pipeline. Required for BlurShape draw ops
+    // Attach the geometry-abstracted blur pipeline. Handles both BlurShape
     // (Graphics::{draw,fill}Blurred{Rectangle,RoundedRectangle,Ellipse} +
-    // drawBlurredLine).
-    void setShapeBlur(ShapeBlurPipeline* sb) { shapeBlur_ = sb; }
+    // drawBlurredLine) and BlurPath (Graphics::{draw,fill}BlurredPath).
+    // Shares PathPipeline's per-frame segment SSBO for the path-geometry
+    // branch (tag=5), so it must be set AFTER setPathPipeline().
+    void setBlurPipeline(BlurPipeline* bp) { blurPipeline_ = bp; }
+    BlurPipeline* blurPipeline() const { return blurPipeline_; }
 
-    // Attach the path-blur pipeline. Required for BlurPath draw ops
-    // (Graphics::{draw,fill}BlurredPath). Shares PathPipeline's per-frame
-    // segment SSBO — must be set AFTER setPathPipeline() so the dispatch
-    // can grab that descriptor.
-    void setPathBlur(PathBlurPipeline* pb) { pathBlur_ = pb; }
+    // Attach the geometry-abstracted fill pipeline. Handles every non-effect
+    // 2D op: rect / rrect / ellipse / strokes / line / image / glyphs / path.
+    // Must be set AFTER setPathPipeline() so it can share the segment-SSBO
+    // descriptor-set layout for the path-geometry branch.
+    void setFillPipeline(FillPipeline* fp) { fillPipeline_ = fp; }
+    FillPipeline* fillPipeline() const { return fillPipeline_; }
 
     // Attach the DrawShader dispatcher. Required for DrawShader draw ops
     // (g.drawShader). User shaders own their own VkPipeline; this module
@@ -353,18 +517,37 @@ public:
     void arena_align(uint32_t alignment) { arena_.align(alignment); }
     template <typename T>
     void arena_pushSpan(std::span<const T> data) { arena_.pushSpan(data); }
+    template <typename T>
+    uint32_t arena_push(const T& data) { return arena_.push(data); }
+    template <typename T>
+    uint32_t arena_pushSpanReturn(std::span<const T> data) { return arena_.pushSpan(data); }
     // Byte offset where the next push will land. Capture before an
     // arena_pushSpan call to remember that data's location for later
     // cross-command references (e.g. PopClip reusing PushClipPath's verts).
     uint32_t arena_offset() const { return arena_.size(); }
+    // Mutable access to arena contents — used by the post-scheduler upload
+    // pass to write back firstInstance onto each dispatch ref once the
+    // primitive has been uploaded to its pipeline's SSBO. Safe at the
+    // single-writer worker-thread call site; do not use during record.
+    Arena& arenaMut() { return arena_; }
 
-    void reset()
-    {
-        commands_.clear();
-        arena_.reset();
-        fonts_.clear();
-        fills_.clear();
-    }
+    // Defined out-of-line in Renderer.cpp — the body touches RenderTarget,
+    // which is only forward-declared at this point in the header.
+    void reset();
+
+    // Defined in Renderer.cpp. Called from execute() after the scheduler
+    // has reordered / fused commands. Walks the final command list and
+    // uploads each command's primitive arena span into the appropriate
+    // pipeline's per-frame SSBO, writing the resulting `firstInstance`
+    // back onto the command's dispatch ref via DispatchRefPrefix.
+    // Ensures that same-stateKey runs (including Fuse mode's merged
+    // primitive spans) land contiguously in the SSBO so the dispatch
+    // loop can issue batched vkCmdDraw(6, primCount, 0, firstInstance)
+    // calls without touching upload order.
+    void uploadScheduledPrimitives();
+
+    // (Removed finalizeScopes — subtreeBounds is now computed inside
+    // CommandScheduler's peer-depth pre-pass, from the same underlying data.)
 
     Device&         device()   { return device_; }
     RenderTarget&   target()   { return target_; }
@@ -372,6 +555,12 @@ public:
     State&          state()    { return state_; }
     Memory::V&      vertices() { return vertices_; }
     const Arena&    arena() const { return arena_; }
+
+    // Post-record pass that reorders / culls / fuses draw commands before
+    // dispatch. Defaults to Identity (passthrough). Message thread calls
+    // setMode to switch algorithms live; worker thread runs it each frame
+    // inside execute().
+    CommandScheduler& commandScheduler() { return *scheduler_; }
 
 private:
     Device&       device_;
@@ -381,6 +570,19 @@ private:
 
     std::vector<DrawCommand> commands_;
     Arena                    arena_;
+
+    // Scope tree — hierarchical bbox structure used by the CommandScheduler
+    // to prune overlap queries. Root (id 0) is the full viewport and is
+    // repopulated by reset() each frame. Clip push/pop in Graphics calls
+    // into pushScope/popScope above; every recorded command captures the
+    // currentScopeId_ at push time.
+    std::vector<Scope> scopes_;
+    uint32_t           currentScopeId_ = 0;
+
+    // Scheduler is constructed in the Renderer ctor (out of line, where
+    // CommandScheduler is complete). unique_ptr so the forward declaration
+    // at the top of this header is enough here.
+    std::unique_ptr<CommandScheduler> scheduler_;
 
     // Non-POD captures (proper RAII, cleared each frame)
     std::vector<juce::Font>     fonts_;
@@ -408,8 +610,8 @@ private:
     EffectPipeline*    postProcess_      = nullptr;
     EffectPipeline*    copyEffect_       = nullptr;
     HSVPipeline*       hsvPipeline_      = nullptr;
-    ShapeBlurPipeline* shapeBlur_        = nullptr;
-    PathBlurPipeline*  pathBlur_         = nullptr;
+    BlurPipeline*      blurPipeline_     = nullptr;
+    FillPipeline*      fillPipeline_     = nullptr;
     ShaderPipeline*    shaderPipeline_   = nullptr;
     PathPipeline*      pathPipeline_     = nullptr;
     ClipPipeline*      clipPipeline_     = nullptr;

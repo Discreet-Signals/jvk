@@ -17,6 +17,7 @@
 // Core implementations
 #include "include/jvk/core/Device.cpp"
 #include "include/jvk/core/Renderer.cpp"
+#include "include/jvk/core/CommandScheduler.cpp"
 #include "include/jvk/core/Pipeline.cpp"
 #include "include/jvk/core/RenderTarget.cpp"
 #include "include/jvk/offscreen/ShaderImage.cpp"

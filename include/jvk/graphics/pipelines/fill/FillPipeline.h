@@ -5,7 +5,7 @@
  Licensed under the MIT License. See LICENSE file in the project root
  for full license text.
  ------------------------------------------------------------------------------
- File: ClipPipeline.h
+ File: FillPipeline.h
  Author: Gavin Payne
  ------------------------------------------------------------------------------
 */
@@ -15,45 +15,60 @@
 namespace jvk {
 
 // =============================================================================
-// ClipPipeline — geometry-abstracted stencil-clip pipeline. Rasterises the
-// clip shape's cover quad, the fragment shader (clip.frag) evaluates the
-// shape's SDF / path-winding and `discard`s outside pixels. Surviving
-// fragments trigger a fixed-function stencil INCR (push variant) or DECR
-// (pop variant) — subsequent draws pass the stencil test only where the
-// stencil value equals the current clip depth.
+// FillPipeline — geometry-abstracted 2D fill/stroke/draw pipeline.
 //
-// Two VkPipelines share one pipeline layout + one pair of shader modules:
-//   pushPipeline_   stencilPassOp = INCR_WRAP  (cmp = EQUAL, ref = parentDepth)
-//   popPipeline_    stencilPassOp = DECR_WRAP  (cmp = EQUAL, ref = thisDepth)
+// Consolidates the legacy ColorPipeline + PathPipeline dispatch paths behind
+// the shared GeometryPrimitive format. Every non-effect 2D op (FillRect,
+// FillRoundedRect, FillEllipse, StrokeRoundedRect, StrokeEllipse, DrawImage,
+// DrawGlyphs, DrawLine, FillPath) funnels through one VkPipeline + one pair
+// of shader modules (geometry.vert + fill.frag); per-instance behaviour
+// branches on the primitive's `geometryTag`.
 //
-// Descriptor layout (matches FillPipeline / BlurPipeline conventions so
-// push / pop / fill / blur all speak the same GeometryPrimitive format):
-//   set 1, binding 0   SSBO   — GeometryPrimitive array (OWNED)
-//   set 2, binding 0   SSBO   — path segment array (SHARED with PathPipeline)
+// Style-B instanced dispatch: `vkCmdDraw(6, primCount, 0, firstInstance)`.
+// No vertex buffer binding; the vertex shader expands bbox → quad corner
+// via gl_VertexIndex. Single-primitive dispatches today (primCount = 1);
+// Phase C fusion will collapse runs of compatible primitives into larger
+// batches with no further shader / pipeline changes.
 //
-// One primitive per push + its matching pop share the SAME firstInstance:
-// the pop reuses the push's SSBO entry so INCR and DECR touch exactly the
-// same fragments. Graphics::clipToPath remembers the ClipDispatchRef on its
-// pathClipStack; restoreState emits the pop with the same ref.
+// Descriptor layout (pipeline stays bound once per scene RP; only sets 0
+// and 3 rebind per-dispatch, and only when the resource changes):
+//
+//   set 0, binding 0   sampler2D   color LUT — gradient atlas row for
+//                                  gradient fills, 1×1 default for solid.
+//                                  Rebound per dispatch via
+//                                  ResourceCaches::{gradient,default}Descriptor.
+//   set 1, binding 0   SSBO        GeometryPrimitive[] — OWNED, per-frame
+//                                  staging + flush mirroring PathPipeline's
+//                                  segment SSBO pattern.
+//   set 2, binding 0   SSBO        Path segments — SHARED with PathPipeline
+//                                  via its ssboSetLayout(); the fragment
+//                                  shader's tag=5 branch walks it.
+//   set 3, binding 0   sampler2D   Shape sampler — MSDF glyph atlas page for
+//                                  tag 4, image texture for tag 6, 1×1
+//                                  default otherwise. Rebound per dispatch.
+//
+// Stencil is always-on with EQUAL compare against a dynamic reference. A
+// dispatch outside any clip sets ref=0; inside clip depth D sets ref=D.
+// Matches BlurPipeline's convention so both pipelines share one mental model.
 // =============================================================================
 
-class ClipPipeline {
+class FillPipeline {
 public:
     struct PushConstants {
-        float viewportW, viewportH;   // 8
-        float _pad0, _pad1;           // 8   — keep block 16-byte aligned
+        float viewportW, viewportH;  // 8
+        float _pad0, _pad1;          // 8  — keep block 16-byte aligned
         int   _pad2, _pad3, _pad4, _pad5;
     };                                // total: 32 bytes
 
-    static constexpr VkDeviceSize INITIAL_BUFFER_BYTES = 16 * 1024;   // ≈ 128 primitives
-    static constexpr uint32_t     PRIMITIVE_STRIDE     = 128;          // sizeof(GeometryPrimitive)
+    static constexpr VkDeviceSize INITIAL_BUFFER_BYTES = 256 * 1024;   // ≈ 2048 primitives
+    static constexpr uint32_t     PRIMITIVE_STRIDE     = 128;           // sizeof(GeometryPrimitive)
     static constexpr int          MAX_FRAMES           = 2;
 
-    ClipPipeline() = default;
-    ~ClipPipeline() { destroy(); }
+    FillPipeline() = default;
+    ~FillPipeline() { destroy(); }
 
-    ClipPipeline(const ClipPipeline&) = delete;
-    ClipPipeline& operator=(const ClipPipeline&) = delete;
+    FillPipeline(const FillPipeline&) = delete;
+    FillPipeline& operator=(const FillPipeline&) = delete;
 
     void init(Device& device,
               VkRenderPass sceneRenderPass,
@@ -64,7 +79,19 @@ public:
         device_ = &device;
         VkDevice d = device.device();
 
-        // Set 1 — primitive SSBO (OWNED).
+        // Glyph atlas lives here now — formerly inside ColorPipeline. Record-
+        // time `drawGlyphs` uses it to look up MSDF atlas UV rects + page
+        // indices; the worker's prepare() pass flushes dirty pages before
+        // dispatch reads them. (Safe: paint finishes before worker starts.)
+        atlas_.init(device);
+
+        // Set 0 — color LUT sampler (SHARED: global IMAGE_SAMPLER layout,
+        // same one ResourceCaches builds its gradient / default descriptors
+        // against).
+        VkDescriptorSetLayout colorLutLayout =
+            device.bindings().getLayout(Memory::M::IMAGE_SAMPLER);
+
+        // Set 1 — primitive SSBO layout (OWNED).
         {
             VkDescriptorSetLayoutBinding b {};
             b.binding = 0;
@@ -79,7 +106,10 @@ public:
             vkCreateDescriptorSetLayout(d, &dli, nullptr, &primSetLayout_);
         }
 
-        // Per-slot primitive-SSBO descriptor sets.
+        // Set 3 — shape sampler (SHARED: same IMAGE_SAMPLER layout).
+        VkDescriptorSetLayout shapeSetLayout = colorLutLayout;
+
+        // Primitive-SSBO descriptor pool + per-slot sets.
         {
             VkDescriptorPoolSize poolSize {};
             poolSize.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -103,21 +133,16 @@ public:
             vkAllocateDescriptorSets(d, &ai, primDescSets_);
         }
 
+        // Per-slot host-visible primitive buffers.
         for (int i = 0; i < MAX_FRAMES; i++) {
             allocateBuffer(i, INITIAL_BUFFER_BYTES);
             writeDescriptor(i);
         }
 
-        // Pipeline layout — 3 sets (set 0 unused) + PC.
-        VkDescriptorSetLayout setLayouts[3] = {
-            primSetLayout_,       // set 0 — actually this is unused, see below.
-            primSetLayout_,       // set 1 — primitive SSBO
-            pathSsboSetLayout,    // set 2 — path segments
+        // Pipeline layout — 4 descriptor sets + PC.
+        VkDescriptorSetLayout setLayouts[4] = {
+            colorLutLayout, primSetLayout_, pathSsboSetLayout, shapeSetLayout
         };
-        // Shader actually binds at set=1 and set=2; set 0 needs a layout
-        // declared to satisfy continuous-set-index requirements on some
-        // drivers. Point it at primSetLayout_ as a harmless stand-in; the
-        // shader never reads set 0.
 
         VkPushConstantRange pcRange {};
         pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -126,19 +151,26 @@ public:
 
         VkPipelineLayoutCreateInfo pli {};
         pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pli.setLayoutCount = 3;
+        pli.setLayoutCount = 4;
         pli.pSetLayouts = setLayouts;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pcRange;
         vkCreatePipelineLayout(d, &pli, nullptr, &layout_);
 
-        pushPipeline_ = buildVariant(sceneRenderPass, vertSpv, fragSpv, VK_STENCIL_OP_INCREMENT_AND_WRAP);
-        popPipeline_  = buildVariant(sceneRenderPass, vertSpv, fragSpv, VK_STENCIL_OP_DECREMENT_AND_WRAP);
+        pipeline_ = buildPipeline(sceneRenderPass, vertSpv, fragSpv);
     }
 
-    bool ready() const { return pushPipeline_ != VK_NULL_HANDLE && popPipeline_ != VK_NULL_HANDLE; }
+    bool ready() const { return device_ != nullptr && pipeline_ != VK_NULL_HANDLE; }
+    VkPipelineLayout pipelineLayout() const { return layout_; }
 
-    // --- Primitive SSBO staging (paint-thread record) --------------------
+    GlyphAtlas& atlas() { return atlas_; }
+    const GlyphAtlas& atlas() const { return atlas_; }
+
+    // Worker-thread prepare step — stages dirty MSDF atlas pages into GPU
+    // textures. Mirrors ColorPipeline::prepare().
+    void prepareFrame() { atlas_.stageDirtyPages(); }
+
+    // ---- Primitive SSBO staging (paint-thread record) --------------------
 
     void beginFrame() { cpuPrims_.clear(); }
 
@@ -162,51 +194,38 @@ public:
             memcpy(mappedPtrs_[frameSlot], cpuPrims_.data(), cpuPrims_.size());
     }
 
-    // --- Dispatch --------------------------------------------------------
+    // ---- Dispatch (worker-thread replay) ---------------------------------
 
-    // Push variant — INCR_WRAP the stencil where the shape SDF says "inside"
-    // and the parent clip's stencil matches `stencilRef` (= parent depth).
-    void pushClip(State& state, VkCommandBuffer cmd,
-                  VkDescriptorSet pathSsbo,
-                  VkExtent2D extent, VkRect2D scissor,
-                  uint32_t firstInstance, uint32_t primCount,
-                  uint8_t stencilRef)
-    {
-        dispatchVariant(pushPipeline_, state, cmd, pathSsbo, extent, scissor,
-                        firstInstance, primCount, stencilRef);
-    }
-
-    // Pop variant — DECR_WRAP at the matching depth, using the SAME primitive
-    // range as the push so every INCR'd fragment gets a matching DECR.
-    void popClip(State& state, VkCommandBuffer cmd,
-                 VkDescriptorSet pathSsbo,
-                 VkExtent2D extent, VkRect2D scissor,
-                 uint32_t firstInstance, uint32_t primCount,
-                 uint8_t stencilRef)
-    {
-        dispatchVariant(popPipeline_, state, cmd, pathSsbo, extent, scissor,
-                        firstInstance, primCount, stencilRef);
-    }
-
-private:
-    void dispatchVariant(VkPipeline pipeline,
-                         State& state, VkCommandBuffer cmd,
-                         VkDescriptorSet pathSsbo,
-                         VkExtent2D extent, VkRect2D scissor,
-                         uint32_t firstInstance, uint32_t primCount,
-                         uint8_t stencilRef)
+    // One instanced draw of `primCount` primitives starting at `firstInstance`
+    // in the per-frame SSBO. Runs INSIDE the currently-active scene render
+    // pass; no RP transitions. The caller sets scissor + viewport from the
+    // command; stencilRef travels dynamically so pipeline rebinds aren't
+    // needed per clip-depth change.
+    void dispatch(State& state, VkCommandBuffer cmd,
+                  VkDescriptorSet colorLUTDesc,
+                  VkDescriptorSet pathSsboDesc,
+                  VkDescriptorSet shapeDesc,
+                  VkExtent2D extent,
+                  VkRect2D   scissor,
+                  uint32_t   firstInstance,
+                  uint32_t   primCount,
+                  uint8_t    stencilRef)
     {
         if (!ready() || primCount == 0) return;
 
-        state.setCustomPipeline(pipeline, layout_, stencilRef);
+        // Force State to rebind pipeline (its tracker doesn't understand our
+        // custom layout). State is here only so its tracker gets invalidated;
+        // dispatch is otherwise self-contained.
+        state.setCustomPipeline(pipeline_, layout_, stencilRef);
 
-        VkDescriptorSet sets[3] = {
-            primDescSets_[currentFrameSlot_],   // set 0 — unused stand-in
-            primDescSets_[currentFrameSlot_],   // set 1 — primitive SSBO
-            pathSsbo                            // set 2 — path segments
+        VkDescriptorSet sets[4] = {
+            colorLUTDesc,
+            primDescSets_[currentFrameSlot_],
+            pathSsboDesc,
+            shapeDesc
         };
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            layout_, 0, 3, sets, 0, nullptr);
+            layout_, 0, 4, sets, 0, nullptr);
 
         vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilRef);
 
@@ -226,27 +245,46 @@ private:
 
         vkCmdDraw(cmd, 6, primCount, 0, firstInstance);
 
+        // Our custom layout isn't the generic Pipeline base's — tell State
+        // its pipeline tracker is stale so the next standard op rebinds.
         state.invalidate();
     }
 
-    VkPipeline buildVariant(VkRenderPass renderPass,
-                            std::span<const uint32_t> vertSpv,
-                            std::span<const uint32_t> fragSpv,
-                            VkStencilOp stencilPassOp)
+private:
+    void destroy()
+    {
+        if (!device_) return;
+        VkDevice d = device_->device();
+        if (pipeline_ != VK_NULL_HANDLE)      vkDestroyPipeline(d, pipeline_, nullptr);
+        if (layout_   != VK_NULL_HANDLE)      vkDestroyPipelineLayout(d, layout_, nullptr);
+        if (descPool_ != VK_NULL_HANDLE)      vkDestroyDescriptorPool(d, descPool_, nullptr);
+        if (primSetLayout_ != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(d, primSetLayout_, nullptr);
+        for (int i = 0; i < MAX_FRAMES; i++) {
+            if (mappedPtrs_[i])       { vkUnmapMemory(d, storageMemory_[i]); mappedPtrs_[i] = nullptr; }
+            if (storageBuffer_[i])    vkDestroyBuffer(d, storageBuffer_[i], nullptr);
+            if (storageMemory_[i])    vkFreeMemory(d, storageMemory_[i], nullptr);
+        }
+    }
+
+    VkPipeline buildPipeline(VkRenderPass sceneRenderPass,
+                             std::span<const uint32_t> vertSpv,
+                             std::span<const uint32_t> fragSpv)
     {
         VkDevice d = device_->device();
 
-        auto makeModule = [&](std::span<const uint32_t> code) {
-            VkShaderModuleCreateInfo ci {};
-            ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-            ci.codeSize = code.size() * 4;
-            ci.pCode = code.data();
-            VkShaderModule m;
-            vkCreateShaderModule(d, &ci, nullptr, &m);
-            return m;
-        };
-        VkShaderModule vertMod = makeModule(vertSpv);
-        VkShaderModule fragMod = makeModule(fragSpv);
+        VkShaderModuleCreateInfo vci {};
+        vci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        vci.codeSize = vertSpv.size() * 4;
+        vci.pCode = vertSpv.data();
+        VkShaderModule vertMod;
+        vkCreateShaderModule(d, &vci, nullptr, &vertMod);
+
+        VkShaderModuleCreateInfo fci {};
+        fci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        fci.codeSize = fragSpv.size() * 4;
+        fci.pCode = fragSpv.data();
+        VkShaderModule fragMod;
+        vkCreateShaderModule(d, &fci, nullptr, &fragMod);
 
         VkPipelineShaderStageCreateInfo stages[2] {};
         stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -258,7 +296,7 @@ private:
         stages[1].module = fragMod;
         stages[1].pName  = "main";
 
-        // No vertex buffer — geometry.vert expands bbox from SSBO.
+        // No vertex buffer.
         VkPipelineVertexInputStateCreateInfo vi {};
         vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
 
@@ -266,10 +304,10 @@ private:
         ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
         ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
-        VkPipelineViewportStateCreateInfo vpState {};
-        vpState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-        vpState.viewportCount = 1;
-        vpState.scissorCount  = 1;
+        VkPipelineViewportStateCreateInfo vp {};
+        vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        vp.viewportCount = 1;
+        vp.scissorCount  = 1;
 
         VkPipelineRasterizationStateCreateInfo raster {};
         raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
@@ -281,28 +319,37 @@ private:
         ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-        // Stencil: EQUAL cmp, dynamic ref; passOp = INCR_WRAP (push) or
-        // DECR_WRAP (pop). Outside-parent-clip fragments test unequal and
-        // KEEP; discarded (SDF-outside) fragments never reach the stencil.
-        VkStencilOpState so {};
-        so.failOp      = VK_STENCIL_OP_KEEP;
-        so.passOp      = stencilPassOp;
-        so.depthFailOp = VK_STENCIL_OP_KEEP;
-        so.compareOp   = VK_COMPARE_OP_EQUAL;
-        so.compareMask = 0xFF;
-        so.writeMask   = 0xFF;
-        so.reference   = 0;   // dynamic
-
+        // Always-on stencil test (EQUAL). Outside-clip pixels where
+        // stencil != ref are discarded; ref=0 is the no-clip case. Matches
+        // the ColorPipeline clipConfig's stencil state so visuals are byte-
+        // identical to the pre-refactor behaviour.
         VkPipelineDepthStencilStateCreateInfo ds {};
         ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
         ds.stencilTestEnable = VK_TRUE;
+        VkStencilOpState so {};
+        so.failOp      = VK_STENCIL_OP_KEEP;
+        so.passOp      = VK_STENCIL_OP_KEEP;
+        so.depthFailOp = VK_STENCIL_OP_KEEP;
+        so.compareOp   = VK_COMPARE_OP_EQUAL;
+        so.compareMask = 0xFF;
+        so.writeMask   = 0x00;
+        so.reference   = 0;
         ds.front = so;
         ds.back  = so;
 
-        // No colour write — stencil-only.
+        // Straight-alpha blend: src * srcA + dst * (1 - srcA). Matches JUCE
+        // convention — colour output of fill.frag is premultiplied-neutral
+        // (color × shape with straight alpha on both).
         VkPipelineColorBlendAttachmentState blend {};
-        blend.colorWriteMask = 0;
-        blend.blendEnable = VK_FALSE;
+        blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                             | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        blend.blendEnable         = VK_TRUE;
+        blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blend.colorBlendOp        = VK_BLEND_OP_ADD;
+        blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blend.alphaBlendOp        = VK_BLEND_OP_ADD;
 
         VkPipelineColorBlendStateCreateInfo cb {};
         cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -325,21 +372,21 @@ private:
         pci.pStages = stages;
         pci.pVertexInputState   = &vi;
         pci.pInputAssemblyState = &ia;
-        pci.pViewportState      = &vpState;
+        pci.pViewportState      = &vp;
         pci.pRasterizationState = &raster;
         pci.pMultisampleState   = &ms;
         pci.pDepthStencilState  = &ds;
         pci.pColorBlendState    = &cb;
         pci.pDynamicState       = &dynState;
         pci.layout              = layout_;
-        pci.renderPass          = renderPass;
+        pci.renderPass          = sceneRenderPass;
 
-        VkPipeline result = VK_NULL_HANDLE;
-        vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &result);
+        VkPipeline p = VK_NULL_HANDLE;
+        vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &p);
 
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);
-        return result;
+        return p;
     }
 
     void growStorageBuffer(int frameSlot, size_t neededBytes)
@@ -404,27 +451,9 @@ private:
         vkUpdateDescriptorSets(d, 1, &w, 0, nullptr);
     }
 
-    void destroy()
-    {
-        if (!device_) return;
-        VkDevice d = device_->device();
-        if (pushPipeline_   != VK_NULL_HANDLE) vkDestroyPipeline(d, pushPipeline_, nullptr);
-        if (popPipeline_    != VK_NULL_HANDLE) vkDestroyPipeline(d, popPipeline_, nullptr);
-        if (layout_         != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
-        if (descPool_       != VK_NULL_HANDLE) vkDestroyDescriptorPool(d, descPool_, nullptr);
-        if (primSetLayout_  != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(d, primSetLayout_, nullptr);
-        for (int i = 0; i < MAX_FRAMES; i++) {
-            if (mappedPtrs_[i])       { vkUnmapMemory(d, storageMemory_[i]); mappedPtrs_[i] = nullptr; }
-            if (storageBuffer_[i])    vkDestroyBuffer(d, storageBuffer_[i], nullptr);
-            if (storageMemory_[i])    vkFreeMemory(d, storageMemory_[i], nullptr);
-        }
-        device_ = nullptr;
-    }
-
     Device*               device_        = nullptr;
     VkPipelineLayout      layout_        = VK_NULL_HANDLE;
-    VkPipeline            pushPipeline_  = VK_NULL_HANDLE;
-    VkPipeline            popPipeline_   = VK_NULL_HANDLE;
+    VkPipeline            pipeline_      = VK_NULL_HANDLE;
 
     VkDescriptorSetLayout primSetLayout_ = VK_NULL_HANDLE;
     VkDescriptorPool      descPool_      = VK_NULL_HANDLE;
@@ -437,6 +466,8 @@ private:
 
     std::vector<uint8_t>  cpuPrims_;
     int                   currentFrameSlot_ = 0;
+
+    GlyphAtlas            atlas_;
 };
 
 } // namespace jvk

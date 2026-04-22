@@ -50,7 +50,15 @@ public:
     //                                         pixels are discarded so the
     //                                         following effect pass can
     //                                         fill them without overlap.
-    enum class StencilMode { Inside, Outside };
+    // Effect stencil gating:
+    //   Inside   — writes only where stencil == ref   (clip-respecting pass)
+    //   Outside  — writes only where stencil != ref   (legacy outside-seed)
+    //   Always   — writes every pixel (stencil test disabled). Used by the
+    //              ping-pong seed copy that runs before every effect
+    //              dispatch so the destination half starts with source
+    //              content and the effect only has to write its output
+    //              region. Must be paired with copy.frag.
+    enum class StencilMode { Inside, Outside, Always };
 
     void init(Device& device,
               VkRenderPass compatibleRenderPass,
@@ -129,10 +137,12 @@ public:
 
         VkPipelineDepthStencilStateCreateInfo ds {};
         ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.stencilTestEnable = VK_TRUE;
-        // writeMask=0 — effect passes never modify stencil. compareOp flips
-        // between EQUAL (Inside) and NOT_EQUAL (Outside); reference is
-        // always the active clip depth (set dynamically per pass).
+        // Always mode disables stencil entirely — writes every fragment.
+        // Inside / Outside keep the test enabled, writeMask=0 so effect
+        // passes never modify stencil, and compareOp flips between EQUAL
+        // (Inside) and NOT_EQUAL (Outside). Reference is set dynamically
+        // per pass.
+        ds.stencilTestEnable = (mode == StencilMode::Always) ? VK_FALSE : VK_TRUE;
         VkStencilOpState so {};
         so.failOp      = VK_STENCIL_OP_KEEP;
         so.passOp      = VK_STENCIL_OP_KEEP;
@@ -159,11 +169,14 @@ public:
         VkDynamicState dyn[] = {
             VK_DYNAMIC_STATE_VIEWPORT,
             VK_DYNAMIC_STATE_SCISSOR,
-            VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+            VK_DYNAMIC_STATE_STENCIL_REFERENCE,   // ignored when stencil is disabled
         };
         VkPipelineDynamicStateCreateInfo dynState {};
         dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 3;
+        // Only the first 2 entries apply in Always mode; the stencil-ref
+        // entry is harmless in unused form but stripping it shortens the
+        // dynamic state list for that variant.
+        dynState.dynamicStateCount = (mode == StencilMode::Always) ? 2u : 3u;
         dynState.pDynamicStates = dyn;
 
         VkGraphicsPipelineCreateInfo pci {};

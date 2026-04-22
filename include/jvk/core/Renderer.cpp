@@ -23,6 +23,7 @@ std::vector<Renderer*>& Renderer::registry()
 Renderer::Renderer(Device& device, RenderTarget& target)
     : device_(device), target_(target),
       vertices_(device.physicalDevice(), device.device()),
+      scheduler_(std::make_unique<CommandScheduler>()),
       worker_(std::make_unique<Worker>(*this))
 {
     {
@@ -50,6 +51,107 @@ Renderer::~Renderer()
     }
     if (worker_) worker_.reset();
     flushRetains();
+}
+
+// =============================================================================
+// Per-frame reset — clears record buffers and reseeds the scope tree with a
+// root scope matching the current render target. Out-of-line because the
+// header only forward-declares RenderTarget.
+// =============================================================================
+
+void Renderer::reset()
+{
+    commands_.clear();
+    arena_.reset();
+    fonts_.clear();
+    fills_.clear();
+
+    scopes_.clear();
+    Scope root {};
+    root.parentId = 0;
+    root.bounds   = { 0, 0,
+                      static_cast<int>(target_.width()),
+                      static_cast<int>(target_.height()) };
+    scopes_.push_back(root);
+    currentScopeId_ = 0;
+}
+
+// =============================================================================
+// Post-scheduler primitive upload. Walks commands_ in its post-scheduled
+// order, routes each command's primitive arena span to the appropriate
+// pipeline's uploadPrimitives, and writes the returned firstInstance back
+// onto the command's DispatchRef prefix.
+//
+// The scheduler has already reordered (and in Fuse mode, concatenated)
+// primitive spans into the arena. The dispatch loop downstream trusts the
+// resulting firstInstance/primCount on each ref — it has no knowledge of
+// arena offsets or the pre-scheduled record order.
+// =============================================================================
+
+void Renderer::uploadScheduledPrimitives()
+{
+    // Helper: rewrite firstInstance on a dispatch ref via the common prefix.
+    // The op-specific tail fields (fillIndex, mode, imageHash, coverRect,
+    // glyph pages) are left untouched.
+    auto stampFirstInstance = [&](uint32_t dataOffset, uint32_t firstInstance) {
+        auto& prefix = arena_.readMut<DispatchRefPrefix>(dataOffset);
+        prefix.firstInstance = firstInstance;
+    };
+
+    for (auto& cmd : commands_) {
+        switch (cmd.op) {
+            case DrawOp::FillRect:
+            case DrawOp::FillRectList:
+            case DrawOp::FillRoundedRect:
+            case DrawOp::FillEllipse:
+            case DrawOp::StrokeRoundedRect:
+            case DrawOp::StrokeEllipse:
+            case DrawOp::DrawLine:
+            case DrawOp::FillPath: {
+                if (!fillPipeline_) break;
+                const auto& ref = arena_.read<FillDispatchRef>(cmd.dataOffset);
+                auto prims = arena_.readSpan<GeometryPrimitive>(ref.arenaOffset, ref.primCount);
+                uint32_t first = fillPipeline_->uploadPrimitives(prims.data(), ref.primCount);
+                stampFirstInstance(cmd.dataOffset, first);
+                break;
+            }
+            case DrawOp::DrawImage: {
+                if (!fillPipeline_) break;
+                const auto& ref = arena_.read<FillImageDispatchRef>(cmd.dataOffset);
+                auto prims = arena_.readSpan<GeometryPrimitive>(ref.arenaOffset, ref.primCount);
+                uint32_t first = fillPipeline_->uploadPrimitives(prims.data(), ref.primCount);
+                stampFirstInstance(cmd.dataOffset, first);
+                break;
+            }
+            case DrawOp::DrawGlyphs: {
+                if (!fillPipeline_) break;
+                const auto& ref = arena_.read<FillGlyphsDispatchRef>(cmd.dataOffset);
+                auto prims = arena_.readSpan<GeometryPrimitive>(ref.arenaOffset, ref.primCount);
+                uint32_t first = fillPipeline_->uploadPrimitives(prims.data(), ref.primCount);
+                stampFirstInstance(cmd.dataOffset, first);
+                break;
+            }
+            case DrawOp::BlurShape:
+            case DrawOp::BlurPath: {
+                if (!blurPipeline_) break;
+                const auto& ref = arena_.read<BlurDispatchRef>(cmd.dataOffset);
+                auto prims = arena_.readSpan<GeometryPrimitive>(ref.arenaOffset, ref.primCount);
+                uint32_t first = blurPipeline_->uploadPrimitives(prims.data(), ref.primCount);
+                stampFirstInstance(cmd.dataOffset, first);
+                break;
+            }
+            case DrawOp::PushClipPath:
+            case DrawOp::PopClipPath: {
+                if (!clipPipeline_) break;
+                const auto& ref = arena_.read<ClipDispatchRef>(cmd.dataOffset);
+                auto prims = arena_.readSpan<GeometryPrimitive>(ref.arenaOffset, ref.primCount);
+                uint32_t first = clipPipeline_->uploadPrimitives(prims.data(), ref.primCount);
+                stampFirstInstance(cmd.dataOffset, first);
+                break;
+            }
+            default: break;
+        }
+    }
 }
 
 // =============================================================================
@@ -218,7 +320,38 @@ void Renderer::execute()
     // fence, so the GPU is done reading this slot's buffer from 2 frames
     // ago. The OTHER slot's buffer may still be in flight (frame N-1)
     // and is not touched.
+    // Flush record-phase path segments (used by fill.frag / clip.frag /
+    // geom_blur.frag tag=5 branches) into THIS frame slot's SSBO. Path
+    // segments are NOT reordered by the scheduler — they live at the
+    // byte offsets Graphics::fillPath recorded — so flushing them before
+    // scheduler.run is safe.
     if (pathPipeline_) pathPipeline_->flushToGPU(frame.frameSlot);
+
+    // Post-record scheduler pass. Identity mode passes through untouched.
+    // Other modes compute peerDepth, build the DAG, reorder, and (in
+    // Fuse) concatenate same-stateKey DAG-independent primitives into
+    // merged arena spans. Runs here (not on the paint thread) so the
+    // analysis cost never blocks record.
+    scheduler_->run(commands_, scopes_, arena_);
+
+    // Upload primitive arena data to each geometry-abstracted pipeline's
+    // SSBO in post-scheduler order. Writes back `firstInstance` on each
+    // dispatch ref so the dispatch loop below can issue
+    // vkCmdDraw(6, primCount, 0, firstInstance) without care for record-
+    // vs-scheduled order. This is the exact phase that makes the Fuse
+    // mode's merged primitive spans land contiguously in the SSBO —
+    // primCount on the merged ref covers the whole run in one dispatch.
+    uploadScheduledPrimitives();
+
+    // Now the SSBOs can flush. Fill's prepareFrame (MSDF atlas stage)
+    // must happen after flush so the atlas pages are ready before
+    // dispatch samples them.
+    if (blurPipeline_) blurPipeline_->flushToGPU(frame.frameSlot);
+    if (clipPipeline_) clipPipeline_->flushToGPU(frame.frameSlot);
+    if (fillPipeline_) {
+        fillPipeline_->flushToGPU(frame.frameSlot);
+        fillPipeline_->prepareFrame();
+    }
     device_.flushUploads(frame.cmd);
 
     auto const& sb = target_.sceneBuffers(frame.frameSlot);
@@ -294,28 +427,35 @@ void Renderer::execute()
     // Runs a single post-process pass (caller provides the dispatch via
     // `applyPass`) and swaps the active half. Must be called between a
     // vkCmdEndRenderPass and the matching resume of the scene RP.
+    //
+    // Every pass gets a free "seed copy" prologue: before the effect
+    // dispatch runs, the current scene half is blitted verbatim to the
+    // destination half via copyEffect_ (StencilMode::Always — writes every
+    // pixel). This makes the ping-pong safe for effect pipelines that
+    // only write a subset of the destination — tight-bbox blurs, clipped
+    // HSV, scissored kernel passes, future shape-aware effects — so each
+    // of them can stay tightly scoped without the outside-region pixels
+    // turning into stale / uninitialised ping-pong data. Effects that DO
+    // write every destination pixel (unclipped HSV, fullscreen blur)
+    // still work; the seed copy is then redundant but harmless.
+    //
+    // Generalising here means every effect pipeline, present and future,
+    // gets correct ping-pong semantics for free. The alternative — asking
+    // each pipeline to seed its own destination — spreads the same rule
+    // across every dispatch site and rots the moment a new effect is
+    // added.
     auto effectPassAndSwap = [&](auto applyPass) {
         int dst = cur ^ 1;
+        if (copyEffect_) {
+            copyEffect_->applyPass(frame.cmd,
+                pp[cur].sampler, pp[dst].effectFB, target_.effectRenderPass(),
+                frame.extent,
+                /*dir*/    0.0f, 0.0f,
+                /*radius*/ 0.0f,
+                /*stencilRef*/ 0);
+        }
         applyPass(pp[cur].sampler, pp[dst].effectFB);
         cur = dst;
-    };
-
-    // When a clip is active, the effect pass will discard fragments outside
-    // the clip via stencil test. Those outside-clip destination pixels would
-    // then hold undefined (LOAD'd) data. Running a NOT_EQUAL-stencil copy
-    // pass first fills exactly those outside-clip pixels with the source,
-    // so the two passes together cover the destination without overlap. The
-    // copy does NOT swap — the subsequent effect pass is the one that
-    // flips `cur`.
-    auto preCopyIfClipped = [&](uint8_t stencilDepth) {
-        if (stencilDepth == 0 || !copyEffect_) return;
-        int dst = cur ^ 1;
-        copyEffect_->applyPass(frame.cmd,
-            pp[cur].sampler, pp[dst].effectFB, target_.effectRenderPass(),
-            frame.extent,
-            /*dir unused*/ 0.0f, 0.0f,
-            /*radius unused*/ 0.0f,
-            /*stencilRef*/ stencilDepth);
     };
 
     beginSceneRP(target_.sceneRenderPassClear(), /*withClears=*/true);
@@ -323,27 +463,49 @@ void Renderer::execute()
         static_cast<float>(frame.extent.width),
         static_cast<float>(frame.extent.height));
 
+    // Scene render pass is lazy-managed across the command loop. Each effect
+    // op (EffectKernel / EffectHSV / BlurShape / BlurPath) needs the scene
+    // RP ENDED while its effect RP runs; each scene-drawing op (fills, clips,
+    // paths, shaders) needs the scene RP OPEN. Consecutive effect ops used
+    // to bounce (end-begin-end-begin) between each other; tracking the state
+    // collapses those bounces — five clustered blurs now get one end and one
+    // begin instead of five of each.
+    bool sceneOpen = true;
+
     for (auto& cmd : commands_) {
+        const bool needsSceneEnded = cmd.op == DrawOp::EffectKernel
+                                  || cmd.op == DrawOp::EffectHSV
+                                  || cmd.op == DrawOp::BlurShape
+                                  || cmd.op == DrawOp::BlurPath;
+
+        if (needsSceneEnded) {
+            if (sceneOpen) {
+                vkCmdEndRenderPass(frame.cmd);
+                sceneOpen = false;
+            }
+        } else {
+            if (!sceneOpen) {
+                beginSceneRP(scenePassLoad, /*withClears=*/false);
+                sceneOpen = true;
+            }
+        }
+
         if (cmd.op == DrawOp::EffectKernel) {
-            // Separable Gaussian blur. Pre-copy if clipped (seeds outside-
-            // clip pixels with source), then H pass + V pass. Each pass
-            // swaps; the two swaps cancel so `cur` lands back on the same
-            // half it started on. Stencil test in the blur pipeline keeps
-            // the H/V writes inside the clip; the pre-copy handled outside.
-            vkCmdEndRenderPass(frame.cmd);
+            // Separable Gaussian blur. Each pass swaps; the two swaps
+            // cancel so `cur` lands back on the same half it started on.
+            // effectPassAndSwap runs a full-viewport seed copy before each
+            // dispatch so the stencil-clipped blur writes can stay inside
+            // the clip without leaving the outside-clip pixels as stale
+            // ping-pong data. Scene RP was ended by the lazy manager at
+            // the top of the loop.
             if (postProcess_) {
                 auto& bp = arena_.read<BlurParams>(cmd.dataOffset);
-                preCopyIfClipped(cmd.stencilDepth);
                 effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
                     postProcess_->applyPass(frame.cmd, src, dst,
                         target_.effectRenderPass(), frame.extent,
                         1.0f, 0.0f, bp.radius,
                         static_cast<uint32_t>(cmd.stencilDepth));
                 });
-                // Second pass runs on the freshly-written half. Its clip
-                // state is the same, but the outside-clip pixels of the
-                // new `cur` half haven't been seeded yet — pre-copy again.
-                preCopyIfClipped(cmd.stencilDepth);
                 effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
                     postProcess_->applyPass(frame.cmd, src, dst,
                         target_.effectRenderPass(), frame.extent,
@@ -351,7 +513,8 @@ void Renderer::execute()
                         static_cast<uint32_t>(cmd.stencilDepth));
                 });
             }
-            beginSceneRP(scenePassLoad, /*withClears=*/false);
+            // Scene RP left closed — next non-effect op will reopen, or
+            // the next effect chains onto the closed state for free.
             continue;
         }
         if (cmd.op == DrawOp::PushClipRect) {
@@ -366,80 +529,131 @@ void Renderer::execute()
             state_.popClipRect();
             continue;
         }
-        if (cmd.op == DrawOp::PushClipPath) {
-            // Analytical-SDF clip push — fragment shader discards outside the
-            // clip shape, stencil INCR_WRAP where inside at stencil == parentDepth.
+        if (cmd.op == DrawOp::PushClipPath || cmd.op == DrawOp::PopClipPath) {
+            // Geometry-abstracted clip stencil dispatch. One primitive in the
+            // clip pipeline's SSBO per push+pop pair — `firstInstance` is
+            // shared so INCR_WRAP and DECR_WRAP touch identical fragments.
             if (clipPipeline_ && pathPipeline_) {
-                auto& p = arena_.read<ClipShapeParams>(cmd.dataOffset);
-                ClipPipeline::PushConstants pc {};
-                pc.shapeType    = p.shapeType;
-                pc.centerX      = p.centerX;
-                pc.centerY      = p.centerY;
-                pc.halfW        = p.halfW;
-                pc.halfH        = p.halfH;
-                pc.cornerRadius = p.cornerRadius;
-                pc.segmentStart = p.segmentStart;
-                pc.segmentCount = p.segmentCount;
-                pc.fillRule     = p.fillRule;
-                clipPipeline_->pushClip(state_, frame.cmd, *this, cmd,
-                    pc, p.coverRect,
-                    pathPipeline_->ssboDescriptorSet(),
-                    static_cast<uint32_t>(cmd.stencilDepth),
-                    static_cast<float>(frame.extent.width),
-                    static_cast<float>(frame.extent.height));
+                auto& ref = arena_.read<ClipDispatchRef>(cmd.dataOffset);
+                auto& cb = cmd.clipBounds;
+                int x0 = std::max(0, cb.getX());
+                int y0 = std::max(0, cb.getY());
+                int x1 = std::max(x0, cb.getRight());
+                int y1 = std::max(y0, cb.getBottom());
+                VkRect2D scissor {
+                    { x0, y0 },
+                    { static_cast<uint32_t>(x1 - x0),
+                      static_cast<uint32_t>(y1 - y0) }
+                };
+                VkDescriptorSet pathDesc = pathPipeline_->ssboDescriptorSet();
+                if (cmd.op == DrawOp::PushClipPath) {
+                    clipPipeline_->pushClip(state_, frame.cmd, pathDesc,
+                        frame.extent, scissor,
+                        ref.firstInstance, ref.primCount,
+                        cmd.stencilDepth);
+                    state_.pushStencilDepth();
+                } else {
+                    clipPipeline_->popClip(state_, frame.cmd, pathDesc,
+                        frame.extent, scissor,
+                        ref.firstInstance, ref.primCount,
+                        cmd.stencilDepth);
+                    state_.popStencilDepth();
+                }
             }
-            state_.pushStencilDepth();
             continue;
         }
-        if (cmd.op == DrawOp::PopClipPath) {
-            // Analytical-SDF clip pop — DECR_WRAP at stencil == currentDepth
-            // (before the CPU decrement). cmd.stencilDepth here is the depth
-            // one level DEEPER than parent (i.e. the push's target depth),
-            // so stencil == that value is exactly what the INCR produced.
-            if (clipPipeline_ && pathPipeline_) {
-                auto& p = arena_.read<ClipShapeParams>(cmd.dataOffset);
-                ClipPipeline::PushConstants pc {};
-                pc.shapeType    = p.shapeType;
-                pc.centerX      = p.centerX;
-                pc.centerY      = p.centerY;
-                pc.halfW        = p.halfW;
-                pc.halfH        = p.halfH;
-                pc.cornerRadius = p.cornerRadius;
-                pc.segmentStart = p.segmentStart;
-                pc.segmentCount = p.segmentCount;
-                pc.fillRule     = p.fillRule;
-                clipPipeline_->popClip(state_, frame.cmd, *this, cmd,
-                    pc, p.coverRect,
-                    pathPipeline_->ssboDescriptorSet(),
-                    static_cast<uint32_t>(cmd.stencilDepth),
-                    static_cast<float>(frame.extent.width),
-                    static_cast<float>(frame.extent.height));
+        // Unified fill dispatch for every 2D non-effect op that FillPipeline
+        // absorbs: rect / rrect / ellipse / strokes / line / path / glyphs /
+        // image. Each branch resolves its per-op descriptor dependencies and
+        // calls FillPipeline::dispatch() with the primitive range. Stays
+        // inside the scene render pass (no RP transitions).
+        if (fillPipeline_ && pathPipeline_) {
+            auto scissorOf = [&](const DrawCommand& c) {
+                auto& cb = c.clipBounds;
+                int x0 = std::max(0, cb.getX());
+                int y0 = std::max(0, cb.getY());
+                int x1 = std::max(x0, cb.getRight());
+                int y1 = std::max(y0, cb.getBottom());
+                return VkRect2D { { x0, y0 },
+                                  { static_cast<uint32_t>(x1 - x0),
+                                    static_cast<uint32_t>(y1 - y0) } };
+            };
+
+            const VkDescriptorSet pathDesc = pathPipeline_->ssboDescriptorSet();
+            const VkDescriptorSet defaultDesc = caches().defaultDescriptor();
+
+            auto colorDescFor = [&](uint32_t fillIndex) -> VkDescriptorSet {
+                auto& fill = getFill(fillIndex);
+                return (fill.isGradient() && fill.gradient)
+                    ? caches().gradientDescriptor()
+                    : defaultDesc;
+            };
+
+            switch (cmd.op) {
+                case DrawOp::FillRect:
+                case DrawOp::FillRectList:
+                case DrawOp::FillRoundedRect:
+                case DrawOp::FillEllipse:
+                case DrawOp::StrokeRoundedRect:
+                case DrawOp::StrokeEllipse:
+                case DrawOp::DrawLine:
+                case DrawOp::FillPath: {
+                    auto& ref = arena_.read<FillDispatchRef>(cmd.dataOffset);
+                    fillPipeline_->dispatch(state_, frame.cmd,
+                        colorDescFor(ref.fillIndex),
+                        pathDesc,
+                        /*shapeTex*/ defaultDesc,
+                        frame.extent, scissorOf(cmd),
+                        ref.firstInstance, ref.primCount,
+                        cmd.stencilDepth);
+                    continue;
+                }
+                case DrawOp::DrawImage: {
+                    auto& ref = arena_.read<FillImageDispatchRef>(cmd.dataOffset);
+                    auto* tcache = caches().textures().find(ref.imageHash);
+                    VkDescriptorSet imgDesc = tcache ? tcache->descriptorSet : defaultDesc;
+                    fillPipeline_->dispatch(state_, frame.cmd,
+                        /*colorLUT*/ defaultDesc,  // image supplies RGB; LUT unused
+                        pathDesc,
+                        /*shapeTex*/ imgDesc,
+                        frame.extent, scissorOf(cmd),
+                        ref.firstInstance, ref.primCount,
+                        cmd.stencilDepth);
+                    continue;
+                }
+                case DrawOp::DrawGlyphs: {
+                    auto& ref = arena_.read<FillGlyphsDispatchRef>(cmd.dataOffset);
+                    // Per-glyph atlas page indices live immediately after the
+                    // ref in the arena (see Graphics::drawGlyphs).
+                    uint32_t pagesOffset = cmd.dataOffset
+                        + static_cast<uint32_t>(sizeof(FillGlyphsDispatchRef));
+                    auto pages = arena_.readSpan<uint32_t>(pagesOffset, ref.primCount);
+                    auto& atlas = fillPipeline_->atlas();
+
+                    VkDescriptorSet colorDesc = colorDescFor(ref.fillIndex);
+                    // One instance per glyph; batch contiguous same-page runs
+                    // into a single vkCmdDraw(6, N, 0, firstInstance+i). The
+                    // scheduler's future Fuse mode will merge further.
+                    uint32_t runStart = 0;
+                    while (runStart < ref.primCount) {
+                        uint32_t runEnd = runStart + 1;
+                        uint32_t page = pages[runStart];
+                        while (runEnd < ref.primCount && pages[runEnd] == page)
+                            runEnd++;
+                        VkDescriptorSet glyphDesc = atlas.getDescriptorSet(page);
+                        if (glyphDesc == VK_NULL_HANDLE) glyphDesc = defaultDesc;
+                        fillPipeline_->dispatch(state_, frame.cmd,
+                            colorDesc, pathDesc, glyphDesc,
+                            frame.extent, scissorOf(cmd),
+                            ref.firstInstance + runStart,
+                            runEnd - runStart,
+                            cmd.stencilDepth);
+                        runStart = runEnd;
+                    }
+                    continue;
+                }
+                default: break;
             }
-            state_.popStencilDepth();
-            continue;
-        }
-        if (cmd.op == DrawOp::FillPath) {
-            // Analytical SDF path fill — dispatched via PathPipeline which
-            // owns the segment storage buffer + the SDF fragment shader.
-            // Stays inside the scene render pass (no RP transitions).
-            if (pathPipeline_) {
-                auto& p    = arena_.read<FillPathParams>(cmd.dataOffset);
-                auto& fill = getFill(p.fillIndex);
-                // Colour source descriptor — matches the ColorPipeline pattern
-                // (gradient atlas row for gradient fills, 1x1 default for
-                // solids). path_sdf.frag samples it iff gradientInfo.z > 0.
-                VkDescriptorSet colorDesc =
-                    (fill.isGradient() && fill.gradient)
-                        ? caches().gradientDescriptor()
-                        : caches().defaultDescriptor();
-                pathPipeline_->dispatch(state_, frame.cmd, *this, cmd,
-                    p.quadVerts, 6,
-                    p.segmentStart, p.segmentCount, p.fillRule,
-                    colorDesc,
-                    static_cast<float>(frame.extent.width),
-                    static_cast<float>(frame.extent.height));
-            }
-            continue;
         }
         if (cmd.op == DrawOp::DrawShader) {
             // DrawShader is a regular scene draw — no render-pass transition.
@@ -463,68 +677,56 @@ void Renderer::execute()
         if (cmd.op == DrawOp::EffectHSV) {
             // Non-separable HSV — single pass + single swap. Pre-copy if
             // clipped so outside-clip pixels carry source; effect writes
-            // inside-clip.
-            vkCmdEndRenderPass(frame.cmd);
+            // inside-clip. Scene RP ended by the lazy manager above.
             if (hsvPipeline_) {
                 auto& hp = arena_.read<HSVParams>(cmd.dataOffset);
                 HSVPipeline::PushConstants pc {};
                 pc.scaleH = hp.scaleH; pc.scaleS = hp.scaleS; pc.scaleV = hp.scaleV;
                 pc.deltaH = hp.deltaH; pc.deltaS = hp.deltaS; pc.deltaV = hp.deltaV;
-                preCopyIfClipped(cmd.stencilDepth);
                 effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
                     hsvPipeline_->applyPass(frame.cmd, src, dst,
                         target_.effectRenderPass(), frame.extent, pc,
                         static_cast<uint32_t>(cmd.stencilDepth));
                 });
             }
-            beginSceneRP(scenePassLoad, /*withClears=*/false);
             continue;
         }
-        if (cmd.op == DrawOp::BlurShape) {
-            vkCmdEndRenderPass(frame.cmd);
-
-            if (shapeBlur_) {
-                auto& sp = arena_.read<BlurShapeParams>(cmd.dataOffset);
-
-                ShapeBlurPipeline::PushConstants pc {};
-                pc.invCol0X = sp.invXform[0]; pc.invCol0Y = sp.invXform[1];
-                pc.invCol1X = sp.invXform[2]; pc.invCol1Y = sp.invXform[3];
-                pc.invCol2X = sp.invXform[4]; pc.invCol2Y = sp.invXform[5];
-                pc.shapeHalfX = sp.shapeHalf[0];
-                pc.shapeHalfY = sp.shapeHalf[1];
-                pc.lineBX     = sp.lineB[0];
-                pc.lineBY     = sp.lineB[1];
-                pc.maxRadius     = sp.maxRadius;
-                pc.falloff       = sp.falloff;
-                pc.blurStep      = sp.blurStep;
-                pc.cornerRadius  = sp.cornerRadius;
-                pc.lineThickness = sp.lineThickness;
-                pc.shapeType     = static_cast<int>(sp.shapeType);
-                pc.edgePlacement = static_cast<int>(sp.edgePlacement);
-                pc.inverted      = static_cast<int>(sp.inverted);
+        if (cmd.op == DrawOp::BlurShape || cmd.op == DrawOp::BlurPath) {
+            // Unified blur dispatch via BlurPipeline — takes a range of
+            // GeometryPrimitives (currently 1 per command; Phase-C fusion
+            // will pack multiple compatible primitives into one range).
+            // Scene RP ended by the lazy manager; runs of consecutive blurs
+            // share the one end/begin pair around the whole run.
+            if (blurPipeline_ && pathPipeline_) {
+                // Arena payload: BlurCommandRef = (firstInstance, count, mode).
+                // We pack it via BlurDispatch (see below). For single-primitive
+                // dispatch the count is always 1 and firstInstance is the
+                // SSBO offset returned by uploadPrimitives at record time.
+                auto& ref = arena_.read<BlurDispatchRef>(cmd.dataOffset);
 
                 VkRect2D scissor { {0, 0}, frame.extent };
                 VkRenderPass rp = target_.effectRenderPass();
-                // mode: 0 (Low)    → 2 separable passes (H, V). Cheap, but
-                //                    chained variable-radius passes produce
-                //                    streaks along whichever direction holds
-                //                    a larger effective radius.
-                //       1 (Medium) → 1 pass, 32-tap Poisson-disc blue-noise
-                //                    kernel. Constant cost regardless of
-                //                    radius. No streaks — anisotropic noise
-                //                    reads as stochastic texture, not a
-                //                    directional smear.
-                //       2 (High)   → 1 pass, true 2D Gaussian using the 2D
-                //                    Linear Sampling Trick (¼ the taps of a
-                //                    naïve N² loop, mathematically exact).
-                //                    No streaks.
-                //
-                // Medium + High both read the scene source directly; only
-                // one tile-resolve. For small-N blurs this can beat Low.
-                const int32_t kt = (sp.mode == 0) ? 0
-                                 : (sp.mode == 1) ? 1 : 2;
-                const uint32_t passCount = (sp.mode == 0) ? 2u : 1u;
-                pc.kernelType = kt;
+
+                // mode: 0 (Low)    → 2 separable passes (H, V). Cheap but
+                //                    visible directional streaks at band
+                //                    boundaries on chained variable-radius.
+                //       1 (Medium) → 1 pass, 2D Vogel / phi-spiral disc.
+                //                    Radius-scaled tap count (~4·radius).
+                //                    No streaks; faint blue-noise grain.
+                //       2 (High)   → 1 pass, true 2D Gaussian with 2D LST.
+                //                    Mathematically exact separable
+                //                    output; ¼ the taps of naïve N² loop.
+                const int32_t  kt        = (ref.mode == 0) ? 0
+                                         : (ref.mode == 1) ? 1 : 2;
+                const uint32_t passCount = (ref.mode == 0) ? 2u : 1u;
+
+                // PathPipeline::ssboDescriptorSet() returns the descriptor
+                // for the CURRENT frame slot (set by the most recent
+                // flushToGPU in execute's prologue). BlurPipeline binds it
+                // at set 2; the path-geometry branch (tag=5) reads segments
+                // from this set, the shape branches ignore it.
+                VkDescriptorSet pathDesc = pathPipeline_->ssboDescriptorSet();
+
                 for (uint32_t passIx = 0; passIx < passCount; passIx++) {
                     float dx, dy;
                     if (kt != 0) {
@@ -535,75 +737,30 @@ void Renderer::execute()
                         dx = (passIx == 0) ? 1.0f : 0.0f;
                         dy = (passIx == 0) ? 0.0f : 1.0f;
                     }
-                    preCopyIfClipped(cmd.stencilDepth);
                     effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        shapeBlur_->applyPass(frame.cmd, src, dst, rp,
-                            frame.extent, scissor, dx, dy, pc,
+                        blurPipeline_->applyPass(frame.cmd, src, pathDesc,
+                            dst, rp, frame.extent, scissor,
+                            ref.firstInstance, ref.primCount,
+                            kt, dx, dy,
                             static_cast<uint32_t>(cmd.stencilDepth));
                     });
                 }
             }
-            beginSceneRP(scenePassLoad, /*withClears=*/false);
-            continue;
-        }
-        if (cmd.op == DrawOp::BlurPath) {
-            vkCmdEndRenderPass(frame.cmd);
-
-            if (pathBlur_ && pathPipeline_) {
-                auto& bp = arena_.read<BlurPathParams>(cmd.dataOffset);
-
-                PathBlurPipeline::PushConstants pc {};
-                pc.maxRadius       = bp.maxRadius;
-                pc.falloff         = bp.falloff;
-                pc.strokeHalfWidth = bp.strokeHalfWidth;
-                pc.segmentStart    = bp.segmentStart;
-                pc.segmentCount    = bp.segmentCount;
-                pc.fillRule        = bp.fillRule;
-                pc.edgePlacement   = static_cast<int32_t>(bp.edgePlacement);
-                pc.inverted        = static_cast<int32_t>(bp.inverted);
-
-                // PathPipeline::ssboDescriptorSet() returns the descriptor
-                // for the CURRENT frame slot (set by the most recent
-                // flushToGPU in execute's prologue). That's the slot whose
-                // SSBO holds this frame's segments — including those we
-                // uploaded in Graphics::{draw,fill}BlurredPath.
-                VkDescriptorSet pathDesc = pathPipeline_->ssboDescriptorSet();
-
-                VkRect2D scissor { {0, 0}, frame.extent };
-                VkRenderPass rp = target_.effectRenderPass();
-                // Same mode layout as BlurShape above — see that comment.
-                const int32_t kt = (bp.mode == 0) ? 0
-                                 : (bp.mode == 1) ? 1 : 2;
-                const uint32_t passCount = (bp.mode == 0) ? 2u : 1u;
-                pc.kernelType = kt;
-                for (uint32_t passIx = 0; passIx < passCount; passIx++) {
-                    float dx, dy;
-                    if (kt != 0) {
-                        dx = 1.0f; dy = 0.0f;
-                    } else {
-                        dx = (passIx == 0) ? 1.0f : 0.0f;
-                        dy = (passIx == 0) ? 0.0f : 1.0f;
-                    }
-                    preCopyIfClipped(cmd.stencilDepth);
-                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        pathBlur_->applyPass(frame.cmd, src, pathDesc, dst, rp,
-                            frame.extent, scissor, dx, dy, pc,
-                            static_cast<uint32_t>(cmd.stencilDepth));
-                    });
-                }
-            }
-            beginSceneRP(scenePassLoad, /*withClears=*/false);
             continue;
         }
         auto* pipeline = pipelineForOp_[static_cast<size_t>(cmd.op)];
         if (!pipeline) continue;
         if (!pipeline->isBuilt())
             pipeline->build(sceneBuildRP);
-        state_.setPipeline(pipeline);
+        state_.setPipeline(pipeline, cmd.stencilDepth);
         pipeline->execute(*this, arena_, cmd);
     }
 
-    vkCmdEndRenderPass(frame.cmd);
+    // Only close the scene pass if the last op left it open. If the stream
+    // ended on an effect op (blur, HSV, etc.), the scene pass is already
+    // closed and the output is already in the correct ping-pong half.
+    if (sceneOpen)
+        vkCmdEndRenderPass(frame.cmd);
 
     // After the command stream, `cur` is the index of whichever ping-pong
     // half holds the final composited frame. An odd number of single-pass
@@ -721,15 +878,18 @@ void State::invalidate()
     boundVertexBuffer_ = VK_NULL_HANDLE;
 }
 
-void State::setPipeline(Pipeline* pipeline)
+void State::setPipeline(Pipeline* pipeline, uint8_t stencilDepth)
 {
     if (!pipeline) return;
 
     // Clip variant of the pipeline has stencilTest on (cmp = EQUAL, ops =
     // KEEP), reference pushed dynamically below. Non-clip variant has no
-    // stencil test at all — used whenever stencilDepth_ == 0.
-    VkPipeline handle = (stencilDepth_ > 0) ? pipeline->clipHandle()
-                                            : pipeline->handle();
+    // stencil test at all — used whenever cmd stencilDepth == 0. Using the
+    // per-command value (not State::stencilDepth_) is what lets the scheduler
+    // reorder commands across PushClipPath boundaries: each cmd dispatches
+    // with its own clip state captured at record time.
+    VkPipeline handle = (stencilDepth > 0) ? pipeline->clipHandle()
+                                           : pipeline->handle();
 
     if (handle != boundPipeline_) {
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, handle);
@@ -747,25 +907,24 @@ void State::setPipeline(Pipeline* pipeline)
         vkCmdPushConstants(cmd_, boundLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vpSize), vpSize);
     }
 
-    // Stencil reference = clip depth. Every draw op passes only where
-    // stencil == depth (i.e. inside all active clips).
-    if (stencilDepth_ > 0 && stencilDepth_ != boundStencilRef_) {
-        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, stencilDepth_);
-        boundStencilRef_ = stencilDepth_;
+    if (stencilDepth > 0 && stencilDepth != boundStencilRef_) {
+        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, stencilDepth);
+        boundStencilRef_ = stencilDepth;
     }
 
     currentPipeline_ = pipeline;
 }
 
-void State::setCustomPipeline(VkPipeline pipeline, VkPipelineLayout layout)
+void State::setCustomPipeline(VkPipeline pipeline, VkPipelineLayout layout,
+                              uint8_t stencilDepth)
 {
     if (pipeline != boundPipeline_) {
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         boundPipeline_ = pipeline;
         boundLayout_ = layout;
     }
-    if (stencilDepth_ > 0)
-        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, stencilDepth_);
+    if (stencilDepth > 0)
+        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, stencilDepth);
 
     currentPipeline_ = nullptr; // force rebind on next setPipeline
 }
@@ -804,10 +963,12 @@ void State::draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count)
 {
     if (count == 0) return;
 
-    // Set scissor from command clip bounds
+    // cmd.clipBounds is authoritative: it was captured at record time as the
+    // fully-intersected clip stack, so it's correct for this command regardless
+    // of surrounding clip push/pop ordering. We no longer AND against
+    // State::currentClipBounds_, because under reordering that counter may not
+    // reflect the clip state that was active when this command was recorded.
     juce::Rectangle<int> clip = cmd.clipBounds;
-    if (!currentClipBounds_.isEmpty())
-        clip = clip.getIntersection(currentClipBounds_);
 
     if (clip != boundScissor_) {
         // Clamp each edge to the framebuffer before computing the extent,

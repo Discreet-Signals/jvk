@@ -56,8 +56,16 @@ public:
             static_cast<int>(transformed.getWidth() * displayScale_),
             static_cast<int>(transformed.getHeight() * displayScale_));
         s.clipBounds = s.clipBounds.getIntersection(pixel);
+        // Open a new scheduler scope whose bounds match the new scissor. All
+        // commands pushed until the matching popScope() inherit this scopeId.
+        renderer_.pushScope(s.clipBounds);
         renderer_.push(DrawOp::PushClipRect, s.zOrder, s.clipBounds,
-                       s.stencilDepth, s.scopeDepth, PushClipRectParams { transformed });
+                               s.stencilDepth, s.scopeDepth,
+                               PushClipRectParams { transformed },
+                               /*writesPx*/ s.clipBounds,
+                               /*readsPx*/  s.clipBounds,
+                               /*stateKey*/ state_key::make(DrawOp::PushClipRect),
+                               /*isOpaque*/ false);
         s.scopeDepth++;
         return !s.clipBounds.isEmpty();
     }
@@ -134,14 +142,15 @@ public:
             return;
         }
 
-        // Non-rectangular path — use the analytical-SDF clip stencil pipeline.
-        // Flatten the path to line segments, upload to the shared segment
-        // SSBO (same ring PathPipeline owns), emit a PushClipPath op. The
-        // GPU then rasterises the cover quad at replay; surviving fragments
-        // INCR the stencil, and subsequent draws pass only where stencil
-        // == current depth.
+        // Non-rectangular path — use the geometry-abstracted clip-stencil
+        // pipeline. Flatten to segments, upload into the shared path-segment
+        // SSBO, emit a GeometryPrimitive (tag=Path), upload to ClipPipeline's
+        // primitive SSBO, and push DrawOp::PushClipPath. Fragments inside
+        // the path's winding test INCR the stencil; matching pop DECRs with
+        // the SAME primitive range.
         auto* pp = renderer_.pathPipeline();
-        if (!pp) return; // no path pipeline wired — clip is a no-op
+        auto* cp = renderer_.clipPipeline();
+        if (!pp || !cp) return;
 
         auto& s = state();
         auto pathBounds = path.getBounds();
@@ -153,13 +162,12 @@ public:
         flattenPathToSegments(path, combined, scratchSegments_);
         if (scratchSegments_.empty()) return;
 
-        uint32_t segStart = pp->uploadSegments(
+        const uint32_t segStart = pp->uploadSegments(
             scratchSegments_.data(),
             static_cast<uint32_t>(scratchSegments_.size()));
+        const uint32_t segCount = static_cast<uint32_t>(scratchSegments_.size());
+        const uint32_t fillRule = path.isUsingNonZeroWinding() ? 0u : 1u;
 
-        // Cover rect in physical pixels, expanded by 1 pixel so the clip
-        // fragment shader runs for every pixel the path's SDF could mark
-        // as inside.
         auto px = pathBounds.transformedBy(combined).expanded(1.0f);
         int bx  = static_cast<int>(std::floor(px.getX()));
         int by  = static_cast<int>(std::floor(px.getY()));
@@ -171,24 +179,42 @@ public:
                                            static_cast<float>(bx2 - bx),
                                            static_cast<float>(by2 - by) };
 
-        // Intersect clipBounds BEFORE incrementing stencilDepth — the push
-        // op runs at the current (parent) depth; the pop in restoreState
-        // will run against the new depth.
         auto outerBounds = s.clipBounds.getIntersection(pathBoundsPx);
 
-        ClipShapeParams params {};
-        params.shapeType    = 2u; // path
-        params.segmentStart = segStart;
-        params.segmentCount = static_cast<uint32_t>(scratchSegments_.size());
-        params.fillRule     = path.isUsingNonZeroWinding() ? 0u : 1u;
-        params.coverRect    = coverRect;
+        // Build the clip primitive. Segments are in physical pixels (baked
+        // through `combined`), so invXform is identity — shader walks
+        // segments in the same coord space as fragCoord.
+        GeometryPrimitive prim {};
+        fillBbox(prim, pathBoundsPx);
+        prim.invXform01[0] = 1.0f; prim.invXform01[1] = 0.0f;
+        prim.invXform01[2] = 0.0f; prim.invXform01[3] = 1.0f;
+        prim.flags[0] = static_cast<uint32_t>(GeometryTag::Path);
+        prim.flags[1] = packShapeFlags(false, BlurEdge::Centered, fillRule,
+                                       /*stroke*/ false, ColorSource::Solid);
+        prim.flags[2] = segStart;
+        prim.flags[3] = segCount;
 
-        // Remember for the matching pop — same segment range + cover rect
-        // so DECR cancels INCR exactly.
-        s.pathClipStack.push_back(params);
+        const uint32_t arenaOffset = renderer_.arena_push(prim);
+        // Push + matching Pop share this ref via pathClipStack. The upload
+        // pass uploads the primitive ONCE for the push command and ONCE
+        // for the pop command (since both carry the same arenaOffset in
+        // their ref copies); each gets its own firstInstance pointing at
+        // the same primitive data in the SSBO. INCR_WRAP and DECR_WRAP
+        // therefore touch identical fragments.
+        ClipDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u,
+                              arenaOffset, /*_pad*/ 0u, coverRect };
 
+        // Remember for the matching pop — same primitive range so DECR
+        // cancels INCR exactly.
+        s.pathClipStack.push_back(ref);
+
+        renderer_.pushScope(outerBounds);
         renderer_.push(DrawOp::PushClipPath, s.zOrder, outerBounds,
-                       s.stencilDepth, s.scopeDepth, params);
+                               s.stencilDepth, s.scopeDepth, ref,
+                               /*writesPx*/ outerBounds,
+                               /*readsPx*/  outerBounds,
+                               /*stateKey*/ state_key::make(DrawOp::PushClipPath),
+                               /*isOpaque*/ false);
 
         s.clipBounds = outerBounds;
         s.stencilDepth++;
@@ -237,7 +263,13 @@ public:
                 // replay. Payload is empty; op type conveys the kind.
                 struct Empty {};
                 renderer_.push(DrawOp::PopClipRect, old.zOrder, old.clipBounds,
-                               old.stencilDepth, old.scopeDepth, Empty {});
+                                       old.stencilDepth, old.scopeDepth, Empty {},
+                                       /*writesPx*/ old.clipBounds,
+                                       /*readsPx*/  old.clipBounds,
+                                       /*stateKey*/ state_key::make(DrawOp::PopClipRect),
+                                       /*isOpaque*/ false);
+                // Close the scheduler scope opened by the matching clipToRectangle.
+                renderer_.popScope();
                 old.scopeDepth--;
             }
         }
@@ -256,13 +288,33 @@ public:
     void fillRect(const juce::Rectangle<float>& r) override
     {
         if (isClipEmpty()) return;
-        auto& s = state();
-        auto fi = renderer_.captureFill(s.fill);
-        // Stage gradient LUT upload if this is a gradient fill
-        if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::FillRect, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            FillRectParams { r, fi, s.transform, s.opacity, displayScale_ });
+        auto* fp = renderer_.fillPipeline();
+        if (!fp) return;
+        auto& s  = state();
+        auto  fi = renderer_.captureFill(s.fill);
+        auto writes = toWritesPx(r);
+
+        GeometryPrimitive p {};
+        fillBbox(p, writes);
+        auto anchor    = r.getCentre();
+        auto shapeHalf = juce::Point<float>(r.getWidth() * 0.5f, r.getHeight() * 0.5f);
+        fillInverseTransform(p, anchor, shapeHalf);
+
+        auto toPhys = s.transform.scaled(displayScale_);
+        auto cs = fillColorFields(s.fill, toPhys, s.opacity, p);
+
+        p.flags[0] = static_cast<uint32_t>(GeometryTag::Rect);
+        p.flags[1] = packShapeFlags(false, BlurEdge::Centered, 0u, /*stroke*/ false, cs);
+
+        const uint32_t arenaOffset = renderer_.arena_push(p);
+        FillDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u, arenaOffset, fi };
+
+        renderer_.push(DrawOp::FillRect, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth, ref,
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,
+            /*stateKey*/ state_key::make(DrawOp::FillRect, 0, static_cast<uint16_t>(fi)),
+            /*isOpaque*/ currentFillIsOpaque());
     }
 
     void fillRectList(const juce::RectangleList<float>& list) override
@@ -284,9 +336,9 @@ public:
     void fillPath(const juce::Path& path, const juce::AffineTransform& t) override
     {
         if (isClipEmpty() || path.isEmpty()) return;
-
         auto* pp = renderer_.pathPipeline();
-        if (!pp) return;
+        auto* fp = renderer_.fillPipeline();
+        if (!pp || !fp) return;
 
         auto& s = state();
         auto pathBounds = path.getBounds();
@@ -298,12 +350,14 @@ public:
         flattenPathToSegments(path, combined, scratchSegments_);
         if (scratchSegments_.empty()) return;
 
-        uint32_t segStart = pp->uploadSegments(
+        const uint32_t segStart = pp->uploadSegments(
             scratchSegments_.data(),
             static_cast<uint32_t>(scratchSegments_.size()));
+        const uint32_t segCount = static_cast<uint32_t>(scratchSegments_.size());
+        const uint32_t fillRule = path.isUsingNonZeroWinding() ? 0u : 1u;
+        const uint32_t fi       = renderer_.captureFill(s.fill);
 
-        // Path bounds in physical pixels, expanded by 1 pixel for the AA
-        // ramp that smoothstep() kernels around the SDF zero-crossing.
+        // Path bounds in physical pixels + 1px AA margin for the edge kernel.
         auto pxBounds = pathBounds.transformedBy(combined).expanded(1.0f);
         int bx  = static_cast<int>(std::floor(pxBounds.getX()));
         int by  = static_cast<int>(std::floor(pxBounds.getY()));
@@ -313,62 +367,76 @@ public:
         auto clipRect = s.clipBounds.getIntersection(quadPxRect);
         if (clipRect.isEmpty()) return;
 
-        // Register the gradient row up-front so the atlas upload happens in
-        // this frame's staging pass. makeGradientCtx below also registers
-        // idempotently — we mirror the fillRect convention here anyway.
-        if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
+        // Path SDF lives in PHYSICAL pixels (segments already baked through
+        // `combined`), so invXform is identity — the shader's fragCoord and
+        // segment coords share the same space. Gradient coefs live in extraB
+        // as usual.
+        GeometryPrimitive p {};
+        fillBbox(p, clipRect);
+        p.invXform01[0] = 1.0f; p.invXform01[1] = 0.0f;
+        p.invXform01[2] = 0.0f; p.invXform01[3] = 1.0f;
+        auto cs = fillColorFields(s.fill, combined, s.opacity, p);
+        p.flags[0] = static_cast<uint32_t>(GeometryTag::Path);
+        p.flags[1] = packShapeFlags(false, BlurEdge::Centered, fillRule, /*stroke*/ false, cs);
+        p.flags[2] = segStart;
+        p.flags[3] = segCount;
 
-        // Build the per-vertex colour source the same way ColorDraw's
-        // primitive ops do: solid colour folded into the vertex attribute,
-        // or gradient mode/row packed into gradientInfo via gradientAt().
-        pipelines::GradientCtx grad = pipelines::makeGradientCtx(renderer_, s.fill, combined);
-        glm::vec4 color = pipelines::fillColorAttr(grad, s.fill.colour, s.opacity);
-
-        auto gi = [&](float px, float py) -> glm::vec4 {
-            return grad.active() ? pipelines::gradientAt(grad, px, py)
-                                 : glm::vec4(0.0f);
-        };
-
-        auto mkv = [&](float x, float y) {
-            return UIVertex {
-                glm::vec2 { x, y },
-                color,
-                glm::vec2 { 0.0f, 0.0f },          // uv unused by path_sdf
-                glm::vec4 { 0.0f, 0.0f, 0.0f, 0.0f }, // shapeInfo unused
-                gi(x, y)
-            };
-        };
-        float fbx  = static_cast<float>(bx),  fby  = static_cast<float>(by);
-        float fbx2 = static_cast<float>(bx2), fby2 = static_cast<float>(by2);
-
-        FillPathParams p {};
-        p.quadVerts[0] = mkv(fbx,  fby);
-        p.quadVerts[1] = mkv(fbx2, fby);
-        p.quadVerts[2] = mkv(fbx2, fby2);
-        p.quadVerts[3] = mkv(fbx,  fby);
-        p.quadVerts[4] = mkv(fbx2, fby2);
-        p.quadVerts[5] = mkv(fbx,  fby2);
-        p.segmentStart = segStart;
-        p.segmentCount = static_cast<uint32_t>(scratchSegments_.size());
-        p.fillRule     = path.isUsingNonZeroWinding() ? 0u : 1u;
-        p.fillIndex    = renderer_.captureFill(s.fill);
+        const uint32_t arenaOffset = renderer_.arena_push(p);
+        FillDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u, arenaOffset, fi };
 
         renderer_.push(DrawOp::FillPath, s.zOrder, clipRect,
-                       s.stencilDepth, s.scopeDepth, p);
+            s.stencilDepth, s.scopeDepth, ref,
+            /*writesPx*/ clipRect,
+            /*readsPx*/  clipRect,
+            /*stateKey*/ state_key::make(DrawOp::FillPath,
+                                         /*pipelineHint*/ fillRule,
+                                         static_cast<uint16_t>(fi)),
+            /*isOpaque*/ false);   // SDF fills have AA edges → never opaque
     }
 
     void drawImage(const juce::Image& img, const juce::AffineTransform& t) override
     {
         if (isClipEmpty() || !img.isValid()) return;
+        auto* fp = renderer_.fillPipeline();
+        if (!fp) return;
         auto& s = state();
         uint64_t hash = ResourceCaches::hashImage(img);
-
         renderer_.caches().getTexture(hash, img);
 
-        renderer_.push(DrawOp::DrawImage, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            DrawImageParams { hash, t.followedBy(s.transform), s.opacity, displayScale_,
-                              img.getWidth(), img.getHeight() });
+        juce::Rectangle<float> imgRectLogical {
+            0.0f, 0.0f,
+            static_cast<float>(img.getWidth()),
+            static_cast<float>(img.getHeight())
+        };
+        auto imgRectTransformed = imgRectLogical.transformedBy(t);
+        auto writes = toWritesPx(imgRectTransformed);
+
+        // Image quad lives in its own local frame (w × h logical). The vertex
+        // shader expands bbox → physical corners; the fragment shader samples
+        // the bound image via atlasUV = mix((0,0),(1,1), vQuadUV). So we just
+        // stash the UV rect (0..1) in extraB. invXform is identity-ish since
+        // tag=6 doesn't evaluate an SDF.
+        GeometryPrimitive p {};
+        fillBbox(p, writes);
+        p.invXform01[0] = 1.0f; p.invXform01[1] = 0.0f;
+        p.invXform01[2] = 0.0f; p.invXform01[3] = 1.0f;
+        p.flags[0] = static_cast<uint32_t>(GeometryTag::Image);
+        p.flags[1] = packShapeFlags(false, BlurEdge::Centered, 0u, false, ColorSource::Solid);
+        p.extraB[0] = 0.0f; p.extraB[1] = 0.0f;
+        p.extraB[2] = 1.0f; p.extraB[3] = 1.0f;          // atlas UV = full image
+        p.color[0]  = 1.0f; p.color[1]  = 1.0f;
+        p.color[2]  = 1.0f; p.color[3]  = s.opacity;     // sampler supplies RGB
+
+        const uint32_t arenaOffset = renderer_.arena_push(p);
+        FillImageDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u,
+                                    arenaOffset, /*_pad*/ 0u, hash };
+
+        renderer_.push(DrawOp::DrawImage, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth, ref,
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,
+            /*stateKey*/ state_key::make(DrawOp::DrawImage, 0, state_key::truncHash(hash)),
+            /*isOpaque*/ false);   // can't cheaply know the image is opaque
     }
 
     void drawLine(const juce::Line<float>& line) override
@@ -379,12 +447,50 @@ public:
     void drawLineWithThickness(const juce::Line<float>& line, float lineThickness) override
     {
         if (isClipEmpty()) return;
-        auto& s = state();
-        auto fi = renderer_.captureFill(s.fill);
-        if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::DrawLine, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            DrawLineParams { line, lineThickness, fi, s.transform, s.opacity, displayScale_ });
+        auto* fp = renderer_.fillPipeline();
+        if (!fp) return;
+        auto& s  = state();
+        auto  fi = renderer_.captureFill(s.fill);
+
+        // Capsule SDF: A at shape-local origin, B at a 2D offset, radius =
+        // half-thickness. All in logical units — shader's invXform maps
+        // physical → shape-local.
+        auto a = line.getStart();
+        auto b = line.getEnd();
+        auto bRel = juce::Point<float>(b.x - a.x, b.y - a.y);
+        float radius = lineThickness * 0.5f;
+
+        juce::Rectangle<float> lineBox {
+            juce::jmin(a.x, b.x) - radius,
+            juce::jmin(a.y, b.y) - radius,
+            std::abs(b.x - a.x) + radius * 2.0f,
+            std::abs(b.y - a.y) + radius * 2.0f
+        };
+        auto writes = toWritesPx(lineBox, /*expand physical*/ 1.0f);
+
+        GeometryPrimitive p {};
+        fillBbox(p, writes);
+        fillInverseTransform(p, a, juce::Point<float>(0, 0));
+
+        auto toPhys = s.transform.scaled(displayScale_);
+        auto cs = fillColorFields(s.fill, toPhys, s.opacity, p);
+
+        p.flags[0] = static_cast<uint32_t>(GeometryTag::Capsule);
+        p.flags[1] = packShapeFlags(false, BlurEdge::Centered, 0u, false, cs);
+        p.extraA[0] = 0.0f;
+        p.extraA[1] = radius;
+        p.extraA[2] = bRel.x;
+        p.extraA[3] = bRel.y;
+
+        const uint32_t arenaOffset = renderer_.arena_push(p);
+        FillDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u, arenaOffset, fi };
+
+        renderer_.push(DrawOp::DrawLine, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth, ref,
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,
+            /*stateKey*/ state_key::make(DrawOp::DrawLine, 0, static_cast<uint16_t>(fi)),
+            /*isOpaque*/ false);
     }
 
     void setFont(const juce::Font& f) override { state().font = f; }
@@ -395,59 +501,240 @@ public:
                     const juce::AffineTransform& t) override
     {
         if (isClipEmpty() || glyphs.empty()) return;
-        auto& s = state();
-        if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
-        DrawGlyphsParams params;
-        params.glyphCount = static_cast<uint32_t>(glyphs.size());
-        params.transform = t.followedBy(s.transform);
-        params.fontIndex = renderer_.captureFont(s.font);
-        params.fillIndex = renderer_.captureFill(s.fill);
-        params.opacity = s.opacity;
-        params.scale = displayScale_;
-        renderer_.push(DrawOp::DrawGlyphs, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth, params);
-        // Append glyph POD data to arena (align before float data)
-        renderer_.arena_pushSpan(std::span<const uint16_t>(glyphs.data(), glyphs.size()));
-        renderer_.arena_align(4); // Point<float> requires 4-byte alignment
-        renderer_.arena_pushSpan(std::span<const juce::Point<float>>(positions.data(), positions.size()));
+        auto* fp = renderer_.fillPipeline();
+        if (!fp) return;
+
+        auto& s  = state();
+        auto  fi = renderer_.captureFill(s.fill);
+
+        // Resolve glyph atlas entries HERE (paint thread) so each glyph's
+        // MSDF rasterisation + page index is known at record time. Worker's
+        // FillPipeline::prepareFrame() then stages the dirty atlas pages to
+        // GPU before dispatch samples them.
+        auto& atlas = fp->atlas();
+        auto  tx    = t.followedBy(s.transform).scaled(displayScale_);
+        float physFontH = s.font.getHeight() * tx.getScaleFactor();
+        float hScale    = s.font.getHorizontalScale();
+        constexpr int PAD = GlyphAtlas::GLYPH_PADDING;
+
+        auto toPhys = s.transform.scaled(displayScale_);
+        // Build one GeometryPrimitive per glyph; collect atlas page indices
+        // for the dispatcher's per-glyph shape-sampler rebind.
+        scratchGlyphPrims_.clear();
+        scratchGlyphPages_.clear();
+        scratchGlyphPrims_.reserve(glyphs.size());
+        scratchGlyphPages_.reserve(glyphs.size());
+
+        juce::Rectangle<int> unionWrites {};
+
+        auto* typeface = s.font.getTypefacePtr().get();
+        for (size_t i = 0; i < glyphs.size(); i++) {
+            GlyphAtlas::GlyphKey key { typeface, glyphs[i] };
+            auto* entry = atlas.getGlyph(key, s.font);
+            if (!entry) continue;
+            auto glyphPos = positions[i].transformedBy(tx);
+
+            float innerW = entry->boundsW * physFontH * hScale;
+            float innerH = entry->boundsH * physFontH;
+            int   innerTexW = entry->w - PAD * 2;
+            int   innerTexH = entry->h - PAD * 2;
+            float gw = static_cast<float>(entry->w) * innerW / static_cast<float>(innerTexW);
+            float gh = static_cast<float>(entry->h) * innerH / static_cast<float>(innerTexH);
+            float padScreenX = PAD * (innerW / static_cast<float>(innerTexW));
+            float padScreenY = PAD * (innerH / static_cast<float>(innerTexH));
+            float gx = glyphPos.x + entry->boundsX * physFontH * hScale - padScreenX;
+            float gy = glyphPos.y + entry->boundsY * physFontH - padScreenY;
+            float screenPxRange = std::max(1.0f,
+                static_cast<float>(GlyphAtlas::MSDF_PIXEL_RANGE) * (gw / static_cast<float>(entry->w)));
+
+            juce::Rectangle<int> glyphPx {
+                static_cast<int>(std::floor(gx)),
+                static_cast<int>(std::floor(gy)),
+                static_cast<int>(std::ceil(gx + gw) - std::floor(gx)),
+                static_cast<int>(std::ceil(gy + gh) - std::floor(gy))
+            };
+            glyphPx = s.clipBounds.getIntersection(glyphPx);
+            if (glyphPx.isEmpty()) continue;
+
+            GeometryPrimitive p {};
+            fillBbox(p, glyphPx);
+            // Glyph quad has no shape-local SDF — tag=4 reads the MSDF atlas
+            // via vQuadUV, not invXform. Set identity for determinism.
+            p.invXform01[0] = 1.0f; p.invXform01[1] = 0.0f;
+            p.invXform01[2] = 0.0f; p.invXform01[3] = 1.0f;
+
+            // Gradient coefficients for MSDF live in extraA (extraB carries
+            // atlas UV). Write colour fields into p via the solid branch,
+            // then if it was a gradient overwrite extraA with gradient coefs
+            // and move the result out of extraB.
+            auto cs = fillColorFields(s.fill, toPhys, s.opacity, p);
+            if (cs != ColorSource::Solid) {
+                // Gradient coefs went into extraB; relocate to extraA for MSDF
+                // tag (where extraB is atlas UV).
+                for (int j = 0; j < 4; j++) {
+                    p.extraA[j] = p.extraB[j];
+                    p.extraB[j] = 0.0f;
+                }
+            }
+            p.extraB[0] = entry->u0; p.extraB[1] = entry->v0;
+            p.extraB[2] = entry->u1; p.extraB[3] = entry->v1;
+            // Preserve invLen2 + rowNorm in payload.xy; stash screenPxRange
+            // in payload.z (MSDF-only slot).
+            p.payload[2] = screenPxRange;
+
+            p.flags[0] = static_cast<uint32_t>(GeometryTag::MSDFGlyph);
+            p.flags[1] = packShapeFlags(false, BlurEdge::Centered, 0u, false, cs);
+
+            scratchGlyphPrims_.push_back(p);
+            scratchGlyphPages_.push_back(entry->atlasIndex);
+            unionWrites = unionWrites.getUnion(glyphPx);
+        }
+
+        if (scratchGlyphPrims_.empty()) return;
+
+        // Stash the primitive array in the arena. The upload pass after
+        // the scheduler runs will consume this range, concatenate it with
+        // any same-stateKey neighbour under Fuse mode, and upload the
+        // result into FillPipeline's SSBO in scheduled order.
+        const uint32_t arenaOffset = renderer_.arena_pushSpanReturn(
+            std::span<const GeometryPrimitive>(scratchGlyphPrims_.data(),
+                                               scratchGlyphPrims_.size()));
+
+        FillGlyphsDispatchRef ref {
+            /*firstInstance*/ 0u,
+            /*primCount*/ static_cast<uint32_t>(scratchGlyphPrims_.size()),
+            arenaOffset,
+            fi
+        };
+
+        renderer_.push(DrawOp::DrawGlyphs, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth, ref,
+            /*writesPx*/ unionWrites,
+            /*readsPx*/  unionWrites,
+            /*stateKey*/ state_key::make(DrawOp::DrawGlyphs,
+                                         /*pipelineHint*/ renderer_.captureFont(s.font),
+                                         static_cast<uint16_t>(fi)),
+            /*isOpaque*/ false);
+        // Per-glyph atlas page indices follow the ref in arena so the
+        // dispatcher can iterate glyphs and rebind the shape sampler when
+        // the page changes.
+        renderer_.arena_pushSpan(std::span<const uint32_t>(
+            scratchGlyphPages_.data(), scratchGlyphPages_.size()));
     }
 
     void fillRoundedRectangle(const juce::Rectangle<float>& r, float cornerSize) override
     {
         if (isClipEmpty()) return;
-        auto& s = state();
-        auto fi = renderer_.captureFill(s.fill);
-        if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::FillRoundedRect, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            FillRoundedRectParams { r, cornerSize, fi, s.transform, s.opacity, displayScale_ });
+        auto* fp = renderer_.fillPipeline();
+        if (!fp) return;
+        auto& s  = state();
+        auto  fi = renderer_.captureFill(s.fill);
+        // Expand by 1px AA margin — the SDF smoothstep bleeds one pixel
+        // outside the geometric rect at each edge.
+        auto writes = toWritesPx(r, /*expand physical*/ 1.0f);
+
+        GeometryPrimitive p {};
+        fillBbox(p, writes);
+        auto anchor    = r.getCentre();
+        auto shapeHalf = juce::Point<float>(r.getWidth() * 0.5f, r.getHeight() * 0.5f);
+        fillInverseTransform(p, anchor, shapeHalf);
+
+        auto toPhys = s.transform.scaled(displayScale_);
+        auto cs = fillColorFields(s.fill, toPhys, s.opacity, p);
+
+        p.flags[0] = static_cast<uint32_t>(GeometryTag::RoundRect);
+        p.flags[1] = packShapeFlags(false, BlurEdge::Centered, 0u, /*stroke*/ false, cs);
+        p.extraA[0] = cornerSize;   // logical px — SDF lives in logical space
+        p.extraA[1] = 0.0f;
+        p.extraA[2] = 0.0f;
+        p.extraA[3] = 0.0f;
+
+        const uint32_t arenaOffset = renderer_.arena_push(p);
+        FillDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u, arenaOffset, fi };
+
+        renderer_.push(DrawOp::FillRoundedRect, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth, ref,
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,
+            /*stateKey*/ state_key::make(DrawOp::FillRoundedRect, 0,
+                                         static_cast<uint16_t>(fi)),
+            /*isOpaque*/ false);
     }
 
     void fillEllipse(const juce::Rectangle<float>& area) override
     {
         if (isClipEmpty()) return;
-        auto& s = state();
-        auto fi = renderer_.captureFill(s.fill);
-        if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::FillEllipse, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            FillEllipseParams { area, fi, s.transform, s.opacity, displayScale_ });
+        auto* fp = renderer_.fillPipeline();
+        if (!fp) return;
+        auto& s  = state();
+        auto  fi = renderer_.captureFill(s.fill);
+        auto writes = toWritesPx(area, /*expand physical*/ 1.0f);
+
+        GeometryPrimitive p {};
+        fillBbox(p, writes);
+        auto anchor    = area.getCentre();
+        auto shapeHalf = juce::Point<float>(area.getWidth() * 0.5f, area.getHeight() * 0.5f);
+        fillInverseTransform(p, anchor, shapeHalf);
+
+        auto toPhys = s.transform.scaled(displayScale_);
+        auto cs = fillColorFields(s.fill, toPhys, s.opacity, p);
+
+        p.flags[0] = static_cast<uint32_t>(GeometryTag::Ellipse);
+        p.flags[1] = packShapeFlags(false, BlurEdge::Centered, 0u, false, cs);
+
+        const uint32_t arenaOffset = renderer_.arena_push(p);
+        FillDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u, arenaOffset, fi };
+
+        renderer_.push(DrawOp::FillEllipse, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth, ref,
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,
+            /*stateKey*/ state_key::make(DrawOp::FillEllipse, 0, static_cast<uint16_t>(fi)),
+            /*isOpaque*/ false);
     }
 
     void drawRoundedRectangle(const juce::Rectangle<float>& rect, float cornerSize,
                               float lineThickness) override
     {
         if (isClipEmpty()) return;
-        auto& s = state();
-        auto fi = renderer_.captureFill(s.fill);
-        if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::StrokeRoundedRect, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            StrokeRoundedRectParams { rect, cornerSize, lineThickness, fi, s.transform,
-                                      s.opacity, displayScale_ });
+        auto* fp = renderer_.fillPipeline();
+        if (!fp) return;
+        auto& s  = state();
+        auto  fi = renderer_.captureFill(s.fill);
+        auto writes = toWritesPx(rect,
+            /*expand physical*/ lineThickness * 0.5f * displayScale_ + 1.0f);
+
+        GeometryPrimitive p {};
+        fillBbox(p, writes);
+        auto anchor    = rect.getCentre();
+        auto shapeHalf = juce::Point<float>(rect.getWidth() * 0.5f, rect.getHeight() * 0.5f);
+        fillInverseTransform(p, anchor, shapeHalf);
+
+        auto toPhys = s.transform.scaled(displayScale_);
+        auto cs = fillColorFields(s.fill, toPhys, s.opacity, p);
+
+        // Stroke SDF: tag=RRect with stroke bit; extraA.y = lineThickness (logical).
+        // cornerSize is also logical; shader applies abs(filledSDF) - thick/2.
+        p.flags[0] = static_cast<uint32_t>(GeometryTag::RoundRect);
+        p.flags[1] = packShapeFlags(false, BlurEdge::Centered, 0u, /*stroke*/ true, cs);
+        p.extraA[0] = cornerSize;
+        p.extraA[1] = lineThickness;
+        p.extraA[2] = 0.0f;
+        p.extraA[3] = 0.0f;
+
+        const uint32_t arenaOffset = renderer_.arena_push(p);
+        FillDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u, arenaOffset, fi };
+
+        renderer_.push(DrawOp::StrokeRoundedRect, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth, ref,
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,
+            /*stateKey*/ state_key::make(DrawOp::StrokeRoundedRect, 0,
+                                         static_cast<uint16_t>(fi)),
+            /*isOpaque*/ false);
     }
 
-    // Outline rectangle — stroked rounded rect with cornerSize = 0
+    // Outline rectangle — stroked rounded rect with cornerSize = 0.
     void drawRect(const juce::Rectangle<float>& rect, float lineThickness) override
     {
         drawRoundedRectangle(rect, 0.0f, lineThickness);
@@ -456,12 +743,36 @@ public:
     void drawEllipse(const juce::Rectangle<float>& area, float lineThickness) override
     {
         if (isClipEmpty()) return;
-        auto& s = state();
-        auto fi = renderer_.captureFill(s.fill);
-        if (s.fill.isGradient() && s.fill.gradient)
-            renderer_.caches().registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::StrokeEllipse, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            StrokeEllipseParams { area, lineThickness, fi, s.transform, s.opacity, displayScale_ });
+        auto* fp = renderer_.fillPipeline();
+        if (!fp) return;
+        auto& s  = state();
+        auto  fi = renderer_.captureFill(s.fill);
+        auto writes = toWritesPx(area,
+            /*expand physical*/ lineThickness * 0.5f * displayScale_ + 1.0f);
+
+        GeometryPrimitive p {};
+        fillBbox(p, writes);
+        auto anchor    = area.getCentre();
+        auto shapeHalf = juce::Point<float>(area.getWidth() * 0.5f, area.getHeight() * 0.5f);
+        fillInverseTransform(p, anchor, shapeHalf);
+
+        auto toPhys = s.transform.scaled(displayScale_);
+        auto cs = fillColorFields(s.fill, toPhys, s.opacity, p);
+
+        p.flags[0] = static_cast<uint32_t>(GeometryTag::Ellipse);
+        p.flags[1] = packShapeFlags(false, BlurEdge::Centered, 0u, /*stroke*/ true, cs);
+        p.extraA[0] = 0.0f;
+        p.extraA[1] = lineThickness;
+
+        const uint32_t arenaOffset = renderer_.arena_push(p);
+        FillDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u, arenaOffset, fi };
+
+        renderer_.push(DrawOp::StrokeEllipse, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth, ref,
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,
+            /*stateKey*/ state_key::make(DrawOp::StrokeEllipse, 0, static_cast<uint16_t>(fi)),
+            /*isOpaque*/ false);
     }
 
     std::unique_ptr<juce::ImageType> getPreferredImageTypeForTemporaryImages() const override
@@ -477,8 +788,17 @@ public:
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
         float v = 1.0f - amount;
-        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            EffectBlendParams { v, v, v, region, displayScale_ });
+        // EffectBlend is pointwise; writes the region only. region arrives in
+        // pre-transformed coords already (clipBounds is physical), so we don't
+        // re-apply s.transform — just clip.
+        auto writes = s.clipBounds.getIntersection(region.getSmallestIntegerContainer());
+        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth,
+            EffectBlendParams { v, v, v, region, displayScale_ },
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,
+            /*stateKey*/ state_key::make(DrawOp::EffectBlend),
+            /*isOpaque*/ false);
     }
 
     void brighten(float amount, juce::Rectangle<float> region = {})
@@ -486,32 +806,63 @@ public:
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
         float v = 1.0f + amount;
-        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            EffectBlendParams { v, v, v, region, displayScale_ });
+        auto writes = s.clipBounds.getIntersection(region.getSmallestIntegerContainer());
+        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth,
+            EffectBlendParams { v, v, v, region, displayScale_ },
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,
+            /*stateKey*/ state_key::make(DrawOp::EffectBlend),
+            /*isOpaque*/ false);
     }
 
     void tint(juce::Colour c, juce::Rectangle<float> region = {})
     {
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
-        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            EffectBlendParams { c.getFloatRed(), c.getFloatGreen(), c.getFloatBlue(), region, displayScale_ });
+        auto writes = s.clipBounds.getIntersection(region.getSmallestIntegerContainer());
+        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth,
+            EffectBlendParams { c.getFloatRed(), c.getFloatGreen(), c.getFloatBlue(),
+                                region, displayScale_ },
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,
+            /*stateKey*/ state_key::make(DrawOp::EffectBlend),
+            /*isOpaque*/ false);
     }
 
     void warmth(float amount, juce::Rectangle<float> region = {})
     {
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
-        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            EffectBlendParams { 1.0f + amount * 0.2f, 1.0f, 1.0f - amount * 0.1f, region, displayScale_ });
+        auto writes = s.clipBounds.getIntersection(region.getSmallestIntegerContainer());
+        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth,
+            EffectBlendParams { 1.0f + amount * 0.2f, 1.0f, 1.0f - amount * 0.1f,
+                                region, displayScale_ },
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,
+            /*stateKey*/ state_key::make(DrawOp::EffectBlend),
+            /*isOpaque*/ false);
     }
 
     void blur(float radius, juce::Rectangle<float> region = {})
     {
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
-        renderer_.push(DrawOp::EffectKernel, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            BlurParams { radius, region, displayScale_ });
+        // Legacy full-region Gaussian. Writes region; reads region dilated by
+        // radius (kernel reach). radius is in the same space as region —
+        // typically physical already since region comes from clipBounds.
+        auto writes = s.clipBounds.getIntersection(region.getSmallestIntegerContainer());
+        int reach = static_cast<int>(std::ceil(radius * displayScale_)) + 1;
+        auto reads = writes.expanded(reach, reach).getIntersection(s.clipBounds);
+        renderer_.push(DrawOp::EffectKernel, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth,
+            BlurParams { radius, region, displayScale_ },
+            /*writesPx*/ writes,
+            /*readsPx*/  reads,
+            /*stateKey*/ state_key::make(DrawOp::EffectKernel),
+            /*isOpaque*/ false);
     }
 
     // =========================================================================
@@ -535,10 +886,15 @@ public:
     {
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
+        auto writes = s.clipBounds.getIntersection(region.getSmallestIntegerContainer());
         renderer_.push(DrawOp::EffectHSV, s.zOrder, s.clipBounds,
-                       s.stencilDepth, s.scopeDepth,
+            s.stencilDepth, s.scopeDepth,
             HSVParams { scaleH, scaleS, scaleV, deltaH, deltaS, deltaV,
-                        region, displayScale_ });
+                        region, displayScale_ },
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,   // pointwise — reads only its own pixel
+            /*stateKey*/ state_key::make(DrawOp::EffectHSV),
+            /*isOpaque*/ false);
     }
 
     // amount: 0 = grayscale, 1 = original, >1 = boosted saturation.
@@ -653,7 +1009,7 @@ public:
                       {0, 0}, 0.0f, mode);
     }
 
-    // Path variants — route through PathBlurPipeline (ping-pong effect pass
+    // Path variants — route through BlurPipeline (ping-pong effect pass
     // on the scene target), which walks the same per-frame segment SSBO
     // PathPipeline owns for fillPath. The path is flattened to physical-px
     // line segments here and uploaded for the GPU's per-fragment SDF loop.
@@ -714,8 +1070,20 @@ public:
                          transformed.getWidth()  * displayScale_,
                          transformed.getHeight() * displayScale_ };
         }
-        renderer_.push(DrawOp::DrawShader, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            DrawShaderParams { &shader, regionPx, displayScale_ });
+        auto regionBox = regionPx.getSmallestIntegerContainer();
+        auto writes = s.clipBounds.getIntersection(regionBox);
+        // Shader identity is the pipelineHint so two ops using the same Shader
+        // can fuse once DrawShader batching lands. Collision across different
+        // Shader* is fine: DAG independence still enforces correctness.
+        uint32_t shaderHint = static_cast<uint32_t>(
+            reinterpret_cast<uintptr_t>(&shader) & 0xFFFFFFULL);
+        renderer_.push(DrawOp::DrawShader, s.zOrder, s.clipBounds,
+            s.stencilDepth, s.scopeDepth,
+            DrawShaderParams { &shader, regionPx, displayScale_ },
+            /*writesPx*/ writes,
+            /*readsPx*/  writes,   // shaders don't sample the scene buffer
+            /*stateKey*/ state_key::make(DrawOp::DrawShader, shaderHint),
+            /*isOpaque*/ false);
     }
 
     Renderer& getRenderer() { return renderer_; }
@@ -730,13 +1098,13 @@ private:
         float                 zOrder = 0.0f;
         uint32_t              scopeDepth = 0;
         uint8_t               stencilDepth = 0;
-        std::vector<ClipShapeParams> pathClipStack;
+        std::vector<ClipDispatchRef> pathClipStack;
     };
 
     RecordState& state() { return stateStack_.back(); }
     const RecordState& state() const { return stateStack_.back(); }
 
-    // Record a PopClip — same ClipShapeParams as the paired PushClipPath so
+    // Record a PopClip — same ClipDispatchRef as the paired PushClipPath so
     // the DECR_WRAP at the GPU matches the INCR_WRAP exactly. Stencil
     // reference at replay = stencilDepth BEFORE the pop (current depth),
     // so the hardware decrements only the pixels the push incremented.
@@ -744,11 +1112,24 @@ private:
     {
         auto& s = state();
         if (!s.pathClipStack.empty()) {
-            ClipShapeParams params = s.pathClipStack.back();
+            ClipDispatchRef ref = s.pathClipStack.back();
+            // writesPx/readsPx must be the pop's OWN cover rect, not the
+            // parent scope. Using s.clipBounds here would make every sibling
+            // pop share the enclosing scope's rect, spuriously WAW-edging
+            // them together and defeating disjoint-sibling clustering.
+            auto coverPx = ref.coverRect.getSmallestIntegerContainer();
+            auto popRegion = s.clipBounds.getIntersection(coverPx);
             renderer_.push(DrawOp::PopClipPath, s.zOrder, s.clipBounds,
-                           s.stencilDepth, s.scopeDepth, params);
+                                   s.stencilDepth, s.scopeDepth, ref,
+                                   /*writesPx*/ popRegion,
+                                   /*readsPx*/  popRegion,
+                                   /*stateKey*/ state_key::make(DrawOp::PopClipPath),
+                                   /*isOpaque*/ false);
             s.pathClipStack.pop_back();
         }
+        // Close the scheduler scope opened by the matching clipToPath (stencil
+        // branch). Rect-clip scopes are closed in restoreState's rect branch.
+        renderer_.popScope();
         s.scopeDepth--;
         if (s.stencilDepth > 0) s.stencilDepth--;
     }
@@ -761,8 +1142,128 @@ private:
         return juce::jmax(lineThickness, 1.0f / juce::jmax(displayScale_, 1.0f));
     }
 
-    // Pack a BlurShape draw command. Handles the inverse-affine computation
-    // that maps physical fragment coords back into shape-local logical space.
+    // Logical rect + context transform → physical-pixel integer AABB.
+    // Used by every push site to compute a tight writesPx for the scheduler;
+    // expand-by-N for AA margins where relevant. Intersects with the caller's
+    // active scissor so the result is never larger than what actually paints.
+    juce::Rectangle<int> toWritesPx(const juce::Rectangle<float>& logical,
+                                    float expandPhysicalPx = 0.0f) const
+    {
+        auto& s = state();
+        auto px = logical.transformedBy(s.transform.scaled(displayScale_));
+        if (expandPhysicalPx > 0.0f) px = px.expanded(expandPhysicalPx);
+        int bx  = static_cast<int>(std::floor(px.getX()));
+        int by  = static_cast<int>(std::floor(px.getY()));
+        int bx2 = static_cast<int>(std::ceil(px.getRight()));
+        int by2 = static_cast<int>(std::ceil(px.getBottom()));
+        juce::Rectangle<int> box { bx, by, bx2 - bx, by2 - by };
+        return s.clipBounds.getIntersection(box);
+    }
+
+    // True iff the current fill is a solid colour with full alpha AND global
+    // opacity is 1. Conservative — returns false for gradients, images, or
+    // anything with partial alpha. Used to mark FillRect/FillRoundedRect
+    // commands as isOpaque for the Step-4 DCE pass.
+    bool currentFillIsOpaque() const
+    {
+        auto& s = state();
+        if (s.opacity < 1.0f) return false;
+        if (!s.fill.isColour()) return false;
+        return s.fill.colour.getAlpha() == 255;
+    }
+
+    // Populate a primitive's colour-source fields from `fill`. Writes into
+    // extraB/payload/color; returns the ColorSource tag to pack into
+    // shapeFlags. For solid fills the RGBA colour lands in `color`; for
+    // gradients, `color` carries (1,1,1,opacity) and the gradient
+    // coefficients (origin, dir-or-invRadius, invLen2, rowNorm) go in
+    // extraB + payload so the fragment shader can evaluate t per-pixel.
+    //
+    // `toPhys` is the full record-time transform (paint transform × displayScale)
+    // — gradient endpoints are pre-transformed into PHYSICAL pixel space here
+    // so the shader doesn't need the forward affine at runtime.
+    ColorSource fillColorFields(const juce::FillType& fill,
+                                const juce::AffineTransform& toPhys,
+                                float opacity,
+                                GeometryPrimitive& p) const
+    {
+        if (!fill.isGradient() || !fill.gradient) {
+            p.color[0] = fill.colour.getFloatRed();
+            p.color[1] = fill.colour.getFloatGreen();
+            p.color[2] = fill.colour.getFloatBlue();
+            p.color[3] = fill.colour.getFloatAlpha() * opacity;
+            p.extraB[0] = p.extraB[1] = p.extraB[2] = p.extraB[3] = 0.0f;
+            p.payload[0] = p.payload[1] = p.payload[2] = p.payload[3] = 0.0f;
+            return ColorSource::Solid;
+        }
+        auto& g = *fill.gradient;
+        auto gradT = fill.transform.followedBy(toPhys);
+        float x1 = g.point1.x, y1 = g.point1.y;
+        float x2 = g.point2.x, y2 = g.point2.y;
+        gradT.transformPoint(x1, y1);
+        gradT.transformPoint(x2, y2);
+
+        const float rowNorm = renderer_.caches().registerGradient(g);
+
+        p.color[0] = p.color[1] = p.color[2] = 1.0f;
+        p.color[3] = opacity;
+
+        if (g.isRadial) {
+            float radius = std::sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+            float invRadius = (radius > 0.0f) ? 1.0f / radius : 0.0f;
+            p.extraB[0] = x1;   p.extraB[1] = y1;
+            p.extraB[2] = invRadius; p.extraB[3] = 0.0f;
+            p.payload[0] = 0.0f;
+            p.payload[1] = rowNorm;
+            p.payload[2] = p.payload[3] = 0.0f;
+            return ColorSource::Radial;
+        }
+
+        float dx = x2 - x1, dy = y2 - y1;
+        float len2 = dx * dx + dy * dy;
+        float invLen2 = (len2 > 0.0f) ? 1.0f / len2 : 0.0f;
+        p.extraB[0] = x1; p.extraB[1] = y1;
+        p.extraB[2] = dx; p.extraB[3] = dy;
+        p.payload[0] = invLen2;
+        p.payload[1] = rowNorm;
+        p.payload[2] = p.payload[3] = 0.0f;
+        return ColorSource::Linear;
+    }
+
+    // Populate invXform01 / invXform23_half. `anchor` is the shape-local origin
+    // in LOGICAL coordinates (typically the shape's centre); shapeHalf is the
+    // shape's half-extent in logical units.
+    void fillInverseTransform(GeometryPrimitive& p,
+                              const juce::Point<float>& anchor,
+                              const juce::Point<float>& shapeHalf) const
+    {
+        auto& s = state();
+        auto M    = s.transform.scaled(displayScale_);
+        auto invM = M.inverted().translated(-anchor.x, -anchor.y);
+        p.invXform01[0] = invM.mat00; p.invXform01[1] = invM.mat10;
+        p.invXform01[2] = invM.mat01; p.invXform01[3] = invM.mat11;
+        p.invXform23_half[0] = invM.mat02;
+        p.invXform23_half[1] = invM.mat12;
+        p.invXform23_half[2] = shapeHalf.x;
+        p.invXform23_half[3] = shapeHalf.y;
+    }
+
+    // Populate bbox from a physical-pixel integer rect.
+    static void fillBbox(GeometryPrimitive& p, const juce::Rectangle<int>& box)
+    {
+        p.bbox[0] = static_cast<float>(box.getX());
+        p.bbox[1] = static_cast<float>(box.getY());
+        p.bbox[2] = static_cast<float>(box.getRight());
+        p.bbox[3] = static_cast<float>(box.getBottom());
+    }
+
+    // Pack a BlurShape draw command. Builds a GeometryPrimitive carrying
+    // the inverse affine (physical → shape-local logical) + shape geometry,
+    // uploads it to BlurPipeline's per-frame primitive SSBO, and emits a
+    // DrawOp::BlurShape whose arena payload is a BlurDispatchRef pointing
+    // at that primitive. Single-primitive (count=1) today; the scheduler's
+    // Fuse mode will later pack N compatible primitives into one range and
+    // collapse them into a single vkCmdDraw(6, N, ...) dispatch.
     void pushBlurShape(const juce::Rectangle<float>& boundsRect,
                        float cornerSize,
                        uint32_t shapeType,
@@ -773,6 +1274,8 @@ private:
     {
         if (isClipEmpty()) return;
         if (blurRadius <= 0.0f && falloffRadius <= 0.0f) return;
+        auto* bp = renderer_.blurPipeline();
+        if (!bp) return;
         auto& s = state();
 
         // Shape-local anchor: rect/rrect/ellipse are origin-centred with
@@ -789,45 +1292,111 @@ private:
         // the shape-local origin.
         juce::AffineTransform invMshift = invM.translated(-anchor.x, -anchor.y);
 
-        BlurShapeParams p {};
-        p.invXform[0] = invMshift.mat00; p.invXform[1] = invMshift.mat10;
-        p.invXform[2] = invMshift.mat01; p.invXform[3] = invMshift.mat11;
-        p.invXform[4] = invMshift.mat02; p.invXform[5] = invMshift.mat12;
-
-        p.shapeHalf[0] = boundsRect.getWidth()  * 0.5f;
-        p.shapeHalf[1] = boundsRect.getHeight() * 0.5f;
-        p.lineB[0]     = lineB.x;
-        p.lineB[1]     = lineB.y;
+        const float shapeHalfX = boundsRect.getWidth()  * 0.5f;
+        const float shapeHalfY = boundsRect.getHeight() * 0.5f;
 
         // blurStep = physical texels per user-logical pixel. Folds in both
         // the user's transform scale AND displayScale so the shader's kernel
         // step converts 1 user-logical pixel to the right number of physical
-        // texels — which means the blur respects addTransform(scale(...))
-        // AND the loop count stays fixed regardless of displayScale (2x
-        // retina just samples every other physical pixel, same tap count).
+        // texels — respecting addTransform(scale(...)) AND keeping loop
+        // count fixed across displayScale (2x retina just samples every
+        // other physical pixel, same tap count).
         const float transformScale = s.transform.getScaleFactor();
+        const float blurStep = transformScale * displayScale_;
+        const float falloffC = juce::jmax(0.001f, falloffRadius);
 
-        p.maxRadius     = blurRadius;
-        p.falloff       = juce::jmax(0.001f, falloffRadius);
-        p.blurStep      = transformScale * displayScale_;
-        p.cornerRadius  = cornerSize;
-        p.lineThickness = lineThickness;
+        // Scheduler bbox: shape AABB + falloff (where output visibly differs
+        // from source). Reads extend further by maxRadius (kernel reach).
+        // Both in physical pixels, intersected with scissor.
+        juce::Rectangle<float> shapeLogical;
+        if (shapeType == 3) {
+            // Capsule: boundsRect encodes A at (x,y); lineB is B relative to A;
+            // lineThickness is the cross-section half-width. Expand the AB
+            // segment by lineThickness.
+            float ax = boundsRect.getX(), ay = boundsRect.getY();
+            float bx = ax + lineB.x,      by = ay + lineB.y;
+            float xmin = juce::jmin(ax, bx) - lineThickness;
+            float ymin = juce::jmin(ay, by) - lineThickness;
+            float xmax = juce::jmax(ax, bx) + lineThickness;
+            float ymax = juce::jmax(ay, by) + lineThickness;
+            shapeLogical = { xmin, ymin, xmax - xmin, ymax - ymin };
+        } else {
+            shapeLogical = boundsRect;
+            // Outline/stroke variants spill by lineThickness/2 outside the
+            // rect — include it in the shape AABB to keep writesPx tight.
+            if (lineThickness > 0.0f)
+                shapeLogical = shapeLogical.expanded(lineThickness * 0.5f);
+        }
+        const float falloffPhys = falloffC * blurStep;
+        const float radiusPhys  = blurRadius * blurStep;
+        auto writes = toWritesPx(shapeLogical, falloffPhys);
+        // readsPx is where the fragment shader samples from. Not bounded by
+        // scissor — clamp only to the framebuffer so we don't claim reads
+        // beyond the GPU's texture bounds.
+        const juce::Rectangle<int> vpBounds {
+            0, 0,
+            static_cast<int>(renderer_.target().width()),
+            static_cast<int>(renderer_.target().height())
+        };
+        auto reads = writes.expanded(static_cast<int>(std::ceil(radiusPhys)))
+                           .getIntersection(vpBounds);
 
-        p.shapeType     = shapeType;
-        p.edgePlacement = static_cast<uint32_t>(edge);
-        p.inverted      = inverted ? 1u : 0u;
-        p.mode          = static_cast<uint32_t>(mode);
+        // Build the GeometryPrimitive. Layout matches shaders/geometry.glsl.
+        // Stroke flag is true for non-capsule shapes with lineThickness > 0;
+        // capsule consumes lineThickness as its own cross-section, so the
+        // shader treats it as fill.
+        const bool isStroke = (shapeType != 3) && (lineThickness > 0.0f);
+        GeometryPrimitive prim {};
+        prim.bbox[0] = static_cast<float>(writes.getX());
+        prim.bbox[1] = static_cast<float>(writes.getY());
+        prim.bbox[2] = static_cast<float>(writes.getRight());
+        prim.bbox[3] = static_cast<float>(writes.getBottom());
+        prim.flags[0] = shapeType;
+        prim.flags[1] = packShapeFlags(inverted, edge, /*fillRule*/ 0u, isStroke);
+        prim.flags[2] = 0;
+        prim.flags[3] = 0;
+        prim.invXform01[0] = invMshift.mat00;
+        prim.invXform01[1] = invMshift.mat10;
+        prim.invXform01[2] = invMshift.mat01;
+        prim.invXform01[3] = invMshift.mat11;
+        prim.invXform23_half[0] = invMshift.mat02;
+        prim.invXform23_half[1] = invMshift.mat12;
+        prim.invXform23_half[2] = shapeHalfX;
+        prim.invXform23_half[3] = shapeHalfY;
+        prim.extraA[0] = cornerSize;          // cornerRadius (tag 1)
+        prim.extraA[1] = lineThickness;       // thickness (tags 0..2 outline, 3 capsule half)
+        prim.extraA[2] = lineB.x;             // capsule B.x
+        prim.extraA[3] = lineB.y;             // capsule B.y
+        prim.extraB[0] = blurRadius;          // logical
+        prim.extraB[1] = falloffC;            // logical
+        prim.extraB[2] = blurStep;
+        prim.extraB[3] = 0.0f;                // strokeHalfWidth — path-only
 
+        const uint32_t arenaOffset = renderer_.arena_push(prim);
+        BlurDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u,
+                              arenaOffset, static_cast<uint32_t>(mode) };
+
+        // pipelineHint bundles shape + mode + edge + inverted so two blurs
+        // can fuse only when they share shader configuration.
+        uint32_t hint = static_cast<uint32_t>(shapeType)
+                      | (static_cast<uint32_t>(mode)  <<  4)
+                      | (static_cast<uint32_t>(edge)  <<  8)
+                      | ((inverted ? 1u : 0u)         << 12);
         renderer_.push(DrawOp::BlurShape, s.zOrder, s.clipBounds,
-                       s.stencilDepth, s.scopeDepth, p);
+            s.stencilDepth, s.scopeDepth, ref,
+            /*writesPx*/ writes,
+            /*readsPx*/  reads,
+            /*stateKey*/ state_key::make(DrawOp::BlurShape, hint),
+            /*isOpaque*/ false);
     }
 
     // Pack a BlurPath draw command. Flattens the path to line segments
-    // (physical pixels), uploads them to PathPipeline's per-frame SSBO,
-    // then emits a BlurPath op carrying the segment range + blur params
-    // (all distances in physical pixels — the caller's logical units
-    // were multiplied by displayScale here so the shader stays in one
-    // coord space).
+    // in PHYSICAL pixels, uploads them to PathPipeline's per-frame SSBO
+    // (shared with FillPath + clip-path), and emits a GeometryPrimitive
+    // (tag=5) whose flags[2..3] hold (segmentStart, segmentCount). All
+    // distances on the primitive are in physical pixels — blurStep=1.0
+    // — because the segments are pre-baked physical; a later phase flips
+    // this to local-coord segments + non-unity blurStep.
     void pushBlurPath(const juce::Path& path,
                       const juce::AffineTransform& t,
                       float blurRadius, float falloffRadius,
@@ -839,7 +1408,8 @@ private:
         if (blurRadius <= 0.0f && falloffRadius <= 0.0f) return;
 
         auto* pp = renderer_.pathPipeline();
-        if (!pp) return;
+        auto* bp = renderer_.blurPipeline();
+        if (!pp || !bp) return;
 
         auto& s = state();
         auto pathBounds = path.getBounds();
@@ -851,30 +1421,82 @@ private:
         flattenPathToSegments(path, combined, scratchSegments_);
         if (scratchSegments_.empty()) return;
 
-        uint32_t segStart = pp->uploadSegments(
+        const uint32_t segStart = pp->uploadSegments(
             scratchSegments_.data(),
             static_cast<uint32_t>(scratchSegments_.size()));
+        const uint32_t segCount = static_cast<uint32_t>(scratchSegments_.size());
+        const uint32_t fillRule = path.isUsingNonZeroWinding() ? 0u : 1u;
 
         // Pre-multiply radius params to physical pixels so the shader runs
         // entirely in one coord space (segments are already physical too).
-        // `blurStep` folds both the user's transform scale and displayScale,
-        // so the on-screen blur respects addTransform(scale(...)) as well
-        // as retina.
-        const float blurStep = s.transform.getScaleFactor() * displayScale_;
+        // blurStep == transformScale × displayScale on the logical side;
+        // for BlurPath we collapse it into the radius/falloff/stroke and
+        // set the primitive's blurStep to 1.0 so the shader sees physical.
+        const float physStep       = s.transform.getScaleFactor() * displayScale_;
+        const float maxRadiusPhys  = blurRadius      * physStep;
+        const float falloffPhys    = juce::jmax(0.001f, falloffRadius * physStep);
+        const float strokeHWPhys   = strokeHalfWidth * physStep;
 
-        BlurPathParams p {};
-        p.segmentStart    = segStart;
-        p.segmentCount    = static_cast<uint32_t>(scratchSegments_.size());
-        p.fillRule        = path.isUsingNonZeroWinding() ? 0u : 1u;
-        p.maxRadius       = blurRadius       * blurStep;
-        p.falloff         = juce::jmax(0.001f, falloffRadius * blurStep);
-        p.strokeHalfWidth = strokeHalfWidth  * blurStep;
-        p.edgePlacement   = static_cast<uint32_t>(edge);
-        p.inverted        = inverted ? 1u : 0u;
-        p.mode            = static_cast<uint32_t>(mode);
+        // Path AABB → physical px, expanded by falloff for the dirty rect,
+        // further expanded by maxRadius for the kernel read footprint.
+        auto px = pathBounds.transformedBy(combined).expanded(falloffPhys + 1.0f);
+        int bx  = static_cast<int>(std::floor(px.getX()));
+        int by  = static_cast<int>(std::floor(px.getY()));
+        int bx2 = static_cast<int>(std::ceil(px.getRight()));
+        int by2 = static_cast<int>(std::ceil(px.getBottom()));
+        juce::Rectangle<int> writes { bx, by, bx2 - bx, by2 - by };
+        writes = s.clipBounds.getIntersection(writes);
+        const juce::Rectangle<int> vpBounds {
+            0, 0,
+            static_cast<int>(renderer_.target().width()),
+            static_cast<int>(renderer_.target().height())
+        };
+        auto reads = writes.expanded(static_cast<int>(std::ceil(maxRadiusPhys)))
+                           .getIntersection(vpBounds);
 
+        GeometryPrimitive prim {};
+        prim.bbox[0] = static_cast<float>(writes.getX());
+        prim.bbox[1] = static_cast<float>(writes.getY());
+        prim.bbox[2] = static_cast<float>(writes.getRight());
+        prim.bbox[3] = static_cast<float>(writes.getBottom());
+        prim.flags[0] = static_cast<uint32_t>(GeometryTag::Path);
+        prim.flags[1] = packShapeFlags(inverted, edge, fillRule,
+                                       /*stroke*/ strokeHalfWidth > 0.0f);
+        prim.flags[2] = segStart;
+        prim.flags[3] = segCount;
+        // Identity inverse — path segments are already in physical pixels,
+        // so the shader's fragCoord is already in the right coord space.
+        prim.invXform01[0] = 1.0f; prim.invXform01[1] = 0.0f;
+        prim.invXform01[2] = 0.0f; prim.invXform01[3] = 1.0f;
+        prim.invXform23_half[0] = 0.0f;
+        prim.invXform23_half[1] = 0.0f;
+        prim.invXform23_half[2] = 0.0f;
+        prim.invXform23_half[3] = 0.0f;
+        prim.extraA[0] = 0.0f;
+        prim.extraA[1] = 0.0f;
+        prim.extraA[2] = 0.0f;
+        prim.extraA[3] = 0.0f;
+        prim.extraB[0] = maxRadiusPhys;   // physical
+        prim.extraB[1] = falloffPhys;     // physical
+        prim.extraB[2] = 1.0f;            // blurStep — radius already physical
+        prim.extraB[3] = strokeHWPhys;    // physical (0 for fill)
+
+        const uint32_t arenaOffset = renderer_.arena_push(prim);
+        BlurDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u,
+                              arenaOffset, static_cast<uint32_t>(mode) };
+
+        uint32_t hint = 0xFu                                               // path (distinguish from shape)
+                      | (static_cast<uint32_t>(mode)         <<  4)
+                      | (static_cast<uint32_t>(edge)         <<  8)
+                      | ((inverted ? 1u : 0u)                << 12)
+                      | ((strokeHalfWidth > 0.0f ? 1u : 0u)  << 13);       // stroke vs fill
         renderer_.push(DrawOp::BlurPath, s.zOrder, s.clipBounds,
-                       s.stencilDepth, s.scopeDepth, p);
+            s.stencilDepth, s.scopeDepth, ref,
+            /*writesPx*/ writes,
+            /*readsPx*/  reads,
+            /*stateKey*/ state_key::make(DrawOp::BlurPath, hint, 0,
+                                         static_cast<uint16_t>(fillRule)),
+            /*isOpaque*/ false);
     }
 
     // Flatten a path to a flat list of line segments in the supplied
@@ -1001,6 +1623,13 @@ private:
     std::vector<glm::vec2> scratchPoints_;
     std::vector<Seg>       scratchSegStack_;
     std::vector<glm::vec4> scratchSegments_;
+
+    // drawGlyphs scratch — built in record phase, uploaded to FillPipeline's
+    // primitive SSBO in one go. Per-glyph atlas-page indices land in the
+    // arena after the dispatch ref, so the worker can rebind the shape
+    // sampler when the page changes.
+    std::vector<GeometryPrimitive> scratchGlyphPrims_;
+    std::vector<uint32_t>          scratchGlyphPages_;
 };
 
 } // namespace jvk

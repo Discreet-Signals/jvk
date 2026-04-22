@@ -12,18 +12,20 @@ if [ -z "$GLSLC" ]; then
 fi
 
 echo "Compiling shaders..."
-$GLSLC -fshader-stage=vert ui2d.vert     -o ui2d.vert.spv
-$GLSLC -fshader-stage=frag ui2d.frag     -o ui2d.frag.spv
-$GLSLC -fshader-stage=frag hsv.frag      -o hsv.frag.spv
+$GLSLC -fshader-stage=vert ui2d.vert       -o ui2d.vert.spv
+$GLSLC -fshader-stage=frag ui2d.frag       -o ui2d.frag.spv
+$GLSLC -fshader-stage=frag hsv.frag        -o hsv.frag.spv
 $GLSLC -fshader-stage=vert blur.vert       -o blur.vert.spv
 $GLSLC -fshader-stage=frag blur.frag       -o blur.frag.spv
-$GLSLC -fshader-stage=frag shape_blur.frag -o shape_blur.frag.spv
 $GLSLC -fshader-stage=vert path_sdf.vert   -o path_sdf.vert.spv
 $GLSLC -fshader-stage=frag path_sdf.frag   -o path_sdf.frag.spv
-$GLSLC -fshader-stage=frag path_blur.frag  -o path_blur.frag.spv
-$GLSLC -fshader-stage=vert clip.vert       -o clip.vert.spv
 $GLSLC -fshader-stage=frag clip.frag       -o clip.frag.spv
 $GLSLC -fshader-stage=frag copy.frag       -o copy.frag.spv
+# Geometry-abstracted family. geom_blur.frag #includes geometry.glsl, so
+# glslc's GL_GOOGLE_include_directive extension resolves it from the cwd.
+$GLSLC -fshader-stage=vert geometry.vert       -o geometry.vert.spv
+$GLSLC -fshader-stage=frag geom_blur.frag      -o geom_blur.frag.spv
+$GLSLC -fshader-stage=frag fill.frag           -o fill.frag.spv
 
 echo "Generating UI2DShaders.h..."
 python3 - << 'PYEOF'
@@ -44,13 +46,13 @@ shaders = [
     ('hsv.frag.spv', 'hsv_frag_spv'),
     ('blur.vert.spv', 'blur_vert_spv'),
     ('blur.frag.spv', 'blur_frag_spv'),
-    ('shape_blur.frag.spv', 'shape_blur_frag_spv'),
     ('path_sdf.vert.spv', 'path_sdf_vert_spv'),
     ('path_sdf.frag.spv', 'path_sdf_frag_spv'),
-    ('path_blur.frag.spv', 'path_blur_frag_spv'),
-    ('clip.vert.spv', 'clip_vert_spv'),
     ('clip.frag.spv', 'clip_frag_spv'),
     ('copy.frag.spv', 'copy_frag_spv'),
+    ('geometry.vert.spv', 'geometry_vert_spv'),
+    ('geom_blur.frag.spv', 'geom_blur_frag_spv'),
+    ('fill.frag.spv', 'fill_frag_spv'),
 ]
 
 out = """/*

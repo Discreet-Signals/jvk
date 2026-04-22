@@ -66,7 +66,8 @@ public:
         // the next setPipeline() re-binds and re-pushes viewport constants.
         state.setCustomPipeline(useClipVariant ? shader.clipPipeline()
                                                : shader.pipeline(),
-                                shader.layout());
+                                shader.layout(),
+                                stencilDepth);
 
         if (useClipVariant) {
             // Stencil reference = current clip depth. compareOp=EQUAL in

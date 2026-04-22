@@ -38,6 +38,11 @@ public:
         teardownVulkan();
     }
 
+    // Active Vulkan Renderer, or nullptr in Simple/software mode. Exposed so
+    // host-side tooling (debug overlays, scheduler mode switchers) can poke
+    // live Renderer state without needing to own the device/target plumbing.
+    Renderer* renderer() { return renderer_.get(); }
+
     // Toggle the Vulkan render path on/off at runtime. When disabled, every
     // per-editor Vulkan resource — pipelines, renderer, swapchain, surface,
     // platform subview, and our reference to the shared Device — is released
@@ -172,15 +177,14 @@ private:
         // passes from target_ — must go before both. Reverse registration
         // order, mirrored from registerPipelines.
         clipPipeline_.reset();
-        pathBlur_.reset();
+        blurPipeline_.reset();
+        fillPipeline_.reset();
         pathPipeline_.reset();
         shaderPipeline_.reset();
-        shapeBlur_.reset();
         hsvPipeline_.reset();
         copyEffect_.reset();
         blurEffect_.reset();
         blendPipeline_.reset();
-        colorPipeline_.reset();
 
         renderer_.reset();
         target_.reset();
@@ -272,6 +276,12 @@ private:
         // Wipe the per-frame segment ring for the analytical-SDF path
         // renderer before JUCE paint fills it up again.
         if (pathPipeline_) pathPipeline_->beginFrame();
+        // Same lifecycle for the geometry-abstracted blur / fill / clip
+        // pipelines' per-frame GeometryPrimitive SSBOs. Cleared on paint,
+        // flushed to GPU inside Renderer::execute after the frame fence wait.
+        if (blurPipeline_) blurPipeline_->beginFrame();
+        if (fillPipeline_) fillPipeline_->beginFrame();
+        if (clipPipeline_) clipPipeline_->beginFrame();
 
         // Phase 1: Record — JUCE paints, Graphics pushes commands into Renderer
         float scale = getDisplayScale();
@@ -334,10 +344,6 @@ private:
     {
         using namespace shaders::ui2d;
 
-        colorPipeline_ = std::make_unique<pipelines::ColorPipeline>(
-            *device_, spv(vert_spv, vert_spvSize), spv(frag_spv, frag_spvSize));
-        renderer_->registerPipeline(*colorPipeline_);
-
         blendPipeline_ = std::make_unique<pipelines::BlendPipeline>(
             *device_, spv(vert_spv, vert_spvSize), spv(frag_spv, frag_spvSize));
         renderer_->registerPipeline(*blendPipeline_);
@@ -354,17 +360,19 @@ private:
             EffectPipeline::StencilMode::Inside);
         renderer_->setPostProcess(blurEffect_.get());
 
-        // Pre-copy pipeline for clipped effects. Same vertex shader as blur;
-        // the frag just samples the source texture verbatim. StencilMode::
-        // Outside means the pass writes ONLY the pixels outside the active
-        // clip — the immediately-following effect pass then fills the inside.
-        // Together the two passes cover every destination pixel exactly once.
+        // Ping-pong seed-copy pipeline. Full-viewport copy from source to
+        // destination, no stencil test — runs BEFORE every effect dispatch
+        // that swaps the ping-pong so the destination half starts with the
+        // current scene content. Lets every effect pipeline use tight
+        // dispatch regions (bbox / stencil-clipped) without leaving stale
+        // ping-pong data where the effect doesn't touch. Shares blur.vert
+        // (fullscreen triangle) + copy.frag (passthrough sample).
         copyEffect_ = std::make_unique<EffectPipeline>();
         copyEffect_->init(*device_,
             target_->effectRenderPass(),
             spv(blur_vert_spv, blur_vert_spvSize),
             spv(copy_frag_spv, copy_frag_spvSize),
-            EffectPipeline::StencilMode::Outside);
+            EffectPipeline::StencilMode::Always);
         renderer_->setCopyEffect(copyEffect_.get());
 
         // HSV transform pipeline — one shader, covers every HSV-space
@@ -378,17 +386,6 @@ private:
             spv(hsv_frag_spv,  hsv_frag_spvSize));
         renderer_->setHSVPipeline(hsvPipeline_.get());
 
-        // Shape-aware blur — variable per-pixel radius driven by the shape's
-        // SDF. Used by Graphics::{draw,fill}Blurred{Rectangle,RoundedRectangle,
-        // Ellipse} and Graphics::drawBlurredLine. Reuses the fullscreen-
-        // triangle vertex shader from the standard blur.
-        shapeBlur_ = std::make_unique<ShapeBlurPipeline>();
-        shapeBlur_->init(*device_,
-            target_->effectRenderPass(),
-            spv(blur_vert_spv, blur_vert_spvSize),
-            spv(shape_blur_frag_spv, shape_blur_frag_spvSize));
-        renderer_->setShapeBlur(shapeBlur_.get());
-
         // DrawShader dispatcher — runs user shaders (jvk::Shader) inside the
         // scene render pass. Each user shader lazily builds its own pipeline
         // variants (normal + clip) on first draw, against the scene RP
@@ -397,9 +394,10 @@ private:
         shaderPipeline_->init(*device_, target_->sceneRenderPassClear());
         renderer_->setShaderPipeline(shaderPipeline_.get());
 
-        // Analytical-SDF path renderer. Owns a per-frame storage-buffer
-        // ring for segment uploads and a fragment shader that walks the
-        // segments per pixel to compute the SDF + winding analytically.
+        // Path-segment storage utility. No longer dispatches FillPath itself
+        // (that moved into FillPipeline); PathPipeline is now just the per-
+        // frame segment SSBO + its descriptor set layout, shared by the fill,
+        // blur, and clip pipelines.
         pathPipeline_ = std::make_unique<PathPipeline>();
         pathPipeline_->init(*device_,
             target_->sceneRenderPassClear(),
@@ -407,25 +405,45 @@ private:
             spv(path_sdf_frag_spv, path_sdf_frag_spvSize));
         renderer_->setPathPipeline(pathPipeline_.get());
 
-        // Path-aware blur — reuses PathPipeline's per-frame segment SSBO
-        // (shares its descriptor-set layout). Must be initialised AFTER
-        // pathPipeline_ so ssboSetLayout() is ready.
-        pathBlur_ = std::make_unique<PathBlurPipeline>();
-        pathBlur_->init(*device_,
+        // Geometry-abstracted fill pipeline. Absorbs ColorPipeline + path-
+        // fill dispatch. Owns a per-frame GeometryPrimitive SSBO + MSDF
+        // glyph atlas. Must be built AFTER pathPipeline_ so it can share
+        // that pipeline's segment-SSBO descriptor-set layout for tag=5.
+        fillPipeline_ = std::make_unique<FillPipeline>();
+        fillPipeline_->init(*device_,
+            target_->sceneRenderPassClear(),
+            pathPipeline_->ssboSetLayout(),
+            spv(geometry_vert_spv, geometry_vert_spvSize),
+            spv(fill_frag_spv, fill_frag_spvSize));
+        renderer_->setFillPipeline(fillPipeline_.get());
+
+        // Geometry-abstracted variable-radius Gaussian blur. Handles both
+        // shape blurs (rect / rrect / ellipse / capsule — tags 0..3) and
+        // path blurs (tag 5). Owns its own per-frame GeometryPrimitive
+        // SSBO; reuses PathPipeline's segment-SSBO layout for the path
+        // geometry branch. Must be initialised AFTER pathPipeline_.
+        blurPipeline_ = std::make_unique<BlurPipeline>();
+        blurPipeline_->init(*device_,
             target_->effectRenderPass(),
             pathPipeline_->ssboSetLayout(),
-            spv(blur_vert_spv, blur_vert_spvSize),
-            spv(path_blur_frag_spv, path_blur_frag_spvSize));
-        renderer_->setPathBlur(pathBlur_.get());
+            // Tight-bbox dispatch via the shared geometry.vert. The
+            // ping-pong seed-copy prologue in Renderer::effectPassAndSwap
+            // already seeds the destination half with source content, so
+            // the blur only has to write its shape band — outside-bbox
+            // pixels retain the copied source.
+            spv(geometry_vert_spv, geometry_vert_spvSize),
+            spv(geom_blur_frag_spv, geom_blur_frag_spvSize));
+        renderer_->setBlurPipeline(blurPipeline_.get());
 
-        // Clip-stencil pipeline. Shares PathPipeline's segment SSBO for
-        // arbitrary-path clips; rrect clips are purely analytical (no SSBO
-        // read). Owns two VkPipelines — push (INCR_WRAP) and pop (DECR_WRAP)
-        // — sharing one layout and one pair of shader modules.
+        // Geometry-abstracted clip-stencil pipeline. Owns its own per-frame
+        // GeometryPrimitive SSBO; shares PathPipeline's segment-SSBO layout
+        // for the tag=5 path branch. Two VkPipeline variants share one
+        // layout + one pair of shader modules (geometry.vert + clip.frag).
         clipPipeline_ = std::make_unique<ClipPipeline>();
         clipPipeline_->init(*device_,
             target_->sceneRenderPassClear(),
-            spv(clip_vert_spv, clip_vert_spvSize),
+            pathPipeline_->ssboSetLayout(),
+            spv(geometry_vert_spv, geometry_vert_spvSize),
             spv(clip_frag_spv, clip_frag_spvSize));
         renderer_->setClipPipeline(clipPipeline_.get());
     }
@@ -456,15 +474,14 @@ private:
     juce::Component metalView_;
 #endif
 
-    std::unique_ptr<pipelines::ColorPipeline>         colorPipeline_;
     std::unique_ptr<pipelines::BlendPipeline>         blendPipeline_;
     std::unique_ptr<EffectPipeline>                   blurEffect_;
     std::unique_ptr<EffectPipeline>                   copyEffect_;
     std::unique_ptr<HSVPipeline>                      hsvPipeline_;
-    std::unique_ptr<ShapeBlurPipeline>                shapeBlur_;
     std::unique_ptr<ShaderPipeline>                   shaderPipeline_;
     std::unique_ptr<PathPipeline>                     pathPipeline_;
-    std::unique_ptr<PathBlurPipeline>                 pathBlur_;
+    std::unique_ptr<FillPipeline>                     fillPipeline_;
+    std::unique_ptr<BlurPipeline>                     blurPipeline_;
     std::unique_ptr<ClipPipeline>                     clipPipeline_;
 
     RenderTimer renderTimer_;

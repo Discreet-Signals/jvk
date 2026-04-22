@@ -1,11 +1,13 @@
 #version 450
 
 // Trivial pass-through shader. Samples one input and writes it verbatim.
-// Used by Renderer::execute as a pre-copy step before a clipped effect:
-// the destination ping-pong buffer is filled with the source's contents
-// so that when the subsequent effect pass discards outside-clip fragments
-// (via stencil test), those destination pixels retain the source instead
-// of undefined data.
+// Used by Renderer::execute as the ping-pong seed-copy prologue that runs
+// before every effect dispatch: the destination half is filled with the
+// current scene contents so the effect only has to write its output
+// region (tight bbox, stencil-clipped band, etc.) — pixels the effect
+// doesn't touch retain the seeded source. Makes every ping-pong effect
+// pipeline (blur, HSV, future kernel / convolution passes) safe to scope
+// tightly without turning outside-write regions into stale data.
 //
 // Push constants match blur.frag's layout — dirX/dirY/radius are ignored,
 // reused as padding. Vertex shader is shared (blur.vert).
