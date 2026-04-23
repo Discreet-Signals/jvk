@@ -338,10 +338,19 @@ public:
         submitInfo.commandBufferCount = 1;
         submitInfo.pCommandBuffers = &cmd;
 
-        vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-        vkQueueWaitIdle(queue);
+        {
+            // Any queue submit has to serialize against Renderer workers +
+            // Device::submitImmediate. Whoever calls this helper is
+            // touching Device::graphicsQueue_, so take the shared lock.
+            // Wrap the command-pool free too: the caller's cmdPool may be
+            // Device::commandPool_ (shared) and vkFreeCommandBuffers
+            // requires the pool to be externally synchronized.
+            const juce::ScopedLock queueSync(Renderer::queueLock());
+            vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+            vkQueueWaitIdle(queue);
 
-        vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
+            vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
+        }
     }
 
     void destroy()

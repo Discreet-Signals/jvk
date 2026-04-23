@@ -72,13 +72,17 @@ public:
         return (static_cast<float>(row) + 0.5f) / static_cast<float>(HEIGHT);
     }
 
-    void stageUploads()
+    // Push this frame's new rows to the GPU. Both the staging allocation
+    // and the upload-queue entry come from the Renderer (per-Renderer so
+    // two editors' workers never share either structure). The copy command
+    // is recorded into the frame's command buffer by flushUploads().
+    void stageUploads(Renderer& r)
     {
         if (cursor_ == 0 || !device_) return;
         VkDeviceSize byteSize = static_cast<VkDeviceSize>(WIDTH) * cursor_ * 4;
-        auto staging = device_->staging().alloc(byteSize);
+        auto staging = r.staging().alloc(byteSize);
         memcpy(staging.mappedPtr, cpuBuffer_.data(), static_cast<size_t>(byteSize));
-        device_->upload(staging, image_.image(), WIDTH, cursor_);
+        r.upload(staging, image_.image(), WIDTH, cursor_);
     }
 
     VkDescriptorSet descriptorSet() const { return descriptorSet_; }
@@ -108,6 +112,17 @@ private:
 
 // =============================================================================
 // Generic frame-based LRU cache
+//
+// Entries are stored as `unique_ptr<V>` so they have stable addresses and V
+// itself does not need to be movable — important because cached resource
+// types inherit FrameRetained (which carries a std::atomic and is therefore
+// non-movable) to block cross-instance destruction races.
+//
+// LRU uses a frame counter that the OWNER of the cache advances. For the
+// shared `ResourceCaches::textures_` that counter is the process-wide
+// monotonic tick from AudioProcessorEditor — otherwise two editors with
+// different per-instance counters corrupt the eviction math. See
+// `AudioProcessorEditor::nextGlobalFrameTick()`.
 // =============================================================================
 
 template <typename K, typename V>
@@ -115,43 +130,114 @@ class Cache {
 public:
     explicit Cache(uint64_t maxAge = 120) : maxAge_(maxAge) {}
 
+    // Every mutator (find, insert, evict) takes lock_. Even though the
+    // intended use for `ResourceCaches::textures_` is message-thread-only
+    // today, the lock makes the cache safe to share with any worker-thread
+    // caller that might be added later and keeps concurrent access from
+    // cross-instance forceDrainAll paths harmless.
     V* find(const K& key)
     {
+        const juce::ScopedLock lk(lock_);
         auto it = entries_.find(key);
         if (it == entries_.end()) return nullptr;
         it->second.lastUsedFrame = currentFrame_;
-        return &it->second.value;
+        return it->second.value.get();
     }
 
-    V& insert(const K& key, V&& value)
+    // Combined find+pin under a single lock acquisition. Use this instead of
+    // `find` followed by a separate `retain` when V inherits FrameRetained
+    // and concurrent eviction (on any thread) could otherwise destroy the
+    // entry between the find's lock release and the caller pinning it.
+    //
+    // Returns nullptr on miss. On hit, the entry's pin count is incremented
+    // before the lock is released; caller is responsible for pushing the
+    // returned object into whatever unpin mechanism will eventually balance
+    // it (Renderer::recordingRetains_ via retain(), etc.).
+    template <typename PinFn>
+    V* findAndPin(const K& key, PinFn&& pinFn)
     {
+        static_assert(std::is_base_of_v<FrameRetained, V>,
+            "Cache::findAndPin requires V to inherit FrameRetained");
+        const juce::ScopedLock lk(lock_);
+        auto it = entries_.find(key);
+        if (it == entries_.end()) return nullptr;
+        it->second.lastUsedFrame = currentFrame_;
+        V* v = it->second.value.get();
+        pinFn(v);   // runs under lock — evict can't erase this entry here
+        return v;
+    }
+
+    V& insert(const K& key, std::unique_ptr<V> value)
+    {
+        const juce::ScopedLock lk(lock_);
         auto [it, _] = entries_.emplace(key, Entry { std::move(value), currentFrame_ });
-        return it->second.value;
+        return *it->second.value;
+    }
+
+    // Combined insert+pin, same rationale as findAndPin.
+    template <typename PinFn>
+    V& insertAndPin(const K& key, std::unique_ptr<V> value, PinFn&& pinFn)
+    {
+        static_assert(std::is_base_of_v<FrameRetained, V>,
+            "Cache::insertAndPin requires V to inherit FrameRetained");
+        const juce::ScopedLock lk(lock_);
+        auto [it, _] = entries_.emplace(key, Entry { std::move(value), currentFrame_ });
+        V* v = it->second.value.get();
+        pinFn(v);
+        return *v;
     }
 
     void evict(uint64_t frame)
     {
+        const juce::ScopedLock lk(lock_);
         currentFrame_ = frame;
         for (auto it = entries_.begin(); it != entries_.end(); ) {
-            if (frame - it->second.lastUsedFrame > maxAge_)
+            // Only destroy entries that (a) are past the age threshold and
+            // (b) no Renderer currently pins. Skipping pinned entries keeps
+            // this path non-blocking — if the same entry is still stale on a
+            // later frame, it'll be caught then. Prevents a multi-editor
+            // session from stalling the message thread on every eviction.
+            //
+            // If V doesn't inherit FrameRetained (e.g. pure POD caches we
+            // might add later), the `if constexpr` skips the pin check at
+            // compile time.
+            bool stale = (frame - it->second.lastUsedFrame) > maxAge_;
+            bool pinned = false;
+            if constexpr (std::is_base_of_v<FrameRetained, V>) {
+                pinned = it->second.value && it->second.value->isPinned();
+            }
+            if (stale && !pinned)
                 it = entries_.erase(it);
             else
                 ++it;
         }
     }
 
-    void clear() { entries_.clear(); }
-    bool contains(const K& key) const { return entries_.count(key) > 0; }
-    size_t size() const { return entries_.size(); }
+    void clear()
+    {
+        const juce::ScopedLock lk(lock_);
+        entries_.clear();
+    }
+    bool contains(const K& key) const
+    {
+        const juce::ScopedLock lk(lock_);
+        return entries_.count(key) > 0;
+    }
+    size_t size() const
+    {
+        const juce::ScopedLock lk(lock_);
+        return entries_.size();
+    }
 
 private:
     struct Entry {
-        V        value;
-        uint64_t lastUsedFrame = 0;
+        std::unique_ptr<V> value;
+        uint64_t           lastUsedFrame = 0;
     };
     std::unordered_map<K, Entry> entries_;
     uint64_t maxAge_;
     uint64_t currentFrame_ = 0;
+    mutable juce::CriticalSection lock_;
 };
 
 
@@ -159,23 +245,26 @@ private:
 // Cached resource types — pair a Resource with its descriptor set
 // =============================================================================
 
-struct CachedImage {
+// Inherits FrameRetained so every Renderer that reads this entry during
+// record can pin it via Renderer::retain, and eviction (which runs on one
+// editor's message thread) blocks on any other editor's in-flight pin
+// before destroying the VkImage / descriptor. Inherited atomic makes this
+// type non-movable — Cache stores unique_ptr<CachedImage> for stable
+// addresses, and construction is heap-allocated at getTexture().
+struct CachedImage : public FrameRetained {
     Image           image;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
-    Memory::M*      bindings = nullptr;
+    Memory::M*      bindings      = nullptr;
 
-    ~CachedImage() { if (bindings && descriptorSet) bindings->free(descriptorSet); }
     CachedImage() = default;
-    CachedImage(CachedImage&& o) noexcept
-        : image(std::move(o.image)), descriptorSet(o.descriptorSet), bindings(o.bindings)
-    { o.descriptorSet = VK_NULL_HANDLE; }
-    CachedImage& operator=(CachedImage&& o) noexcept {
-        if (this != &o) {
-            if (bindings && descriptorSet) bindings->free(descriptorSet);
-            image = std::move(o.image); descriptorSet = o.descriptorSet;
-            bindings = o.bindings; o.descriptorSet = VK_NULL_HANDLE;
-        }
-        return *this;
+    ~CachedImage() override
+    {
+        // MUST run before ~Image / descriptor free. If any Renderer has an
+        // outstanding pin (recorded draw still in flight, upload-queue entry
+        // not yet flushed), this drives Renderer::forceDrainAll() until all
+        // pins drop — then the VkImage + descriptor are safe to destroy.
+        waitUntilUnretained();
+        if (bindings && descriptorSet) bindings->free(descriptorSet);
     }
 };
 
@@ -200,8 +289,11 @@ struct CachedBuffer {
 };
 
 // =============================================================================
-// ResourceCaches — shared across all plugin instances
-// Generic GPU resource caches. Does not know about specific resource types.
+// ResourceCaches — shared across all plugin instances. Holds state that is
+// genuinely shareable because it is mutated only from the (single) JUCE
+// message thread: the texture cache (image-dedup across editors) and the
+// black-pixel default descriptor. Per-frame mutable structures (GradientAtlas,
+// upload queue, deletion queues) live on each Renderer instead.
 // =============================================================================
 
 class ResourceCaches {
@@ -211,12 +303,10 @@ public:
           textures_(120)
     {
         createBlackPixel();
-        gradientAtlas_.init(dev);
     }
 
     ~ResourceCaches() = default;
 
-    GradientAtlas&                     gradientAtlas() { return gradientAtlas_; }
     Cache<uint64_t, CachedImage>&      textures()      { return textures_; }
 
     // Stable 64-bit hash of a juce::Path's geometry. Still used by path
@@ -270,27 +360,49 @@ public:
         return h;
     }
 
-    VkDescriptorSet getTexture(uint64_t hash, const juce::Image& img)
+    // The shared texture cache. Called from the message thread during
+    // record (Graphics::drawImage), so inserts/lookups never race another
+    // editor — JUCE serializes the message thread.
+    //
+    // Per-Renderer safety against eviction: every access (hit or miss)
+    // pins the entry via Renderer::retain so another editor's message
+    // thread can't destroy the VkImage while THIS editor has an in-flight
+    // upload or a recorded draw referencing it. The pin is released when
+    // the pinning Renderer's slot rolls around and the fence has signalled
+    // — i.e. when the GPU provably no longer reads the image.
+    //
+    // Cross-instance eviction: if ~CachedImage fires on editor A's beginFrame
+    // while editor B still has a pin, FrameRetained blocks and forceDrainAll
+    // idles every Renderer + vkDeviceWaitIdle's before the image is freed.
+    VkDescriptorSet getTexture(uint64_t hash, const juce::Image& img, Renderer& r)
     {
-        if (auto* cached = textures_.find(hash))
+        // Hit path: atomic find+pin. Pin is added while still holding the
+        // cache lock, so no concurrent eviction can free this entry between
+        // the map lookup and the retain.
+        if (auto* cached = textures_.findAndPin(hash,
+                [&](CachedImage* v) { r.retain(v); }))
+        {
             return cached->descriptorSet;
+        }
 
         auto w = static_cast<uint32_t>(img.getWidth());
         auto h = static_cast<uint32_t>(img.getHeight());
 
-        CachedImage ci;
-        ci.image = Image(device_.pool(), device_.device(), w, h,
+        auto ci = std::make_unique<CachedImage>();
+        ci->image = Image(device_.pool(), device_.device(), w, h,
             VK_FORMAT_R8G8B8A8_UNORM,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-        ci.descriptorSet = device_.bindings().alloc();
-        ci.bindings = &device_.bindings();
+        ci->descriptorSet = device_.bindings().alloc();
+        ci->bindings = &device_.bindings();
 
-        Memory::M::writeImage(device_.device(), ci.descriptorSet, 0,
-            ci.image.view(), ci.image.sampler());
+        Memory::M::writeImage(device_.device(), ci->descriptorSet, 0,
+            ci->image.view(), ci->image.sampler());
 
-        // Stage pixel upload (JUCE → RGBA8)
+        // Stage pixel upload (JUCE → RGBA8) into the Renderer's per-instance
+        // staging allocator — keeps all per-frame staging off the shared
+        // Device L2.
         VkDeviceSize byteSize = static_cast<VkDeviceSize>(w) * h * 4;
-        auto staging = device_.staging().alloc(byteSize);
+        auto staging = r.staging().alloc(byteSize);
         auto* dst = static_cast<uint8_t*>(staging.mappedPtr);
         juce::Image::BitmapData bmp(img, juce::Image::BitmapData::readOnly);
         for (uint32_t y = 0; y < h; y++) {
@@ -303,9 +415,27 @@ public:
                 dst[idx + 3] = c.getAlpha();
             }
         }
-        device_.upload(staging, ci.image.image(), w, h);
 
-        auto& inserted = textures_.insert(hash, std::move(ci));
+        // Snapshot the VkImage handle from the freshly-created Image while
+        // `ci` still owns it. We need this handle for the upload queue entry
+        // that records into the worker's command buffer — capturing it here
+        // keeps the code correct even if some future refactor changes the
+        // order of upload() vs insert().
+        VkImage dstImage = ci->image.image();
+
+        // Miss path: atomic insert+pin. Pinning inside the Cache lock
+        // guarantees no other thread can observe the entry as unpinned
+        // before this Renderer has a pin — so the eviction skip-if-pinned
+        // rule covers this entry from the moment it's visible.
+        auto& inserted = textures_.insertAndPin(hash, std::move(ci),
+                [&](CachedImage* v) { r.retain(v); });
+
+        // Queue the pixel upload into the Renderer's command buffer. Order
+        // relative to insertAndPin doesn't matter for correctness anymore —
+        // the entry is pinned from the moment it enters the cache, and the
+        // pin outlives the worker's flushUploads + the frame's GPU fence.
+        r.upload(staging, dstImage, w, h);
+
         return inserted.descriptorSet;
     }
 
@@ -324,17 +454,6 @@ public:
         return h;
     }
 
-    // Stage a gradient for rendering this frame. Returns the normalized row
-    // y-coord (pass via vertex gradientInfo.w). All gradients share the atlas
-    // descriptor set (ResourceCaches::gradientDescriptor()), so there is no
-    // per-gradient descriptor switch during draws.
-    float registerGradient(const juce::ColourGradient& g)
-    {
-        return gradientAtlas_.getRow(g, hashGradient(g));
-    }
-
-    VkDescriptorSet gradientDescriptor() const { return gradientAtlas_.descriptorSet(); }
-
     VkDescriptorSet defaultDescriptor() const { return blackPixel_.descriptorSet; }
     VkImageView     defaultImageView() const { return blackPixel_.image.view(); }
     VkSampler       defaultSampler()   const { return blackPixel_.image.sampler(); }
@@ -343,14 +462,12 @@ public:
     {
         currentFrame_ = frameId;
         textures_.evict(frameId);
-        gradientAtlas_.beginFrame();
     }
 
     Device& device() { return device_; }
 
 private:
     Device& device_;
-    GradientAtlas                   gradientAtlas_;
     Cache<uint64_t, CachedImage>    textures_;
     CachedImage                     blackPixel_;
     uint64_t currentFrame_ = 0;
@@ -369,15 +486,16 @@ private:
         Memory::M::writeImage(vkd, blackPixel_.descriptorSet, 0,
             blackPixel_.image.view(), blackPixel_.image.sampler());
 
-        // Upload 1x1 black pixel
+        // Upload 1x1 black pixel via a one-shot command buffer. Runs during
+        // Device setup (before any Renderer exists), so it can't use the
+        // Renderer-owned upload queue — record the copy directly using
+        // Renderer's static helper so the barrier sequence stays in one place.
         uint32_t black = 0xFF000000;
         auto staging = device_.staging().alloc(4);
         memcpy(staging.mappedPtr, &black, 4);
-        device_.upload(staging, blackPixel_.image.image(), 1, 1);
-
-        // Flush immediately so it's ready before first frame
+        VkImage dst = blackPixel_.image.image();
         device_.submitImmediate([&](VkCommandBuffer cmd) {
-            device_.flushUploads(cmd);
+            Renderer::recordImageUpload(cmd, staging, dst, 1, 1);
         });
     }
 };

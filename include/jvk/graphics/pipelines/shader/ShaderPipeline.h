@@ -54,11 +54,19 @@ public:
                   float viewportW, float viewportH,
                   const juce::Rectangle<int>& clipBoundsPixels,
                   uint8_t stencilDepth,
-                  float frameTime)
+                  float frameTime,
+                  uint32_t frameSlot)
     {
         if (!device_) return;
         shader.ensureCreated(*device_, renderPass_, msaa_);
         if (!shader.isReady()) return;
+
+        // Apply any pending image-binding rebinds deferred from the
+        // message thread's Shader::set(). Safe here: the current slot's
+        // fence was waited in beginFrame(), so no cmdbuf is referencing
+        // this slot's descriptor set. The other slot's set isn't
+        // touched, so its in-flight cmdbuf stays valid.
+        shader.flushDescriptorUpdates(frameSlot);
 
         const bool useClipVariant = stencilDepth > 0;
 
@@ -110,8 +118,11 @@ public:
 
         // Bind the shader's descriptor set only if it actually has bindings.
         // Fragment-only shaders (push-constant-driven) leave descriptorSet()
-        // VK_NULL_HANDLE and use a zero-set pipeline layout.
-        VkDescriptorSet set = shader.descriptorSet();
+        // VK_NULL_HANDLE and use a zero-set pipeline layout. The set is
+        // chosen per frame slot so deferred message-thread rebinds can
+        // target this slot without disturbing any in-flight cmdbuf that
+        // bound another slot's set.
+        VkDescriptorSet set = shader.descriptorSet(frameSlot);
         if (set != VK_NULL_HANDLE) {
             // Refresh the GPU-visible uniform/storage buffer from the shader's
             // CPU shadow before binding — this is what makes set(name, value)

@@ -165,15 +165,21 @@ struct FillDispatchRef {
     uint32_t fillIndex;       // Renderer::getFill() slot — colour LUT source
 };
 
-// DrawImage dispatch — image texture descriptor is looked up via imageHash
-// in ResourceCaches's texture cache at dispatch time. imageHash is u64, so
-// it's placed after a pad word to keep 8-byte alignment.
+// DrawImage dispatch. `imageHash` is kept for scheduler fusion (stateKey
+// trunc) and debugging, but the worker dispatch loop no longer looks the
+// descriptor up in the shared texture cache — instead it uses `textureDesc`,
+// which Graphics::drawImage resolved + pinned on the message thread via
+// ResourceCaches::getTexture(hash, img, Renderer&). This avoids a data race
+// against concurrent inserts/evictions from sibling editors' message
+// threads, and the pin keeps the CachedImage (and its VkImageView) alive
+// for the life of the draw.
 struct FillImageDispatchRef {
-    uint32_t firstInstance;   // [prefix]
-    uint32_t primCount;       // [prefix]
-    uint32_t arenaOffset;     // [prefix]
-    uint32_t _pad;
-    uint64_t imageHash;
+    uint32_t        firstInstance;   // [prefix]
+    uint32_t        primCount;       // [prefix]
+    uint32_t        arenaOffset;     // [prefix]
+    uint32_t        _pad;
+    uint64_t        imageHash;
+    VkDescriptorSet textureDesc;     // record-time resolved + pinned
 };
 
 // DrawGlyphs dispatch. Today each glyph is one primitive; the atlas page

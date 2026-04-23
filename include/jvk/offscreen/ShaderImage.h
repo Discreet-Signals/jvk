@@ -18,9 +18,13 @@ namespace jvk
 {
 
 // Runs a fragment shader into a juce::Image. All instances share one VkInstance
-// / VkDevice / VkQueue / VkCommandPool via Device::acquire() so many can run
-// concurrently without driver glitches. Everything else — render pass, pipeline,
-// descriptors, framebuffer, staging buffers — is local to each instance.
+// / VkDevice / VkQueue via Device::acquire() so many can run concurrently
+// without driver glitches. Everything else — command pool, render pass,
+// pipeline, descriptors, framebuffer, staging buffers — is local to each
+// instance. (The command pool is per-instance because Vulkan pools are
+// externally synchronized and a ShaderImage's render timer runs on the
+// message thread while an editor's jvk-render-worker is on its own thread —
+// sharing one pool lets those threads race on MoltenVK's internal pool state.)
 //
 // Descriptor bindings (combined image samplers, storage buffers) are auto-
 // discovered from the fragment SPIR-V via spirv-reflect. Push constants follow
@@ -47,7 +51,10 @@ public:
     void pushData(const float* data, int count);
 
     // Loads a juce::Image into the combined-image-sampler at `binding`.
-    // Call from the message thread (performs an immediate GPU submit).
+    // CPU-side stash only: the GPU destroy/upload/descriptor-write work is
+    // deferred into the next render() so the caller's thread never stalls
+    // on vkDeviceWaitIdle. Calling twice for the same binding before the
+    // next render() coalesces to just the most recent image.
     void loadTexture(int binding, const juce::Image& image);
 
     void setFrameRate(int fps);
@@ -65,6 +72,7 @@ private:
     void destroyPipeline();
     void createDescriptors();
     void destroyDescriptors();
+    void applyPendingTextureLoads();
 
     std::shared_ptr<Device> device_;
 
@@ -118,7 +126,17 @@ private:
     std::vector<DescriptorSetInfo> descriptorSets;
     int storageSize = 0;
 
-    // Per-frame command buffers + fences (double-buffered)
+    // Deferred loadTexture requests. loadTexture() only stores into this
+    // vector; render() drains it at the top under a two-fence wait. Keyed
+    // by binding so repeated calls for the same binding before the next
+    // render() collapse to just the final image.
+    struct PendingTextureLoad { int binding; juce::Image image; };
+    std::vector<PendingTextureLoad> pendingTextureLoads_;
+
+    // Per-instance command pool + per-frame command buffers + fences
+    // (double-buffered). See the class-level comment for why the pool is
+    // per-instance rather than shared via Device.
+    VkCommandPool   commandPool_     = VK_NULL_HANDLE;
     VkCommandBuffer commandBuffer[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     VkFence         fence[2]         = { VK_NULL_HANDLE, VK_NULL_HANDLE };
     int             frameIndex = 0;

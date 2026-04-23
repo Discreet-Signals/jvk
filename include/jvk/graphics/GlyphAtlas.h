@@ -84,19 +84,21 @@ public:
         return atlasPages[static_cast<size_t>(atlasIndex)].descriptorSet;
     }
 
-    // Stage dirty atlas pages for deferred upload via Device staging.
-    // Pixels are copied to staging memory; actual GPU transfer commands
-    // are recorded in the next frame's flushUploads() before the render pass.
-    void stageDirtyPages()
+    // Stage dirty atlas pages for deferred upload. Pixels are copied into
+    // the Renderer's staging allocator (per-Renderer, not shared via Device)
+    // and the copy-to-image command is queued on the Renderer's upload list.
+    // flushUploads() at the top of execute() records both into the frame's
+    // command buffer before the scene render pass.
+    void stageDirtyPages(Renderer& r)
     {
         for (auto& page : atlasPages)
         {
             if (page.needsUpload)
             {
                 auto byteSize = static_cast<VkDeviceSize>(ATLAS_SIZE * ATLAS_SIZE * 4);
-                auto staging = device->staging().alloc(byteSize);
+                auto staging = r.staging().alloc(byteSize);
                 memcpy(staging.mappedPtr, page.pixels.data(), static_cast<size_t>(byteSize));
-                device->upload(staging, page.texture.image(),
+                r.upload(staging, page.texture.image(),
                     static_cast<uint32_t>(ATLAS_SIZE), static_cast<uint32_t>(ATLAS_SIZE));
                 page.needsUpload = false;
             }

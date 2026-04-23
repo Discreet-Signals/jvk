@@ -167,8 +167,10 @@ public:
     const GlyphAtlas& atlas() const { return atlas_; }
 
     // Worker-thread prepare step — stages dirty MSDF atlas pages into GPU
-    // textures. Mirrors ColorPipeline::prepare().
-    void prepareFrame() { atlas_.stageDirtyPages(); }
+    // textures via the Renderer's per-instance staging allocator + upload
+    // queue (safety: Device's staging/uploads are no longer shared across
+    // editors).
+    void prepareFrame(Renderer& r) { atlas_.stageDirtyPages(r); }
 
     // ---- Primitive SSBO staging (paint-thread record) --------------------
 

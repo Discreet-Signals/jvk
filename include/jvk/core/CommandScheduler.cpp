@@ -58,9 +58,19 @@ bool isFusableOp(DrawOp op) noexcept
         case DrawOp::FillPath:
         case DrawOp::BlurShape:
         case DrawOp::BlurPath:
+            return true;
+        // PushClipPath / PopClipPath are stateful stencil-buffer
+        // operations, NOT style-B instanced shape dispatches. Fusing N
+        // pushes into one vkCmdDraw(6, N, 0, first) writes the stencil
+        // counter N times in a single call, but their matching Pops
+        // remain as N separate ops that unwind one at a time — so by
+        // the first Pop the stencil is off by N-1, every sd>=1 op
+        // inside fails its EQUAL test, and the nested clip-scope's
+        // content goes blank. See the fuse-dump regression where three
+        // PushClipPath inputs collapsed to one while three PopClipPaths
+        // remained unmatched.
         case DrawOp::PushClipPath:
         case DrawOp::PopClipPath:
-            return true;
         default:
             return false;
     }
@@ -388,18 +398,58 @@ void CommandScheduler::scheduleRegion(const std::vector<DrawCommand>& cmds,
                         visited_[w] = jU;
                         const auto& P = cmds[start + w];
 
-                        // WAW always — two writes to the same pixel never
-                        // commute, regardless of whose scope.
-                        const bool waw = P.writesPx.intersects(C.writesPx);
+                        // Both RAW and WAW edges are gated by sameScopeLineage.
+                        //
+                        // The contract: sibling subtrees are asserted
+                        // independent by their disjoint component bounds —
+                        // e.g. the 6 pedals sit in their own clip scopes
+                        // and are positioned side-by-side. Two ops in
+                        // disjoint sibling subtrees don't strictly order
+                        // against each other; if their physical pixel
+                        // bounds nick each other at the edges (tight
+                        // layouts, sub-pixel overhangs, blur halos), the
+                        // overlap is accepted as visually undefined. The
+                        // win: cross-pedal serialization chains evaporate.
+                        //
+                        // Pedal-5's title fillRR no longer transitively
+                        // chains back to pedal-1's blur through a
+                        // pedal-1-body WAW edge, so all 6 pedal title
+                        // blurs become simultaneously ready and Fuse mode
+                        // collapses them into one instanced dispatch —
+                        // same ping-pong cycle cost as a single blur.
+                        // That's what closes the "many little blurs"
+                        // perf gap to "one big blur".
+                        //
+                        // The same rule keeps RAW cross-peer sampling
+                        // tolerated (TopBar glass buttons reading the
+                        // neighbour's pre-blur scene is fine).
+                        const bool sameLineage =
+                            sameScopeLineage(P.scopeId, C.scopeId, scopes);
 
-                        // RAW only within the same scope lineage (ancestor /
-                        // descendant / equal). Cross-sibling-subtree RAWs
-                        // are suppressed — peer components (e.g. TopBar
-                        // buttons) are asserted independent by their disjoint
-                        // bounds, so slight cross-peer read leaks ("glass
-                        // panel sampling the neighbour's pre-blur scene")
-                        // are explicitly tolerated to enable batching.
-                        const bool raw = sameScopeLineage(P.scopeId, C.scopeId, scopes)
+                        // WAW is UNCONDITIONAL: if two ops' writesPx
+                        // actually intersect, painter's order is load-
+                        // bearing — the later one must follow. This
+                        // covers both genuinely overlapping colour writes
+                        // (e.g. a pedal being dragged over a sibling
+                        // pedal) and stencil writes (PushClipPath /
+                        // PopClipPath brackets, whose shared stencil
+                        // plane makes overlap destructive). The sibling-
+                        // independence shortcut would merge those into
+                        // one fused dispatch and visibly corrupt the
+                        // result — there's no interpretation under which
+                        // reordering real overlap is OK.
+                        //
+                        // RAW stays gated by sameLineage: cross-peer
+                        // reads (blur kernels sampling a sibling's
+                        // pixels — TopBar glass buttons reading a
+                        // neighbour's pre-blur scene, pedal-1 blur's
+                        // halo extending into pedal-2's body) are
+                        // tolerated as visually undefined so that the
+                        // cross-peer blur-fusion wins still hold. This
+                        // is the only gate that provides a perf benefit;
+                        // WAW-gating was a side effect that this fixes.
+                        const bool waw = P.writesPx.intersects(C.writesPx);
+                        const bool raw = sameLineage
                                       && P.writesPx.intersects(C.readsPx);
 
                         if (waw || raw) {

@@ -12,23 +12,46 @@ public:
         reflectShader();
     }
 
-    // Image bindings: ensure the image is registered in ResourceCaches, then
-    // stash its view+sampler on the binding. If the shader is already live
-    // the write is applied immediately; otherwise ensureCreated() picks it up.
-    void set(const juce::String& name, const juce::Image& image, ResourceCaches& caches)
+    // Image bindings: ensure the image is registered in the Renderer's
+    // texture cache, then stash its view+sampler on the binding. Takes the
+    // Renderer (not just ResourceCaches) because the cache insert queues its
+    // pixel upload onto that Renderer's upload list — so the copy runs in
+    // the same frame as the draw that uses it, and two editors never share
+    // the upload queue.
+    //
+    // Pure CPU-side update: mutates the binding's pinned texture / view /
+    // sampler and flags every frame-in-flight descriptor slot as needing a
+    // write. The actual vkUpdateDescriptorSets happens inside
+    // flushDescriptorUpdates(slot) from the render thread, after the slot's
+    // frame fence has been waited — no vkDeviceWaitIdle needed.
+    void set(const juce::String& name, const juce::Image& image, Renderer& r)
     {
         for (auto& b : bindings_) {
             if (b.name == name && b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                auto& caches = r.caches();
                 uint64_t hash = ResourceCaches::hashImage(image);
-                caches.getTexture(hash, image);
+                caches.getTexture(hash, image, r);
                 auto* tc = caches.textures().find(hash);
                 if (tc == nullptr) return;
+
+                // Skip the rebind entirely if the CachedImage identity
+                // hasn't changed — the common steady-state case where a
+                // pedal re-binds the same juce::Image every paint. Saves
+                // one vkUpdateDescriptorSets per frame per binding.
+                if (tc == b.pinnedTexture) return;
+
+                // Swap the durable pin: release the previous CachedImage
+                // (if any), pin the new one. This keeps the entry alive
+                // against the cache's LRU eviction for as long as this
+                // Shader binding holds its view+sampler.
+                if (b.pinnedTexture) b.pinnedTexture->unpin();
+                tc->pin();
+                b.pinnedTexture = tc;
+
                 b.imageView = tc->image.view();
                 b.sampler   = tc->image.sampler();
                 b.bound     = true;
-                if (created_ && descriptorSet_ != VK_NULL_HANDLE)
-                    Memory::M::writeImage(device_->device(), descriptorSet_,
-                                          b.binding, b.imageView, b.sampler);
+                b.slotsPending = (1u << kSlots) - 1u;
                 return;
             }
         }
@@ -76,7 +99,12 @@ public:
         if (!layoutBindings.empty()) {
             layoutId_ = device.bindings().registerLayout(layoutBindings.data(),
                 static_cast<uint32_t>(layoutBindings.size()));
-            descriptorSet_ = device.bindings().alloc(layoutId_);
+            // One descriptor set per frame-in-flight so set(name, image) can
+            // defer the write into dispatch() safely: we write into slot N's
+            // set only after slot N's fence has been satisfied, while slot
+            // (N^1)'s in-flight cmdbuf continues to sample its own set.
+            for (int i = 0; i < kSlots; ++i)
+                descriptorSets_[i] = device.bindings().alloc(layoutId_);
             setLayout = device.bindings().getLayout(layoutId_);
 
             // Bind defaults (1x1 black pixel) for unset image bindings so the
@@ -126,44 +154,54 @@ public:
                 std::memcpy(uniformMapped_, uniformData_.data(), bufferSize);
             }
 
-            // Wire the descriptor set: one write per binding so the shader
-            // sees its UBO/SSBO buffers and image samplers as soon as it's
-            // bound. Image bindings either use the user-supplied descriptor
-            // (set via set(name, image, caches)) or the default 1x1 fallback.
+            // Wire every per-slot descriptor set identically with initial
+            // bindings: UBO/SSBO buffers point at our single shared host-
+            // mapped buffer; image samplers take whatever is currently on
+            // b.imageView/sampler (user-supplied from set() or the 1x1
+            // default fallback). Later set() calls mutate only CPU state
+            // and flag slotsPending; flushDescriptorUpdates replays those
+            // into the per-slot set on the render thread.
             std::vector<VkWriteDescriptorSet>   writes;
             std::vector<VkDescriptorBufferInfo> bufferInfos;
             std::vector<VkDescriptorImageInfo>  imageInfos;
-            bufferInfos.reserve(bindings_.size());
-            imageInfos.reserve(bindings_.size());
-            for (auto& b : bindings_) {
-                if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
-                    b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-                    bufferInfos.push_back({ uniformBuffer_, b.offsetInBuffer, b.sizeInBuffer });
-                    VkWriteDescriptorSet w {};
-                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                    w.dstSet = descriptorSet_;
-                    w.dstBinding = b.binding;
-                    w.descriptorType = b.type;
-                    w.descriptorCount = 1;
-                    w.pBufferInfo = &bufferInfos.back();
-                    writes.push_back(w);
-                }
-                else if (b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-                    imageInfos.push_back({ b.sampler, b.imageView,
-                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
-                    VkWriteDescriptorSet w {};
-                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                    w.dstSet = descriptorSet_;
-                    w.dstBinding = b.binding;
-                    w.descriptorType = b.type;
-                    w.descriptorCount = 1;
-                    w.pImageInfo = &imageInfos.back();
-                    writes.push_back(w);
+            bufferInfos.reserve(bindings_.size() * kSlots);
+            imageInfos.reserve(bindings_.size() * kSlots);
+            for (int s = 0; s < kSlots; ++s) {
+                for (auto& b : bindings_) {
+                    if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                        b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                        bufferInfos.push_back({ uniformBuffer_, b.offsetInBuffer, b.sizeInBuffer });
+                        VkWriteDescriptorSet w {};
+                        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                        w.dstSet = descriptorSets_[s];
+                        w.dstBinding = b.binding;
+                        w.descriptorType = b.type;
+                        w.descriptorCount = 1;
+                        w.pBufferInfo = &bufferInfos.back();
+                        writes.push_back(w);
+                    }
+                    else if (b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                        imageInfos.push_back({ b.sampler, b.imageView,
+                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
+                        VkWriteDescriptorSet w {};
+                        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                        w.dstSet = descriptorSets_[s];
+                        w.dstBinding = b.binding;
+                        w.descriptorType = b.type;
+                        w.descriptorCount = 1;
+                        w.pImageInfo = &imageInfos.back();
+                        writes.push_back(w);
+                    }
                 }
             }
             if (!writes.empty())
                 vkUpdateDescriptorSets(d, static_cast<uint32_t>(writes.size()),
                                        writes.data(), 0, nullptr);
+
+            // Initial wiring above already covers every image binding with
+            // whatever was on b.imageView/sampler at ensureCreated time, so
+            // clear pending flags — no redundant re-writes on first dispatch.
+            for (auto& b : bindings_) b.slotsPending = 0;
         }
 
         // Create pipeline (fullscreen triangle, fragment-only shader)
@@ -318,7 +356,32 @@ public:
     VkPipeline       pipeline()      const { return pipeline_; }
     VkPipeline       clipPipeline()  const { return clipPipeline_ ? clipPipeline_ : pipeline_; }
     VkPipelineLayout layout()        const { return layout_; }
-    VkDescriptorSet  descriptorSet() const { return descriptorSet_; }
+    VkDescriptorSet  descriptorSet(uint32_t slotIdx) const
+    {
+        return descriptorSets_[slotIdx % kSlots];
+    }
+
+    // Apply any pending image-binding rebinds into the given frame slot's
+    // descriptor set. Called from ShaderPipeline::dispatch on the render
+    // thread after the slot's frame fence has already been waited — so
+    // vkUpdateDescriptorSets is safe without any vkDeviceWaitIdle. Other
+    // slots' in-flight cmdbufs reference their own per-slot sets, which
+    // we don't touch here.
+    void flushDescriptorUpdates(uint32_t slotIdx)
+    {
+        if (!created_) return;
+        const uint32_t slot = slotIdx % kSlots;
+        const uint32_t mask = 1u << slot;
+        VkDescriptorSet set = descriptorSets_[slot];
+        if (set == VK_NULL_HANDLE) return;
+        VkDevice d = device_->device();
+        for (auto& b : bindings_) {
+            if (b.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
+            if ((b.slotsPending & mask) == 0) continue;
+            Memory::M::writeImage(d, set, b.binding, b.imageView, b.sampler);
+            b.slotsPending &= ~mask;
+        }
+    }
 
     const float* uniformData()   const { return uniformData_.data(); }
     size_t       uniformSize()   const { return uniformData_.size() * sizeof(float); }
@@ -338,6 +401,18 @@ public:
         // handles we're about to destroy.
         waitUntilUnretained();
 
+        // Release durable pins on every texture we had bound. Each
+        // corresponding CachedImage can now be evicted by the shared
+        // cache's LRU. Do this BEFORE destroying our own descriptor +
+        // pipeline so the order matches set()'s acquisition order in
+        // reverse.
+        for (auto& b : bindings_) {
+            if (b.pinnedTexture) {
+                b.pinnedTexture->unpin();
+                b.pinnedTexture = nullptr;
+            }
+        }
+
         if (!device_) return;
         VkDevice d = device_->device();
         if (uniformMapped_  != nullptr)        vkUnmapMemory(d, uniformMemory_);
@@ -346,7 +421,8 @@ public:
         if (pipeline_       != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_,     nullptr);
         if (clipPipeline_   != VK_NULL_HANDLE) vkDestroyPipeline(d, clipPipeline_, nullptr);
         if (layout_         != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
-        if (descriptorSet_  != VK_NULL_HANDLE) device_->bindings().free(descriptorSet_);
+        for (auto& set : descriptorSets_)
+            if (set != VK_NULL_HANDLE) device_->bindings().free(set);
     }
 
 private:
@@ -359,6 +435,20 @@ private:
         VkImageView      imageView = VK_NULL_HANDLE;
         VkSampler        sampler   = VK_NULL_HANDLE;
         bool             bound = false;
+        // Bitmask of per-frame descriptor sets that still need a
+        // vkUpdateDescriptorSets write to reflect the current
+        // imageView/sampler. Bit N set → slot N's descriptor set is stale
+        // and must be rewritten next time dispatch runs on slot N. Set()
+        // flips every bit; flushDescriptorUpdates(slot) clears bit `slot`.
+        uint32_t         slotsPending = 0;
+        // Durable pin on the shared-cache CachedImage whose view+sampler
+        // are baked into this Shader's per-slot descriptor sets. Without
+        // this, the cache's 120-frame LRU could evict the entry (no one
+        // re-hits getTexture for a Shader-bound image — drawShader only
+        // binds the Shader's own descriptor set), freeing the VkImage/
+        // View/Sampler while our descriptor still references them → UB on
+        // next draw. Pinned in set(), swapped on rebind, released in ~Shader.
+        CachedImage*     pinnedTexture = nullptr;
     };
 
     void reflectShader()
@@ -419,7 +509,15 @@ private:
     VkPipeline       pipeline_      = VK_NULL_HANDLE;
     VkPipeline       clipPipeline_  = VK_NULL_HANDLE;
     VkPipelineLayout layout_        = VK_NULL_HANDLE;
-    VkDescriptorSet  descriptorSet_ = VK_NULL_HANDLE;
+    // One descriptor set per frame-in-flight. The message-thread-facing
+    // set() call mutates only CPU state (imageView/sampler + slotsPending
+    // bitmask); the actual vkUpdateDescriptorSets runs inside dispatch()
+    // on the render thread, writing into just the current slot's set
+    // after that slot's frame fence has been waited. Other slots' sets
+    // keep their prior wiring and stay valid for any still-in-flight
+    // cmdbufs that bound them.
+    static constexpr int kSlots = 2; // MAX_FRAMES_IN_FLIGHT
+    std::array<VkDescriptorSet, kSlots> descriptorSets_ { VK_NULL_HANDLE, VK_NULL_HANDLE };
     Memory::M::LayoutID layoutId_   = 0;
 
     // Single host-visible coherent buffer backing every reflected UBO/SSBO

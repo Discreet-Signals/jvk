@@ -370,7 +370,8 @@ public:
         // Path SDF lives in PHYSICAL pixels (segments already baked through
         // `combined`), so invXform is identity — the shader's fragCoord and
         // segment coords share the same space. Gradient coefs live in extraB
-        // as usual.
+        // as usual. fillColorFields internally calls renderer_.registerGradient
+        // (per-Renderer, thread-safe) to stage the LUT row for this fill.
         GeometryPrimitive p {};
         fillBbox(p, clipRect);
         p.invXform01[0] = 1.0f; p.invXform01[1] = 0.0f;
@@ -401,7 +402,12 @@ public:
         if (!fp) return;
         auto& s = state();
         uint64_t hash = ResourceCaches::hashImage(img);
-        renderer_.caches().getTexture(hash, img);
+        // Safety: resolve the texture NOW (message thread — safe around the
+        // shared cache's inserts/evictions), pin the entry on this Renderer
+        // so it survives sibling editor eviction, and capture the descriptor
+        // directly into the dispatch ref. The worker thread never touches the
+        // shared cache map for this draw.
+        auto textureDesc = renderer_.caches().getTexture(hash, img, renderer_);
 
         juce::Rectangle<float> imgRectLogical {
             0.0f, 0.0f,
@@ -409,7 +415,26 @@ public:
             static_cast<float>(img.getHeight())
         };
         auto imgRectTransformed = imgRectLogical.transformedBy(t);
-        auto writes = toWritesPx(imgRectTransformed);
+
+        // IMPORTANT: the primitive bbox must be the image's FULL physical
+        // AABB (unclipped). The fragment shader computes atlas UV as
+        // mix((0,0), (1,1), vQuadUV), where vQuadUV = 0..1 across the bbox
+        // quad — so clipping the bbox to the visible scope would remap UV
+        // 0..1 onto the visible fraction of the image and squash the
+        // texture to fit. The dispatcher's scissor (cmd.clipBounds) is
+        // what actually restricts fragments to the visible rect; the bbox
+        // just has to carry the complete 0..1 UV span.
+        //
+        // writesPx / readsPx on the DrawCommand stay clipped for the
+        // scheduler (that's the real pixel footprint after scissor).
+        auto physRect = imgRectTransformed.transformedBy(
+            s.transform.scaled(displayScale_));
+        const int pbx  = static_cast<int>(std::floor(physRect.getX()));
+        const int pby  = static_cast<int>(std::floor(physRect.getY()));
+        const int pbx2 = static_cast<int>(std::ceil (physRect.getRight()));
+        const int pby2 = static_cast<int>(std::ceil (physRect.getBottom()));
+        juce::Rectangle<int> fullBbox { pbx, pby, pbx2 - pbx, pby2 - pby };
+        auto writes = s.clipBounds.getIntersection(fullBbox);
 
         // Image quad lives in its own local frame (w × h logical). The vertex
         // shader expands bbox → physical corners; the fragment shader samples
@@ -417,7 +442,7 @@ public:
         // stash the UV rect (0..1) in extraB. invXform is identity-ish since
         // tag=6 doesn't evaluate an SDF.
         GeometryPrimitive p {};
-        fillBbox(p, writes);
+        fillBbox(p, fullBbox);   // full unclipped AABB — see comment above
         p.invXform01[0] = 1.0f; p.invXform01[1] = 0.0f;
         p.invXform01[2] = 0.0f; p.invXform01[3] = 1.0f;
         p.flags[0] = static_cast<uint32_t>(GeometryTag::Image);
@@ -429,7 +454,7 @@ public:
 
         const uint32_t arenaOffset = renderer_.arena_push(p);
         FillImageDispatchRef ref { /*firstInstance*/ 0u, /*primCount*/ 1u,
-                                    arenaOffset, /*_pad*/ 0u, hash };
+                                    arenaOffset, /*_pad*/ 0u, hash, textureDesc };
 
         renderer_.push(DrawOp::DrawImage, s.zOrder, s.clipBounds,
             s.stencilDepth, s.scopeDepth, ref,
@@ -553,8 +578,16 @@ public:
                 static_cast<int>(std::ceil(gx + gw) - std::floor(gx)),
                 static_cast<int>(std::ceil(gy + gh) - std::floor(gy))
             };
-            glyphPx = s.clipBounds.getIntersection(glyphPx);
-            if (glyphPx.isEmpty()) continue;
+            // Clipped rect is used for scope-cull (skip fully-offscreen
+            // glyphs) + the scheduler's writesPx union. The primitive's
+            // bbox stays UNCLIPPED so the shader's vQuadUV → MSDF atlas
+            // UV mapping stays proportional to the full glyph cell —
+            // otherwise a glyph that straddles the clip edge would
+            // squash its MSDF sample into the visible portion, warping
+            // the letterform. Scissor restricts real pixel writes.
+            const juce::Rectangle<int> glyphClipped =
+                s.clipBounds.getIntersection(glyphPx);
+            if (glyphClipped.isEmpty()) continue;
 
             GeometryPrimitive p {};
             fillBbox(p, glyphPx);
@@ -587,7 +620,7 @@ public:
 
             scratchGlyphPrims_.push_back(p);
             scratchGlyphPages_.push_back(entry->atlasIndex);
-            unionWrites = unionWrites.getUnion(glyphPx);
+            unionWrites = unionWrites.getUnion(glyphClipped);
         }
 
         if (scratchGlyphPrims_.empty()) return;
@@ -1203,7 +1236,9 @@ private:
         gradT.transformPoint(x1, y1);
         gradT.transformPoint(x2, y2);
 
-        const float rowNorm = renderer_.caches().registerGradient(g);
+        // Per-Renderer gradient atlas (safety): each editor owns its own
+        // GradientAtlas, so two editors' paint threads never race here.
+        const float rowNorm = renderer_.registerGradient(g);
 
         p.color[0] = p.color[1] = p.color[2] = 1.0f;
         p.color[3] = opacity;

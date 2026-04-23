@@ -31,6 +31,10 @@ namespace jvk {
 //                                  (its `ssboSetLayout()` drives set-2's
 //                                  layout so the descriptor set PathPipeline
 //                                  returns is binding-compatible here)
+//   set 3, binding 0   SSBO        Vogel tap lookup table (Np-independent) —
+//                                  OWNED, immutable, filled once at init.
+//                                  Eliminates cos/sin/sqrt from the fragment
+//                                  inner loop for kernelType==1.
 //
 // Primitive SSBO lifecycle mirrors PathPipeline's segment SSBO:
 //   - beginFrame()            clears the CPU staging buffer.
@@ -59,6 +63,11 @@ public:
     static constexpr VkDeviceSize INITIAL_BUFFER_BYTES = 64 * 1024;   // 64 KB ≈ 512 primitives
     static constexpr uint32_t     PRIMITIVE_STRIDE     = 128;          // sizeof(GeometryPrimitive)
     static constexpr int          MAX_FRAMES           = 2;
+    // Must match MAX_POISSON_TAPS in geom_blur.frag's kernelType==1 branch.
+    // Table is Np-independent: entry i = vec4(cos(i·GA)·√u, sin(i·GA)·√u,
+    // (i+0.5), 0). Built once on host, uploaded once to a device-visible
+    // SSBO at init, bound as set 3 for every blur dispatch.
+    static constexpr uint32_t     VOGEL_TAP_COUNT      = 1024;
 
     BlurPipeline() = default;
     ~BlurPipeline() { destroy(); }
@@ -130,8 +139,15 @@ public:
             writeDescriptor(i);
         }
 
-        // Pipeline layout — 3 descriptor sets + PC.
-        VkDescriptorSetLayout setLayouts[3] = { sceneSetLayout, primSetLayout_, pathSsboSetLayout };
+        // Set 3 — Vogel tap SSBO (OWNED, immutable). Uses its own single-
+        // binding layout, allocated from a dedicated pool so the lifetime
+        // is independent of the per-slot primitive pool.
+        createVogelTapResources();
+
+        // Pipeline layout — 4 descriptor sets + PC.
+        VkDescriptorSetLayout setLayouts[4] = {
+            sceneSetLayout, primSetLayout_, pathSsboSetLayout, vogelSetLayout_
+        };
 
         VkPushConstantRange pcRange {};
         pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -140,7 +156,7 @@ public:
 
         VkPipelineLayoutCreateInfo pli {};
         pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pli.setLayoutCount = 3;
+        pli.setLayoutCount = 4;
         pli.pSetLayouts = setLayouts;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pcRange;
@@ -216,13 +232,14 @@ public:
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
 
-        VkDescriptorSet sets[3] = {
+        VkDescriptorSet sets[4] = {
             sceneSrc,
             primDescSets_[currentFrameSlot_],
-            pathSsbo
+            pathSsbo,
+            vogelDescSet_
         };
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            layout_, 0, 3, sets, 0, nullptr);
+            layout_, 0, 4, sets, 0, nullptr);
 
         vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilRef);
 
@@ -261,6 +278,101 @@ private:
             if (storageBuffer_[i])    vkDestroyBuffer(d, storageBuffer_[i], nullptr);
             if (storageMemory_[i])    vkFreeMemory(d, storageMemory_[i], nullptr);
         }
+        if (vogelDescPool_   != VK_NULL_HANDLE) vkDestroyDescriptorPool(d, vogelDescPool_, nullptr);
+        if (vogelSetLayout_  != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(d, vogelSetLayout_, nullptr);
+        if (vogelBuffer_     != VK_NULL_HANDLE) vkDestroyBuffer(d, vogelBuffer_, nullptr);
+        if (vogelMemory_     != VK_NULL_HANDLE) vkFreeMemory(d, vogelMemory_, nullptr);
+    }
+
+    void createVogelTapResources()
+    {
+        VkDevice d = device_->device();
+
+        // Layout + pool + set for the single immutable SSBO at set=3.
+        VkDescriptorSetLayoutBinding b {};
+        b.binding         = 0;
+        b.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        b.descriptorCount = 1;
+        b.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        VkDescriptorSetLayoutCreateInfo dli {};
+        dli.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        dli.bindingCount = 1;
+        dli.pBindings    = &b;
+        vkCreateDescriptorSetLayout(d, &dli, nullptr, &vogelSetLayout_);
+
+        VkDescriptorPoolSize ps { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1 };
+        VkDescriptorPoolCreateInfo dpi {};
+        dpi.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        dpi.maxSets       = 1;
+        dpi.poolSizeCount = 1;
+        dpi.pPoolSizes    = &ps;
+        vkCreateDescriptorPool(d, &dpi, nullptr, &vogelDescPool_);
+
+        VkDescriptorSetAllocateInfo ai {};
+        ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        ai.descriptorPool     = vogelDescPool_;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts        = &vogelSetLayout_;
+        vkAllocateDescriptorSets(d, &ai, &vogelDescSet_);
+
+        // Backing buffer — host-visible | coherent for a one-shot memcpy. No
+        // need for device-local since the table is read once per fragment and
+        // 16 KB sits comfortably in caches. Keeping it host-visible avoids a
+        // staging-buffer + transfer-cmdbuf dance.
+        constexpr VkDeviceSize bytes = VOGEL_TAP_COUNT * sizeof(float) * 4;
+
+        VkBufferCreateInfo bci {};
+        bci.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size        = bytes;
+        bci.usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        vkCreateBuffer(d, &bci, nullptr, &vogelBuffer_);
+
+        VkMemoryRequirements mr;
+        vkGetBufferMemoryRequirements(d, vogelBuffer_, &mr);
+        VkMemoryAllocateInfo mi {};
+        mi.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mi.allocationSize  = mr.size;
+        mi.memoryTypeIndex = Memory::findMemoryType(device_->physicalDevice(),
+            mr.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        vkAllocateMemory(d, &mi, nullptr, &vogelMemory_);
+        vkBindBufferMemory(d, vogelBuffer_, vogelMemory_, 0);
+
+        // Fill: tap[i] = (cos(i·GA)·√u, sin(i·GA)·√u, u, 0) where u = i + 0.5.
+        // GA = 2π · (1 − 1/φ) ≈ 2.39996 rad — the golden angle. Pre-scaling by
+        // √u collapses the shader's per-tap `sqrt((i+0.5)/Np)` into one mul
+        // by 1/√Np that's constant across the tap loop.
+        void* mapped = nullptr;
+        vkMapMemory(d, vogelMemory_, 0, bytes, 0, &mapped);
+        auto* out = static_cast<float*>(mapped);
+        constexpr float goldenAngle = 2.399963229728653f;
+        for (uint32_t i = 0; i < VOGEL_TAP_COUNT; ++i) {
+            const float u     = static_cast<float>(i) + 0.5f;
+            const float sqrtU = std::sqrt(u);
+            const float ang   = static_cast<float>(i) * goldenAngle;
+            out[i * 4 + 0] = std::cos(ang) * sqrtU;
+            out[i * 4 + 1] = std::sin(ang) * sqrtU;
+            out[i * 4 + 2] = u;
+            out[i * 4 + 3] = 0.0f;
+        }
+        vkUnmapMemory(d, vogelMemory_);
+
+        // Wire the descriptor.
+        VkDescriptorBufferInfo dbi {};
+        dbi.buffer = vogelBuffer_;
+        dbi.offset = 0;
+        dbi.range  = VK_WHOLE_SIZE;
+
+        VkWriteDescriptorSet w {};
+        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        w.dstSet          = vogelDescSet_;
+        w.dstBinding      = 0;
+        w.descriptorCount = 1;
+        w.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        w.pBufferInfo     = &dbi;
+        vkUpdateDescriptorSets(d, 1, &w, 0, nullptr);
     }
 
     VkPipeline buildPipeline(VkRenderPass compatibleRenderPass,
@@ -457,6 +569,15 @@ private:
     // CPU staging — grows unbounded across a frame, cleared on beginFrame().
     std::vector<uint8_t>  cpuPrims_;
     int                   currentFrameSlot_ = 0;
+
+    // Vogel tap lookup — owned, immutable after init, bound at set 3. The
+    // pool owns exactly one descriptor set; the buffer stores
+    // VOGEL_TAP_COUNT × vec4 (16 KB at 1024 taps).
+    VkDescriptorSetLayout vogelSetLayout_ = VK_NULL_HANDLE;
+    VkDescriptorPool      vogelDescPool_  = VK_NULL_HANDLE;
+    VkDescriptorSet       vogelDescSet_   = VK_NULL_HANDLE;
+    VkBuffer              vogelBuffer_    = VK_NULL_HANDLE;
+    VkDeviceMemory        vogelMemory_    = VK_NULL_HANDLE;
 };
 
 } // namespace jvk

@@ -40,9 +40,17 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL deviceDebugCallback(
 // =============================================================================
 
 static std::weak_ptr<Device> g_device;
+static juce::CriticalSection g_deviceAcquireLock;
 
 std::shared_ptr<Device> Device::acquire()
 {
+    // Lock around the weak_ptr.lock() / new Device() / weak_ptr = d window so
+    // simultaneous acquires from different threads can't each decide "not
+    // alive" and construct two Devices (leaking one and splitting every
+    // subsequent editor into independent Vulkan state). Today all callers are
+    // message-thread (AudioProcessorEditor::acquireVulkan, ShaderImage ctor),
+    // but the cost is negligible and keeps the singleton invariant rigorous.
+    const juce::ScopedLock lk(g_deviceAcquireLock);
     auto d = g_device.lock();
     if (d) return d;
     d = std::shared_ptr<Device>(new Device());
@@ -72,8 +80,6 @@ Device::~Device()
     if (device_) vkDeviceWaitIdle(device_);
 
     caches_.reset();
-
-    for (auto& r : retired_) { r.images.clear(); r.buffers.clear(); }
 
     // Destroy memory tiers BEFORE the VkDevice — their destructors call vkDestroy*
     bindings_ = Memory::M();
@@ -120,8 +126,24 @@ bool Device::createInstance()
     extensions.push_back("VK_KHR_xlib_surface");
 #endif
 
-#if JUCE_DEBUG
-    extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    // VK_EXT_debug_utils — only request it when labels are actually compiled
+    // in (JVK_DEBUG_LABELS). Guarded by an instance-extension enumeration so
+    // vkCreateInstance doesn't fail on a loader that doesn't expose it.
+    // Release builds skip this block entirely — no extension, no function-
+    // pointer load, nothing.
+#if JVK_DEBUG_LABELS
+    {
+        uint32_t extCount = 0;
+        vkEnumerateInstanceExtensionProperties(nullptr, &extCount, nullptr);
+        std::vector<VkExtensionProperties> avail(extCount);
+        vkEnumerateInstanceExtensionProperties(nullptr, &extCount, avail.data());
+        for (const auto& e : avail) {
+            if (strcmp(e.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+                extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+                break;
+            }
+        }
+    }
 #endif
 
     VkInstanceCreateInfo ci {};
@@ -148,7 +170,15 @@ bool Device::createInstance()
     }
 #endif
 
-    return vkCreateInstance(&ci, nullptr, &instance_) == VK_SUCCESS;
+    if (vkCreateInstance(&ci, nullptr, &instance_) != VK_SUCCESS)
+        return false;
+
+    // Load VK_EXT_debug_utils command-label entry points so ScopedLabel usage
+    // downstream (Renderer::execute, effect dispatches) resolves to actual
+    // vkCmdBeginDebugUtilsLabelEXT calls. Harmless no-op if the extension
+    // wasn't advertised by the loader.
+    jvk::debug::init(instance_);
+    return true;
 }
 
 // =============================================================================
@@ -311,89 +341,22 @@ bool Device::createCommandPool()
 }
 
 // =============================================================================
-// Upload (L2 staging → L1)
-// =============================================================================
-
-void Device::upload(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height)
-{
-    pendingUploads_.push_back({ dst, width, height, src.buffer, src.offset });
-}
-
-void Device::upload(Memory::L2::Allocation src, VkBuffer dst,
-                    VkDeviceSize size, VkDeviceSize dstOffset)
-{
-    pendingBufferUploads_.push_back({ dst, dstOffset, size, src.buffer, src.offset });
-}
-
-void Device::flushUploads(VkCommandBuffer cmd)
-{
-    for (auto& u : pendingUploads_) {
-        VkImageMemoryBarrier barrier {};
-        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = u.dstImage;
-        barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        barrier.srcAccessMask = 0;
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-        VkBufferImageCopy region {};
-        region.bufferOffset = u.srcOffset;
-        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-        region.imageExtent = { u.width, u.height, 1 };
-
-        vkCmdCopyBufferToImage(cmd, u.srcBuffer, u.dstImage,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &barrier);
-    }
-    pendingUploads_.clear();
-
-    // Buffer-to-buffer copies (path-mesh cache inserts, etc.)
-    for (auto& u : pendingBufferUploads_) {
-        VkBufferCopy region {};
-        region.srcOffset = u.srcOffset;
-        region.dstOffset = u.dstOffset;
-        region.size      = u.size;
-        vkCmdCopyBuffer(cmd, u.srcBuffer, u.dstBuffer, 1, &region);
-
-        // Make the write visible to vertex-input reads (downstream path
-        // stencil draws sample this buffer as a vertex attribute source).
-        VkBufferMemoryBarrier bb {};
-        bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        bb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
-        bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        bb.buffer = u.dstBuffer;
-        bb.offset = u.dstOffset;
-        bb.size   = u.size;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
-            0, 0, nullptr, 1, &bb, 0, nullptr);
-    }
-    pendingBufferUploads_.clear();
-}
-
-// =============================================================================
 // Immediate submission
 // =============================================================================
 
 void Device::submitImmediate(std::function<void(VkCommandBuffer)> fn)
 {
+    // Serialize the entire body under the process-wide queue lock so:
+    //   - vkAllocateCommandBuffers / vkFreeCommandBuffers on the shared
+    //     Device commandPool_ don't race another thread using the same pool
+    //     (Vulkan requires command pools to be externally synchronized).
+    //   - vkQueueSubmit + vkQueueWaitIdle don't race a Renderer worker's
+    //     queue submit (external sync on VkQueue per §4.2.1).
+    // Today this is only called from ResourceCaches::createBlackPixel during
+    // single-threaded setup, but the lock makes it safe for any future
+    // caller to invoke from a worker thread too.
+    const juce::ScopedLock queueSync(Renderer::queueLock());
+
     VkCommandBufferAllocateInfo ai {};
     ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     ai.commandPool = commandPool_;
@@ -423,31 +386,23 @@ void Device::submitImmediate(std::function<void(VkCommandBuffer)> fn)
 }
 
 // =============================================================================
-// Deferred destruction
-// =============================================================================
-
-void Device::retire(Image&& image) { retired_[0].images.push_back(std::move(image)); }
-void Device::retire(Buffer&& buffer) { retired_[0].buffers.push_back(std::move(buffer)); }
-
-void Device::flushRetired(int frameSlot)
-{
-    auto& r = retired_[frameSlot];
-    r.images.clear();
-    r.buffers.clear();
-}
-
-// =============================================================================
 // Caches (initialized after Device construction, needs forward-declared type)
 // =============================================================================
 
 ResourceCaches& Device::caches()
 {
+    // caches_ is set once (under g_deviceAcquireLock via initCaches) and
+    // never mutated again; safe to return the dereference without locking.
     jassert(caches_ != nullptr);
     return *caches_;
 }
 
 void Device::initCaches()
 {
+    // Idempotent + thread-safe: share the same lock as acquire() so the
+    // initial Device construction and its caches construction can't race
+    // across simultaneous editor acquisitions.
+    const juce::ScopedLock lk(g_deviceAcquireLock);
     if (!caches_)
         caches_ = std::make_unique<ResourceCaches>(*this);
 }

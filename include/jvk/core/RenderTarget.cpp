@@ -1,6 +1,30 @@
 namespace jvk {
 
 // =============================================================================
+// RenderTarget — owns a per-target VkCommandPool so each worker thread has
+// exclusive access to its own pool (Vulkan pools are externally synchronized).
+// =============================================================================
+
+RenderTarget::RenderTarget(Device& device)
+    : device_(device)
+{
+    VkCommandPoolCreateInfo ci {};
+    ci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    ci.queueFamilyIndex = device.graphicsFamily();
+    ci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    vkCreateCommandPool(device.device(), &ci, nullptr, &commandPool_);
+}
+
+RenderTarget::~RenderTarget()
+{
+    // Runs AFTER the derived destructor body, which vkDeviceWaitIdle's and
+    // tears down sync objects. Destroying the pool auto-frees every command
+    // buffer allocated from it — no explicit vkFreeCommandBuffers needed.
+    if (commandPool_ != VK_NULL_HANDLE)
+        vkDestroyCommandPool(device_.device(), commandPool_, nullptr);
+}
+
+// =============================================================================
 // SwapchainTarget
 // =============================================================================
 
@@ -26,7 +50,8 @@ SwapchainTarget::~SwapchainTarget()
         vkDestroyFence(d, inFlightFence_[i], nullptr);
     }
     for (auto sem : renderFinished_) vkDestroySemaphore(d, sem, nullptr);
-    vkFreeCommandBuffers(d, device_.commandPool(), MAX_FRAMES, commandBuffers_);
+    // Command buffers are freed automatically when ~RenderTarget destroys
+    // our per-target VkCommandPool.
 
     destroySceneBuffers();
     destroySwapchain();
@@ -425,7 +450,7 @@ void SwapchainTarget::createSyncObjects()
 
     VkCommandBufferAllocateInfo ai {};
     ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    ai.commandPool = device_.commandPool();
+    ai.commandPool = commandPool_;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ai.commandBufferCount = MAX_FRAMES;
     vkAllocateCommandBuffers(d, &ai, commandBuffers_);
@@ -612,7 +637,7 @@ void OffscreenTarget::create()
 
     VkCommandBufferAllocateInfo ai {};
     ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    ai.commandPool = device_.commandPool();
+    ai.commandPool = commandPool_;
     ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     ai.commandBufferCount = 1;
     vkAllocateCommandBuffers(d, &ai, &cmd_);
@@ -630,7 +655,7 @@ void OffscreenTarget::destroy()
     vkDeviceWaitIdle(d);
 
     if (fence_ != VK_NULL_HANDLE) vkDestroyFence(d, fence_, nullptr);
-    if (cmd_ != VK_NULL_HANDLE) vkFreeCommandBuffers(d, device_.commandPool(), 1, &cmd_);
+    // cmd_ is freed by ~RenderTarget destroying our per-target VkCommandPool.
     if (framebuffer_ != VK_NULL_HANDLE) vkDestroyFramebuffer(d, framebuffer_, nullptr);
     if (renderPass_ != VK_NULL_HANDLE) vkDestroyRenderPass(d, renderPass_, nullptr);
     renderImage_ = {};

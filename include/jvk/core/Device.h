@@ -8,6 +8,32 @@ namespace jvk {
 
 class ResourceCaches;  // forward — defined in Cache.h
 
+// Process-wide shared Vulkan device and memory allocators. Refcounted via
+// weak_ptr (acquire() returns the same instance to every caller), so the
+// instance stays alive until the last shared_ptr holder drops it.
+//
+// Multi-instance thread contract (every member below falls into exactly one
+// category):
+//
+//   (a) Immutable after init — safe to read from any thread:
+//         instance(), physicalDevice(), device(), graphicsQueue(),
+//         graphicsFamily(), presentQueue(), presentFamily(), commandPool()
+//         (commandPool is only used by submitImmediate; per-render command
+//         pools live on RenderTarget), time().
+//
+//   (b) Internally synchronized — safe to call from any thread, including
+//       concurrently from multiple editors' workers:
+//         pool() (Memory::L1), bindings() (Memory::M).
+//
+//   (c) Message-thread only — caller must not invoke from a render worker.
+//       Safe across editors because JUCE's message thread is single-threaded:
+//         staging() (retained for the one-shot createBlackPixel bootstrap;
+//         per-frame staging lives on each Renderer), submitImmediate(),
+//         caches(), initCaches().
+//
+// Everything that used to be mutable per-frame state on Device has been
+// moved to Renderer: upload queues, deletion queues, gradient atlas, the
+// worker-thread staging allocator. See ARCHITECTURE.md for the rationale.
 class Device {
 public:
     static std::shared_ptr<Device> acquire();
@@ -25,18 +51,7 @@ public:
     Memory::L2& staging()  { return staging_; }
     Memory::M&  bindings() { return bindings_; }
 
-    void upload(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height);
-    // Buffer-to-buffer staged upload. Queues a copy that flushUploads issues
-    // before the render pass begins. Used by path-mesh cache inserts.
-    void upload(Memory::L2::Allocation src, VkBuffer dst,
-                VkDeviceSize size, VkDeviceSize dstOffset = 0);
-    void flushUploads(VkCommandBuffer cmd);
-
     void submitImmediate(std::function<void(VkCommandBuffer)> fn);
-
-    void retire(Image&& image);
-    void retire(Buffer&& buffer);
-    void flushRetired(int frameSlot);
 
     ResourceCaches& caches();
     void initCaches();
@@ -81,30 +96,6 @@ private:
     Memory::L1 pool_;
     Memory::L2 staging_;
     Memory::M  bindings_;
-
-    struct PendingUpload {
-        VkImage      dstImage;
-        uint32_t     width, height;
-        VkBuffer     srcBuffer;
-        VkDeviceSize srcOffset;
-    };
-    std::vector<PendingUpload> pendingUploads_;
-
-    struct PendingBufferUpload {
-        VkBuffer     dstBuffer;
-        VkDeviceSize dstOffset;
-        VkDeviceSize size;
-        VkBuffer     srcBuffer;
-        VkDeviceSize srcOffset;
-    };
-    std::vector<PendingBufferUpload> pendingBufferUploads_;
-
-    static constexpr int MAX_FRAMES = 2;
-    struct RetiredResources {
-        std::vector<Image>  images;
-        std::vector<Buffer> buffers;
-    };
-    RetiredResources retired_[MAX_FRAMES];
 
     std::unique_ptr<ResourceCaches> caches_;
 

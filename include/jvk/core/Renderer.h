@@ -12,6 +12,7 @@ class ShaderPipeline;
 class PathPipeline;
 class ClipPipeline;
 class CommandScheduler;
+class GradientAtlas;   // defined in Cache.h (included after this header)
 
 // =============================================================================
 // UIVertex — shared vertex format for 2D pipelines
@@ -506,9 +507,66 @@ public:
     void setClipPipeline(ClipPipeline* p) { clipPipeline_ = p; }
     ClipPipeline* clipPipeline() const { return clipPipeline_; }
 
+    // ---- Deferred uploads ---------------------------------------------------
+    //
+    // Every texture / buffer GPU upload triggered during record (image cache
+    // inserts, glyph-atlas dirty pages, gradient-atlas row uploads, path-mesh
+    // buffer inserts) queues into THIS Renderer's pending list. flushUploads
+    // records the copy + barrier commands into the frame's command buffer
+    // just before the scene render pass. Keeping the queue on the Renderer —
+    // not Device — means each editor's worker drains its own queue and two
+    // editors never race on a shared vector.
+    void upload(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height);
+    void upload(Memory::L2::Allocation src, VkBuffer dst,
+                VkDeviceSize size, VkDeviceSize dstOffset = 0);
+    void flushUploads(VkCommandBuffer cmd);
+
+    // Record a single image-copy upload (TRANSFER_DST barrier → copy →
+    // SHADER_READ_ONLY barrier) into `cmd` directly. Use for one-shot
+    // setup uploads that have to run before any Renderer exists
+    // (Device::submitImmediate bootstrap paths). Per-frame work should go
+    // through upload()/flushUploads() so it batches with the scene.
+    static void recordImageUpload(VkCommandBuffer cmd, Memory::L2::Allocation src,
+                                   VkImage dst, uint32_t width, uint32_t height);
+
+    // ---- Deferred destruction ----------------------------------------------
+    //
+    // Per-frame-slot deletion queues. Resources that get replaced mid-frame
+    // (e.g. vertex-ring-buffer growth) move into this slot's bucket. The
+    // bucket's flush runs at the top of the NEXT time this slot rolls around,
+    // which is after target_.beginFrame() has waited on the slot's fence —
+    // so the GPU is provably done with whatever we're about to destroy.
+    // Per-Renderer (not per-Device) so two editors' workers never share the
+    // same bucket vector.
+    void retire(Image&& img)    { retired_[activeRetireSlot_].retire(std::move(img)); }
+    void retire(Buffer&& buf)   { retired_[activeRetireSlot_].retire(std::move(buf)); }
+
     // Capture non-POD types into side vectors. Returns index.
+    //
+    // captureFill dedups: two visually-identical FillTypes share an
+    // index. This matters for Fuse-mode batching — each command's
+    // stateKey encodes fillIndex in its resourceKey bits, so two paints
+    // with the same colour / gradient get the same stateKey and collapse
+    // into one instanced dispatch. Without this dedup, the 6 pedal
+    // titles (all same gradient) each get a unique fillIndex → unique
+    // stateKey → no fusion, even though they're visually identical.
+    //
+    // Full linear scan — UI record workloads land in the ~100-200
+    // unique-fill range per frame, so O(N²) matches are still only a
+    // handful of thousand integer compares in the hot path. If a
+    // pathological frame ever pushes fills_ into the 10k range this
+    // should promote to a hash bucket, but for every plugin UI in
+    // sight that's premature.
     uint32_t captureFont(const juce::Font& f)     { fonts_.push_back(f); return static_cast<uint32_t>(fonts_.size() - 1); }
-    uint32_t captureFill(const juce::FillType& f)  { fills_.push_back(f); return static_cast<uint32_t>(fills_.size() - 1); }
+    uint32_t captureFill(const juce::FillType& f)
+    {
+        const int n = static_cast<int>(fills_.size());
+        for (int i = n - 1; i >= 0; --i)
+            if (fillTypeEquals(fills_[i], f))
+                return static_cast<uint32_t>(i);
+        fills_.push_back(f);
+        return static_cast<uint32_t>(fills_.size() - 1);
+    }
 
     const juce::Font&     getFont(uint32_t i) const { return fonts_[i]; }
     const juce::FillType& getFill(uint32_t i) const { return fills_[i]; }
@@ -531,8 +589,10 @@ public:
     // single-writer worker-thread call site; do not use during record.
     Arena& arenaMut() { return arena_; }
 
-    // Defined out-of-line in Renderer.cpp — the body touches RenderTarget,
-    // which is only forward-declared at this point in the header.
+    // Per-frame reset: drop the command list, arena, captured non-POD types,
+    // and the gradient atlas's per-frame state. Out-of-line because both
+    // RenderTarget (forward-declared here) and GradientAtlas (unique_ptr
+    // member) are only fully defined later.
     void reset();
 
     // Defined in Renderer.cpp. Called from execute() after the scheduler
@@ -545,6 +605,34 @@ public:
     // loop can issue batched vkCmdDraw(6, primCount, 0, firstInstance)
     // calls without touching upload order.
     void uploadScheduledPrimitives();
+
+    // FillType equality for captureFill dedup. juce::FillType doesn't
+    // define operator==, so we roll our own value-compare: identical
+    // solid colour, or identical gradient (stops, points, radial flag).
+    // Returns true when two fills produce the same SSBO descriptor /
+    // gradient atlas row at dispatch — i.e. when collapsing them into a
+    // single fillIndex is visually lossless.
+    static bool fillTypeEquals(const juce::FillType& a,
+                               const juce::FillType& b) noexcept
+    {
+        if (a.isColour() != b.isColour()) return false;
+        if (a.isColour())
+            return a.colour.getARGB() == b.colour.getARGB();
+        if (!a.gradient || !b.gradient) return false;
+        const auto& ga = *a.gradient;
+        const auto& gb = *b.gradient;
+        if (ga.isRadial != gb.isRadial) return false;
+        if (ga.point1   != gb.point1)   return false;
+        if (ga.point2   != gb.point2)   return false;
+        const int nc = ga.getNumColours();
+        if (nc != gb.getNumColours())   return false;
+        for (int i = 0; i < nc; ++i)
+        {
+            if (ga.getColour(i).getARGB()   != gb.getColour(i).getARGB())   return false;
+            if (ga.getColourPosition(i)     != gb.getColourPosition(i))     return false;
+        }
+        return true;
+    }
 
     // (Removed finalizeScopes — subtreeBounds is now computed inside
     // CommandScheduler's peer-depth pre-pass, from the same underlying data.)
@@ -562,11 +650,32 @@ public:
     // inside execute().
     CommandScheduler& commandScheduler() { return *scheduler_; }
 
+    // Per-Renderer staging allocator for per-frame CPU→GPU uploads (glyph
+    // atlas pages, gradient atlas rows, texture cache inserts, etc.).
+    // Device's shared staging is retained only for the one-shot black-pixel
+    // bootstrap inside Device::initCaches. Keeping per-frame staging
+    // per-Renderer means the bump allocator is only ever touched by one
+    // editor's threads, not shared across instances.
+    Memory::L2&     staging() { return staging_; }
+
+    // ---- Gradient atlas (per-Renderer) -------------------------------------
+    //
+    // One gradient atlas per Renderer — mutated on the message thread during
+    // record (registerGradient) and uploaded to the GPU from the worker
+    // thread (stageUploads inside execute). Keeping it per-Renderer keeps
+    // those two threads inside one editor only, so two editors never race
+    // on cursor_/hashToRow_/cpuBuffer_. Accessors are out-of-line so this
+    // header only needs a forward declaration of GradientAtlas.
+    GradientAtlas&  gradients();
+    float           registerGradient(const juce::ColourGradient& g);
+    VkDescriptorSet gradientDescriptor() const;
+
 private:
     Device&       device_;
     RenderTarget& target_;
     State         state_;
     Memory::V     vertices_;
+    Memory::L2    staging_;
 
     std::vector<DrawCommand> commands_;
     Arena                    arena_;
@@ -587,6 +696,37 @@ private:
     // Non-POD captures (proper RAII, cleared each frame)
     std::vector<juce::Font>     fonts_;
     std::vector<juce::FillType> fills_;
+
+    // Pending uploads queued during record; drained by flushUploads at the
+    // top of execute(). Per-Renderer so two editors never share this vector.
+    struct PendingUpload {
+        VkImage      dstImage;
+        uint32_t     width, height;
+        VkBuffer     srcBuffer;
+        VkDeviceSize srcOffset;
+    };
+    struct PendingBufferUpload {
+        VkBuffer     dstBuffer;
+        VkDeviceSize dstOffset;
+        VkDeviceSize size;
+        VkBuffer     srcBuffer;
+        VkDeviceSize srcOffset;
+    };
+    std::vector<PendingUpload>       pendingUploads_;
+    std::vector<PendingBufferUpload> pendingBufferUploads_;
+
+    // Deferred-destruction buckets, keyed by frame slot. execute() sets
+    // activeRetireSlot_ to the current frame's slot at entry so any retire()
+    // calls made during that execute's prepare/upload phase go into the
+    // matching bucket, then flushes that bucket at the top of the NEXT time
+    // the same slot is used (post-fence-wait). Matches MAX_FRAMES_IN_FLIGHT.
+    static constexpr int kRetireSlots = 2;
+    std::array<jvk::core::DeletionQueue, kRetireSlots> retired_ {};
+    int activeRetireSlot_ = 0;
+
+    // Per-Renderer gradient atlas (see public accessors above for rationale).
+    // unique_ptr so this header only needs a forward declaration.
+    std::unique_ptr<GradientAtlas> gradientAtlas_;
 
     // FrameRetained pins gathered during record (msg thread). At execute
     // time these are moved into retainsBySlot_[slot]; they get unpinned the
@@ -617,17 +757,22 @@ private:
     ClipPipeline*      clipPipeline_     = nullptr;
     uint64_t frameCounter_ = 0;
 
+public:
     // ---- Threading ---------------------------------------------------------
-    // Vulkan's VkQueue requires external synchronization. Multiple editors
-    // share Device's single graphics/present queue, so every queue-submitting
-    // Renderer serializes through this lock. Contention is only across
-    // editors (within one editor the worker is the sole submitter), and only
-    // during the brief submit/present window — not all of execute().
+    // Vulkan's VkQueue requires external synchronization (spec §4.2.1).
+    // Every code path that submits to or waits on the shared graphics queue
+    // MUST take this lock for the full submit+present+wait window:
+    //   - Renderer::execute → target_.endFrame (vkQueueSubmit + vkQueuePresentKHR)
+    //   - Device::submitImmediate (vkQueueSubmit + vkQueueWaitIdle, one-shot
+    //     staging uploads during setup)
+    // Contention is only across editors; within a single editor the worker
+    // is the sole submitter and the lock is uncontended.
     static juce::CriticalSection& queueLock()
     {
         static juce::CriticalSection lock;
         return lock;
     }
+private:
 
     class Worker : public juce::Thread
     {

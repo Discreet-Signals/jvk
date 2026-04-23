@@ -17,8 +17,10 @@ public:
     virtual void execute(Renderer& r, const Arena& arena, const DrawCommand& cmd) = 0;
 
     // Called once per frame before the render pass. Pipelines stage pending
-    // uploads (atlas pages, deferred textures) here. Default is no-op.
-    virtual void prepare() {}
+    // uploads (atlas pages, deferred textures) here — push to the Renderer's
+    // upload queue, NOT Device's, so two editors' workers never share the
+    // queue. Default is no-op.
+    virtual void prepare(Renderer& r) { (void)r; }
 
     void loadVertexShader(std::span<const uint32_t> spirv);
     void loadFragmentShader(std::span<const uint32_t> spirv);

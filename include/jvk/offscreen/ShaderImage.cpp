@@ -93,9 +93,15 @@ ShaderImage::ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
     createDescriptors();
     createPipeline();
 
+    VkCommandPoolCreateInfo cpci {};
+    cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    cpci.queueFamilyIndex = device_->graphicsFamily();
+    cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    vkCreateCommandPool(device_->device(), &cpci, nullptr, &commandPool_);
+
     VkCommandBufferAllocateInfo cbai {};
     cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cbai.commandPool = device_->commandPool();
+    cbai.commandPool = commandPool_;
     cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cbai.commandBufferCount = 2;
     vkAllocateCommandBuffers(device_->device(), &cbai, commandBuffer);
@@ -120,8 +126,11 @@ ShaderImage::~ShaderImage()
     for (int i = 0; i < 2; i++)
         if (fence[i]) vkDestroyFence(dev, fence[i], nullptr);
 
-    if (commandBuffer[0] || commandBuffer[1])
-        vkFreeCommandBuffers(dev, device_->commandPool(), 2, commandBuffer);
+    // Destroying the command pool auto-frees both command buffers.
+    if (commandPool_ != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(dev, commandPool_, nullptr);
+        commandPool_ = VK_NULL_HANDLE;
+    }
 
     destroyPipeline();
     destroyDescriptors();
@@ -362,24 +371,48 @@ void ShaderImage::destroyDescriptors()
 
 void ShaderImage::loadTexture(int binding, const juce::Image& image)
 {
-    VkDevice dev = device_->device();
-    if (!dev) return;
-
-    TextureSlot* slot = nullptr;
-    DescriptorSetInfo* ownerSet = nullptr;
-    for (auto& dsi : descriptorSets)
-        for (auto& tex : dsi.textures)
-            if (tex.binding == binding) { slot = &tex; ownerSet = &dsi; break; }
-
-    if (!slot || !ownerSet)
+    // Pure CPU-side stash. The destroy / upload / descriptor-write work
+    // that used to run here (gated on vkDeviceWaitIdle) now runs inside
+    // render() under a two-fence wait — no device-wide stall. Collapse
+    // duplicate requests for the same binding so only the most recent
+    // image is applied when render() next drains the queue.
+    for (auto& p : pendingTextureLoads_)
     {
-        DBG("ShaderImage: No sampler binding " << binding << " in shader");
-        return;
+        if (p.binding == binding) { p.image = image; return; }
     }
+    pendingTextureLoads_.push_back({ binding, image });
+}
 
-    vkDeviceWaitIdle(dev);
+void ShaderImage::applyPendingTextureLoads()
+{
+    if (pendingTextureLoads_.empty()) return;
+    VkDevice dev = device_->device();
+    if (!dev) { pendingTextureLoads_.clear(); return; }
 
-    if (slot->sampler) { vkDestroySampler(dev, slot->sampler, nullptr); slot->sampler = VK_NULL_HANDLE; }
+    // Both render cmdbufs may still be bound to the current descriptor
+    // set's old texture. Wait on just this ShaderImage's two fences
+    // (instead of vkDeviceWaitIdle) so other editors' Renderers are
+    // unaffected — same cheap pattern setSize() uses.
+    vkWaitForFences(dev, 2, fence, VK_TRUE, UINT64_MAX);
+
+    for (auto& pend : pendingTextureLoads_)
+    {
+        const int binding = pend.binding;
+        const juce::Image& image = pend.image;
+
+        TextureSlot* slot = nullptr;
+        DescriptorSetInfo* ownerSet = nullptr;
+        for (auto& dsi : descriptorSets)
+            for (auto& tex : dsi.textures)
+                if (tex.binding == binding) { slot = &tex; ownerSet = &dsi; break; }
+
+        if (!slot || !ownerSet)
+        {
+            DBG("ShaderImage: No sampler binding " << binding << " in shader");
+            continue;
+        }
+
+        if (slot->sampler) { vkDestroySampler(dev, slot->sampler, nullptr); slot->sampler = VK_NULL_HANDLE; }
     if (slot->view)    { vkDestroyImageView(dev, slot->view, nullptr); slot->view = VK_NULL_HANDLE; }
     if (slot->image)   { vkDestroyImage(dev, slot->image, nullptr); slot->image = VK_NULL_HANDLE; }
     if (slot->alloc.memory != VK_NULL_HANDLE) { device_->pool().free(slot->alloc); slot->alloc = {}; }
@@ -497,7 +530,10 @@ void ShaderImage::loadTexture(int binding, const juce::Image& image)
     wds.pImageInfo = &dii;
     vkUpdateDescriptorSets(dev, 1, &wds, 0, nullptr);
 
-    slot->loaded = true;
+        slot->loaded = true;
+    }
+
+    pendingTextureLoads_.clear();
 }
 
 // =============================================================================
@@ -664,6 +700,12 @@ void ShaderImage::render()
     if (!ready) return;
     VkDevice dev = device_->device();
 
+    // Drain any loadTexture() calls made on the message thread since the
+    // last render. Internally waits on both fences so destroy/recreate of
+    // the sampler/view/image is safe. Done before the normal per-frame
+    // fence wait so applyPendingTextureLoads's 2-fence wait subsumes it.
+    applyPendingTextureLoads();
+
     int prev = 1 - frameIndex;
     int curr = frameIndex;
 
@@ -760,7 +802,14 @@ void ShaderImage::render()
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer[curr];
-    vkQueueSubmit(device_->graphicsQueue(), 1, &submitInfo, fence[curr]);
+    {
+        // VkQueue external-sync: this runs on ShaderImage's own render timer
+        // (message thread) and shares Device::graphicsQueue_ with every
+        // editor's jvk-render-worker and with Device::submitImmediate. All
+        // queue-touching paths serialize through Renderer::queueLock().
+        const juce::ScopedLock queueSync(Renderer::queueLock());
+        vkQueueSubmit(device_->graphicsQueue(), 1, &submitInfo, fence[curr]);
+    }
 
     frameIndex = prev;
 }

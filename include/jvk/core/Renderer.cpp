@@ -23,14 +23,35 @@ std::vector<Renderer*>& Renderer::registry()
 Renderer::Renderer(Device& device, RenderTarget& target)
     : device_(device), target_(target),
       vertices_(device.physicalDevice(), device.device()),
+      staging_(device.physicalDevice(), device.device()),
       scheduler_(std::make_unique<CommandScheduler>()),
+      gradientAtlas_(std::make_unique<GradientAtlas>()),
       worker_(std::make_unique<Worker>(*this))
 {
+    // Init the per-Renderer gradient atlas now that Device is ready (it
+    // allocates a backing Image from device.pool() and a descriptor set
+    // from device.bindings()).
+    gradientAtlas_->init(device);
+
     {
         const juce::ScopedLock lk(registryLock());
         registry().push_back(this);
     }
     worker_->startThread();
+}
+
+// ---- Gradient-atlas accessors (out-of-line; header forward-declares type) --
+
+GradientAtlas& Renderer::gradients() { return *gradientAtlas_; }
+
+float Renderer::registerGradient(const juce::ColourGradient& g)
+{
+    return gradientAtlas_->getRow(g, ResourceCaches::hashGradient(g));
+}
+
+VkDescriptorSet Renderer::gradientDescriptor() const
+{
+    return gradientAtlas_->descriptorSet();
 }
 
 // Worker is the last-declared member, so under default destruction it would
@@ -54,9 +75,10 @@ Renderer::~Renderer()
 }
 
 // =============================================================================
-// Per-frame reset — clears record buffers and reseeds the scope tree with a
-// root scope matching the current render target. Out-of-line because the
-// header only forward-declares RenderTarget.
+// Per-frame reset — clears record buffers, reseeds the scope tree with a
+// root scope matching the current render target, and resets the gradient
+// atlas's per-frame state. Out-of-line because the header only
+// forward-declares both RenderTarget and GradientAtlas.
 // =============================================================================
 
 void Renderer::reset()
@@ -74,6 +96,11 @@ void Renderer::reset()
                       static_cast<int>(target_.height()) };
     scopes_.push_back(root);
     currentScopeId_ = 0;
+
+    // Per-frame gradient atlas reset. Runs on the message thread (called from
+    // the editor's render timer) — same thread that does registerGradient
+    // during paint, so no sync needed.
+    gradientAtlas_->beginFrame();
 }
 
 // =============================================================================
@@ -257,6 +284,93 @@ void FrameRetained::waitUntilUnretained() const noexcept
 }
 
 // =============================================================================
+// Deferred uploads (L2 staging → image / buffer, flushed into the frame's
+// command buffer just before the scene render pass).
+// =============================================================================
+
+void Renderer::upload(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height)
+{
+    pendingUploads_.push_back({ dst, width, height, src.buffer, src.offset });
+}
+
+void Renderer::upload(Memory::L2::Allocation src, VkBuffer dst,
+                      VkDeviceSize size, VkDeviceSize dstOffset)
+{
+    pendingBufferUploads_.push_back({ dst, dstOffset, size, src.buffer, src.offset });
+}
+
+void Renderer::recordImageUpload(VkCommandBuffer cmd, Memory::L2::Allocation src,
+                                  VkImage dst, uint32_t width, uint32_t height)
+{
+    VkImageMemoryBarrier barrier {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = dst;
+    barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    VkBufferImageCopy region {};
+    region.bufferOffset = src.offset;
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageExtent = { width, height, 1 };
+
+    vkCmdCopyBufferToImage(cmd, src.buffer, dst,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+void Renderer::flushUploads(VkCommandBuffer cmd)
+{
+    if (pendingUploads_.empty() && pendingBufferUploads_.empty()) return;
+    jvk::debug::ScopedLabel _lbl { cmd, "FlushUploads" };
+    for (auto& u : pendingUploads_) {
+        // The pending-upload struct carries the L2 allocation broken out into
+        // (srcBuffer, srcOffset); repack so we can share recordImageUpload.
+        Memory::L2::Allocation src { nullptr, u.srcBuffer, u.srcOffset };
+        recordImageUpload(cmd, src, u.dstImage, u.width, u.height);
+    }
+    pendingUploads_.clear();
+
+    for (auto& u : pendingBufferUploads_) {
+        VkBufferCopy region {};
+        region.srcOffset = u.srcOffset;
+        region.dstOffset = u.dstOffset;
+        region.size      = u.size;
+        vkCmdCopyBuffer(cmd, u.srcBuffer, u.dstBuffer, 1, &region);
+
+        VkBufferMemoryBarrier bb {};
+        bb.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        bb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        bb.dstAccessMask = VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+        bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        bb.buffer = u.dstBuffer;
+        bb.offset = u.dstOffset;
+        bb.size   = u.size;
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+            0, 0, nullptr, 1, &bb, 0, nullptr);
+    }
+    pendingBufferUploads_.clear();
+}
+
+// =============================================================================
 // Pipeline registration
 // =============================================================================
 
@@ -275,12 +389,36 @@ void Renderer::execute()
 {
     auto frame = target_.beginFrame();
     if (frame.cmd == VK_NULL_HANDLE) {
-        // Frame skipped (e.g. swapchain out of date). The recording retains
-        // were pinned but no GPU command buffer ever referenced them, so
-        // it's safe to unpin immediately. Without this they'd leak across
-        // every skipped frame and indefinitely block any matching dtor.
-        for (auto* obj : recordingRetains_) obj->unpin();
-        recordingRetains_.clear();
+        // Swapchain acquire returned VK_NULL_HANDLE — typically
+        // VK_ERROR_OUT_OF_DATE_KHR during a resize / DPI-change / window
+        // minimise. Leave `recordingRetains_`, `pendingUploads_`, and
+        // `pendingBufferUploads_` intact; they'll be drained by the next
+        // successful execute.
+        //
+        // Why NOT unpin / clear here: `getTexture` inserts a CachedImage
+        // into the process-wide `ResourceCaches::textures_` cache, pins it
+        // into `recordingRetains_`, and pushes the raw VkImage handle into
+        // `pendingUploads_`. The pin is the only thing stopping a sibling
+        // editor's `beginFrame → textures_.evict` from destroying the
+        // CachedImage while its VkImage sits in our upload queue. Dropping
+        // the pin here opens a window where Cache::evict sees `isPinned()
+        // == false`, destroys the entry via `vkDestroyImage`, and the
+        // next successful execute's flushUploads records
+        // vkCmdCopyBufferToImage against a freed handle → validation error
+        // at best, GPU fault or memory corruption in release.
+        //
+        // Clearing `pendingUploads_` alongside the unpin would avoid the
+        // use-after-free but introduce a different bug: the cache entry
+        // stays inserted but its pixels were never uploaded, so any
+        // subsequent `getTexture` hit returns a descriptor whose backing
+        // VkImage is in UNDEFINED layout — sampling that is UB.
+        //
+        // Keeping both alive across skips is correct and cheap: retains
+        // cost ~8 bytes each, pendingUploads entries ~40 bytes, and the
+        // next successful execute clears both. If a FrameRetained dtor
+        // fires on the message thread during persistent skips, its
+        // `waitUntilUnretained → forceDrainAll` path still clears
+        // `recordingRetains_` via `flushRetains` — no deadlock.
         return;
     }
 
@@ -301,9 +439,20 @@ void Renderer::execute()
     const float frameTime = device_.time();
 
     vertices_.beginFrame(frame.frameSlot);
-    device_.flushRetired(frame.frameSlot);
 
-    // Pipeline prepare (atlas dirty pages, etc.) and gradient/texture uploads
+    // target_.beginFrame() above waited on this slot's fence, so the GPU is
+    // done with every resource we moved into this slot's retire bucket the
+    // LAST time this slot rolled around. Safe to destroy now. Subsequent
+    // retire() calls during this execute go into THIS slot's bucket and
+    // won't be touched until the slot next comes around.
+    activeRetireSlot_ = frame.frameSlot % kRetireSlots;
+    retired_[activeRetireSlot_].flush();
+
+    // Pipeline prepare (atlas dirty pages, etc.) and gradient/texture uploads.
+    // Each pipeline pushes its pending uploads onto *this* Renderer's queue,
+    // not Device's — so two editors' workers never share the upload vector.
+    // Mostly CPU work (stages queue entries); actual GPU work lands in
+    // flushUploads below, which has its own debug label.
     {
         Pipeline* seen[static_cast<size_t>(DrawOp::COUNT)] = {};
         int n = 0;
@@ -311,10 +460,10 @@ void Renderer::execute()
             if (!p) continue;
             bool dup = false;
             for (int i = 0; i < n; i++) if (seen[i] == p) { dup = true; break; }
-            if (!dup) { seen[n++] = p; p->prepare(); }
+            if (!dup) { seen[n++] = p; p->prepare(*this); }
         }
     }
-    device_.caches().gradientAtlas().stageUploads();
+    gradientAtlas_->stageUploads(*this);
     // Flush record-phase path/clip segments into THIS frame slot's SSBO.
     // Safe now because target_.beginFrame() above waited on this slot's
     // fence, so the GPU is done reading this slot's buffer from 2 frames
@@ -350,9 +499,11 @@ void Renderer::execute()
     if (clipPipeline_) clipPipeline_->flushToGPU(frame.frameSlot);
     if (fillPipeline_) {
         fillPipeline_->flushToGPU(frame.frameSlot);
-        fillPipeline_->prepareFrame();
+        fillPipeline_->prepareFrame(*this);
     }
-    device_.flushUploads(frame.cmd);
+    // Per-Renderer upload queue (safety: Device's shared queue no longer
+    // exists — each editor's worker drains its own pending uploads here).
+    flushUploads(frame.cmd);
 
     auto const& sb = target_.sceneBuffers(frame.frameSlot);
 
@@ -398,6 +549,12 @@ void Renderer::execute()
     VkRenderPass sceneBuildRP  = target_.sceneRenderPassClear(); // compat for build
 
     auto beginSceneRP = [&](VkRenderPass rp, bool withClears) {
+        // Emit a debug-utils label that envelops the scene RP body so GPU
+        // profilers show "Scene (clear)" / "Scene (load)" instead of
+        // anonymous RenderEncoders. Matched by endSceneRP below — never
+        // nest this beside an effect pipeline's own applyPass scope.
+        jvk::debug::beginLabel(frame.cmd, withClears ? "Scene (clear)" : "Scene (load)");
+
         VkRenderPassBeginInfo rpbi {};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpbi.renderPass = rp;
@@ -424,6 +581,15 @@ void Renderer::execute()
         state_.invalidate();
     };
 
+    // Matches beginSceneRP. Call at every site that would otherwise just do
+    // `vkCmdEndRenderPass(frame.cmd)` on the scene pass — closes the RP first
+    // then emits the endLabel so the label scope is perfectly aligned with
+    // the pass.
+    auto endSceneRP = [&]() {
+        vkCmdEndRenderPass(frame.cmd);
+        jvk::debug::endLabel(frame.cmd);
+    };
+
     // Runs a single post-process pass (caller provides the dispatch via
     // `applyPass`) and swaps the active half. Must be called between a
     // vkCmdEndRenderPass and the matching resume of the scene RP.
@@ -447,6 +613,7 @@ void Renderer::execute()
     auto effectPassAndSwap = [&](auto applyPass) {
         int dst = cur ^ 1;
         if (copyEffect_) {
+            jvk::debug::ScopedLabel _seed { frame.cmd, "Effect:SeedCopy" };
             copyEffect_->applyPass(frame.cmd,
                 pp[cur].sampler, pp[dst].effectFB, target_.effectRenderPass(),
                 frame.extent,
@@ -480,7 +647,7 @@ void Renderer::execute()
 
         if (needsSceneEnded) {
             if (sceneOpen) {
-                vkCmdEndRenderPass(frame.cmd);
+                endSceneRP();
                 sceneOpen = false;
             }
         } else {
@@ -501,12 +668,14 @@ void Renderer::execute()
             if (postProcess_) {
                 auto& bp = arena_.read<BlurParams>(cmd.dataOffset);
                 effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
+                    jvk::debug::ScopedLabel _h { frame.cmd, "Effect:KernelH" };
                     postProcess_->applyPass(frame.cmd, src, dst,
                         target_.effectRenderPass(), frame.extent,
                         1.0f, 0.0f, bp.radius,
                         static_cast<uint32_t>(cmd.stencilDepth));
                 });
                 effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
+                    jvk::debug::ScopedLabel _v { frame.cmd, "Effect:KernelV" };
                     postProcess_->applyPass(frame.cmd, src, dst,
                         target_.effectRenderPass(), frame.extent,
                         0.0f, 1.0f, bp.radius,
@@ -584,8 +753,11 @@ void Renderer::execute()
 
             auto colorDescFor = [&](uint32_t fillIndex) -> VkDescriptorSet {
                 auto& fill = getFill(fillIndex);
+                // Per-Renderer gradient atlas (safety): each editor owns its
+                // own GradientAtlas + descriptor, so two editors' workers
+                // never race on shared cache state here.
                 return (fill.isGradient() && fill.gradient)
-                    ? caches().gradientDescriptor()
+                    ? gradientDescriptor()
                     : defaultDesc;
             };
 
@@ -610,8 +782,12 @@ void Renderer::execute()
                 }
                 case DrawOp::DrawImage: {
                     auto& ref = arena_.read<FillImageDispatchRef>(cmd.dataOffset);
-                    auto* tcache = caches().textures().find(ref.imageHash);
-                    VkDescriptorSet imgDesc = tcache ? tcache->descriptorSet : defaultDesc;
+                    // Safety: descriptor was resolved + pinned on the message
+                    // thread at record time (see Graphics::drawImage). The
+                    // worker thread never touches the shared texture cache
+                    // for this draw, so there's no race against sibling
+                    // editors' concurrent inserts/evictions.
+                    VkDescriptorSet imgDesc = ref.textureDesc ? ref.textureDesc : defaultDesc;
                     fillPipeline_->dispatch(state_, frame.cmd,
                         /*colorLUT*/ defaultDesc,  // image supplies RGB; LUT unused
                         pathDesc,
@@ -663,13 +839,19 @@ void Renderer::execute()
                 auto& sp = arena_.read<DrawShaderParams>(cmd.dataOffset);
                 auto* shader = static_cast<Shader*>(sp.shader);
                 if (shader) {
+                    // insertLabel (not scoped) — DrawShader runs inside the
+                    // open scene RP, so a nested begin/end would break the
+                    // scene label's bracketing. Instead, leave a one-shot
+                    // marker that profilers render as a tick in the timeline.
+                    jvk::debug::insertLabel(frame.cmd, "DrawShader");
                     shaderPipeline_->dispatch(state_, frame.cmd, *shader,
                         sp.region,
                         static_cast<float>(frame.extent.width),
                         static_cast<float>(frame.extent.height),
                         cmd.clipBounds,
                         cmd.stencilDepth,
-                        frameTime);
+                        frameTime,
+                        frame.frameSlot);
                 }
             }
             continue;
@@ -684,6 +866,7 @@ void Renderer::execute()
                 pc.scaleH = hp.scaleH; pc.scaleS = hp.scaleS; pc.scaleV = hp.scaleV;
                 pc.deltaH = hp.deltaH; pc.deltaS = hp.deltaS; pc.deltaV = hp.deltaV;
                 effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
+                    jvk::debug::ScopedLabel _hsv { frame.cmd, "Effect:HSV" };
                     hsvPipeline_->applyPass(frame.cmd, src, dst,
                         target_.effectRenderPass(), frame.extent, pc,
                         static_cast<uint32_t>(cmd.stencilDepth));
@@ -738,6 +921,20 @@ void Renderer::execute()
                         dy = (passIx == 0) ? 0.0f : 1.0f;
                     }
                     effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
+                        // "Effect:BlurShape(Low/Mid/High)" / "Effect:BlurPath(...)"
+                        // so profiles distinguish which blur kernel and op
+                        // fired. kt==0 runs H and V as separate dispatches,
+                        // so a single BlurShape command shows up as two
+                        // labelled passes in that case.
+                        const char* name =
+                            (cmd.op == DrawOp::BlurShape)
+                            ? ((kt == 0) ? "Effect:BlurShape (Low sep)"
+                             : (kt == 1) ? "Effect:BlurShape (Mid Vogel)"
+                                         : "Effect:BlurShape (High 2D LST)")
+                            : ((kt == 0) ? "Effect:BlurPath (Low sep)"
+                             : (kt == 1) ? "Effect:BlurPath (Mid Vogel)"
+                                         : "Effect:BlurPath (High 2D LST)");
+                        jvk::debug::ScopedLabel _b { frame.cmd, name };
                         blurPipeline_->applyPass(frame.cmd, src, pathDesc,
                             dst, rp, frame.extent, scissor,
                             ref.firstInstance, ref.primCount,
@@ -760,7 +957,7 @@ void Renderer::execute()
     // ended on an effect op (blur, HSV, etc.), the scene pass is already
     // closed and the output is already in the correct ping-pong half.
     if (sceneOpen)
-        vkCmdEndRenderPass(frame.cmd);
+        endSceneRP();
 
     // After the command stream, `cur` is the index of whichever ping-pong
     // half holds the final composited frame. An odd number of single-pass
@@ -785,6 +982,9 @@ void Renderer::execute()
 
     // Blit currentImage → swap image. currentImage is in SHADER_READ_ONLY
     // (finalLayout of the last scene RP). Transition both images and copy.
+    // Wrapped in a debug label so GPU captures separate the present blit
+    // from the prior scene / effect render passes.
+    jvk::debug::beginLabel(frame.cmd, "Present Blit");
     VkImageMemoryBarrier barriers[2] {};
     barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
@@ -841,6 +1041,8 @@ void Renderer::execute()
     vkCmdPipelineBarrier(frame.cmd,
         VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
         0, 0, nullptr, 0, nullptr, 1, &present);
+    // Close the "Present Blit" label scope opened before the first barrier.
+    jvk::debug::endLabel(frame.cmd);
 
     // Serialize queue submit+present against other editors sharing the Device's
     // VkQueue (Vulkan external sync requirement).

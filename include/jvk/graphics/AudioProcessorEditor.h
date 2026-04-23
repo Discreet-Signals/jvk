@@ -272,7 +272,14 @@ private:
         if (renderer_->isBusy()) return;
 
         renderer_->reset();
-        device_->caches().beginFrame(frameCounter_++);
+        // Process-wide monotonic tick. Every editor advances the SAME
+        // counter so the shared ResourceCaches::textures_ LRU (its only
+        // cross-instance structure) sees a coherent time axis — otherwise
+        // two editors with independent per-instance counters corrupt the
+        // `frame - lastUsedFrame > maxAge` comparison and evict entries
+        // that are still in flight on a sibling instance.
+        static std::atomic<uint64_t> s_globalFrameTick { 0 };
+        device_->caches().beginFrame(s_globalFrameTick.fetch_add(1, std::memory_order_relaxed));
         // Wipe the per-frame segment ring for the analytical-SDF path
         // renderer before JUCE paint fills it up again.
         if (pathPipeline_) pathPipeline_->beginFrame();
