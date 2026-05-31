@@ -36,6 +36,7 @@ enum class DrawOp : uint8_t {
     FillPath,           // analytical SDF path fill (vger-style)
     DrawShader,
     EffectBlend,
+    EffectNoise,        // procedural white-noise overlay (Graphics::drawNoise)
     EffectResolve,
     EffectKernel,
     EffectHSV,          // full-screen HSV scale/delta (saturate, shiftHue, etc.)

@@ -511,6 +511,28 @@ public:
             EffectBlendParams { 1.0f + amount * 0.2f, 1.0f, 1.0f - amount * 0.1f, region, displayScale_ });
     }
 
+    // Procedural white-noise overlay — GPU, pixel-perfect (a per-pixel hash of
+    // the device coordinate; no texture, no tiling). `amount` blends toward
+    // white noise: 0 = untouched, 1 = full overwrite, 0.1 = a fine grain. When
+    // `staticHash` is true the pattern is identical every frame; otherwise it
+    // animates. Honours the active clip (scissor + path stencil).
+    void drawNoise(float amount, bool staticHash, juce::Rectangle<float> region = {})
+    {
+        auto& s = state();
+        // state().clipBounds is in PHYSICAL (root) pixels; an explicit region is
+        // in the current logical space. Resolve both to physical and pass
+        // scale = 1 so the pipeline doesn't scale again — otherwise an offset
+        // region (e.g. a child component's clip) lands off-screen at HiDPI.
+        const juce::Rectangle<float> physRegion = region.isEmpty()
+            ? s.clipBounds.toFloat()
+            : region.transformedBy(s.transform.scaled(displayScale_));
+        const float timeOffset = staticHash
+            ? 0.0f
+            : static_cast<float>(juce::Time::getMillisecondCounter() & 0xFFFFu);
+        renderer_.push(DrawOp::EffectNoise, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+            NoiseParams { amount, timeOffset, physRegion, 1.0f });
+    }
+
     void blur(float radius, juce::Rectangle<float> region = {})
     {
         if (region.isEmpty()) region = state().clipBounds.toFloat();

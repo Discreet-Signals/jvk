@@ -179,6 +179,7 @@ private:
         hsvPipeline_.reset();
         copyEffect_.reset();
         blurEffect_.reset();
+        noisePipeline_.reset();
         blendPipeline_.reset();
         colorPipeline_.reset();
 
@@ -349,6 +350,13 @@ private:
             *device_, spv(vert_spv, vert_spvSize), spv(frag_spv, frag_spvSize));
         renderer_->registerPipeline(*blendPipeline_);
 
+        // Procedural noise overlay (Graphics::drawNoise). Same ui2d vertex
+        // shader; noise.frag hashes gl_FragCoord per device pixel, AlphaBlend.
+        noisePipeline_ = std::make_unique<pipelines::NoisePipeline>(
+            *device_, spv(vert_spv, vert_spvSize),
+            spv(shaders::noise::frag_spv, shaders::noise::frag_spvSize));
+        renderer_->registerPipeline(*noisePipeline_);
+
         // Generic post-process pipeline. Runs any single-input fullscreen
         // fragment shader as an intra-frame effect. Configured here for
         // separable Gaussian blur (StencilMode::Inside — writes only
@@ -465,6 +473,7 @@ private:
 
     std::unique_ptr<pipelines::ColorPipeline>         colorPipeline_;
     std::unique_ptr<pipelines::BlendPipeline>         blendPipeline_;
+    std::unique_ptr<pipelines::NoisePipeline>         noisePipeline_;
     std::unique_ptr<EffectPipeline>                   blurEffect_;
     std::unique_ptr<EffectPipeline>                   copyEffect_;
     std::unique_ptr<HSVPipeline>                      hsvPipeline_;

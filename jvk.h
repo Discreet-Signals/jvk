@@ -66,6 +66,7 @@
 
 // Shaders (embedded SPIR-V)
 #include "include/jvk/graphics/UI2DShaders.h"
+#include "include/jvk/graphics/NoiseShader.h"
 #include "include/jvk/graphics/ShaderRegionVert.h"
 
 // SPIRV-Reflect (for Shader.h)
@@ -78,6 +79,7 @@
 #include "include/jvk/graphics/pipelines/color/ColorPipeline.h"
 #include "include/jvk/graphics/pipelines/color/ColorDraw.h"
 #include "include/jvk/graphics/pipelines/blend/BlendPipeline.h"
+#include "include/jvk/graphics/pipelines/blend/NoisePipeline.h"
 #include "include/jvk/graphics/pipelines/effect/EffectPipeline.h"
 #include "include/jvk/graphics/pipelines/effect/HSVPipeline.h"
 #include "include/jvk/graphics/pipelines/effect/ShapeBlurPipeline.h"

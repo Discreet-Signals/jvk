@@ -206,6 +206,16 @@ struct EffectBlendParams {
     float                  scale;
 };
 
+// Procedural white-noise overlay (Graphics::drawNoise). `amount` is the alpha
+// blend toward white noise (0 = none, 1 = full overwrite); `timeOffset` shifts
+// the per-pixel hash per frame (0 = static / identical every frame).
+struct NoiseParams {
+    float                  amount;
+    float                  timeOffset;
+    juce::Rectangle<float> region;
+    float                  scale;
+};
+
 struct BlurParams {
     float                  radius;
     juce::Rectangle<float> region;
