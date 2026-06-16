@@ -92,6 +92,21 @@ public:
         if (renderer_) renderer_->flushRetains();
     }
 
+    // Opt-in override for the physical-pixel multiplier. Pass 1.0f to
+    // render at logical resolution (OS upscales into the native-pixel
+    // framebuffer — visibly softer, ¼ fragment work on a Retina
+    // display), 2.0f for native Retina, or anything in between. Any
+    // value <= 0 clears the override and restores the default behaviour
+    // (hard-coded 2× on macOS, peer::getPlatformScaleFactor on Windows).
+    // Triggers a swapchain rebuild so the new scale takes effect on the
+    // next frame.
+    void setDisplayScaleOverride(float scale)
+    {
+        if (displayScaleOverride_ == scale) return;
+        displayScaleOverride_ = scale;
+        updateVulkanTarget();
+    }
+
 protected:
     void paint(juce::Graphics& g) override
     {
@@ -101,6 +116,7 @@ protected:
 
     float getDisplayScale() const
     {
+        if (displayScaleOverride_ > 0.0f) return displayScaleOverride_;
 #if JUCE_MAC
         return 2.0f;
 #else
@@ -495,6 +511,11 @@ private:
     bool vulkanEnabled_ = true;
     bool vulkanAvailable_ = false;
     uint64_t frameCounter_ = 0;
+
+    // Optional opt-in override for getDisplayScale(). 0 = no override;
+    // positive values replace the per-platform default. Set via
+    // setDisplayScaleOverride(), read by getDisplayScale().
+    float displayScaleOverride_ = 0.0f;
 };
 
 } // namespace jvk
