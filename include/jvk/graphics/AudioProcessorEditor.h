@@ -114,6 +114,35 @@ protected:
 #endif
     }
 
+    // The scale that maps our LOGICAL coordinates (getWidth()/getHeight()) to
+    // the swapchain's PHYSICAL pixels — i.e. the factor jvk::Graphics must use
+    // so paint output fills the surface exactly.
+    //
+    // This is derived from the live surface size, NOT from getPlatformScaleFactor():
+    //   * On Windows VST3, hosts communicate DPI via setContentScaleFactor,
+    //     which JUCE applies as an AffineTransform on the editor (not on the
+    //     peer). getPlatformScaleFactor() stays 1.0 for the embedded plugin
+    //     window, so trusting it under-scales paint while the swapchain (sized
+    //     from the transform-scaled HWND) is full physical size — the classic
+    //     "renders into the top-left quarter" Cubase bug.
+    //   * On macOS the peer's getPlatformScaleFactor() is ALWAYS 1.0; the real
+    //     factor is the NSWindow backingScaleFactor (2.0 Retina, 1.0 not, and
+    //     it varies) — a hardcoded 2.0 is wrong on non-Retina displays.
+    //   * On Linux it happens to equal getPlatformScaleFactor(), but the
+    //     surface ratio is correct there too.
+    // target_->width() is the surface's true physical width (we size the
+    // swapchain from currentExtent), so width/getWidth() captures peer DPI AND
+    // the host content-scale transform on every platform, with no per-host
+    // special-casing. Falls back to the sizing estimate before the surface
+    // exists (the first render only happens once target_ is live, so the
+    // fallback is effectively never hit during paint).
+    float getPaintScale() const
+    {
+        if (target_ && getWidth() > 0 && getHeight() > 0)
+            return static_cast<float>(target_->width()) / static_cast<float>(getWidth());
+        return getDisplayScale();
+    }
+
 private:
     void init()
     {
@@ -202,10 +231,15 @@ private:
         device_.reset();
     }
 
-    // ComponentListener — fires even when subclass overrides resized()
-    void componentMovedOrResized(juce::Component&, bool, bool wasResized) override
+    // ComponentListener — fires even when subclass overrides resized().
+    // React to BOTH move and resize: a host DPI change arrives as a
+    // setContentScaleFactor → setTransform on the editor, which can change our
+    // on-screen (physical) size without changing our logical size — that
+    // surfaces as a move, not a resize. updateVulkanTarget compares against the
+    // real surface size, so a spurious call is a cheap no-op.
+    void componentMovedOrResized(juce::Component&, bool wasMoved, bool wasResized) override
     {
-        if (!wasResized) return;
+        if (!wasMoved && !wasResized) return;
         metalView_.setBounds(getLocalBounds());
         updateVulkanTarget();
     }
@@ -234,29 +268,48 @@ private:
     {
         if (!vulkanEnabled_) return;
 
-        // Scale may be 1.0 if the peer isn't attached yet (e.g. first
-        // componentMovedOrResized fired by setSize before the window is
-        // shown). We still init at whatever size we can — otherwise the
-        // first render never happens and the window stays blank until the
-        // user manually resizes. When the peer arrives later,
-        // parentHierarchyChanged / visibilityChanged re-enter here and
-        // target_->resize() picks up the corrected physical size.
-        float scale = getDisplayScale();
-        auto w = static_cast<uint32_t>(getWidth() * scale);
-        auto h = static_cast<uint32_t>(getHeight() * scale);
-        if (w == 0 || h == 0) return;
-
         if (!target_) {
+            // No surface yet — create one. The size passed here is only a hint:
+            // createSwapchain queries the surface's currentExtent and uses that
+            // (the real physical size) when available, so getDisplayScale being
+            // approximate (or 1.0 before the peer attaches) doesn't matter. We
+            // still need a non-zero hint for the Wayland-no-preferred-size
+            // fallback path. If we have no size at all, bail — the first render
+            // can't happen and parentHierarchyChanged/visibilityChanged will
+            // re-enter once the peer/bounds arrive.
+            float scale = getDisplayScale();
+            auto w = static_cast<uint32_t>(getWidth()  * scale);
+            auto h = static_cast<uint32_t>(getHeight() * scale);
+            if (w == 0 || h == 0) return;
             initVulkan(w, h);
             if (target_) renderTimer_.startTimerHz(60);
-        } else {
-            // resize destroys and recreates the swapchain. The worker must
-            // be idle — otherwise it could be mid-execute holding references
-            // to the swapchain images we're about to free. Brief wait
-            // (bounded by one execute duration) on this infrequent path.
-            renderer_->waitForIdle();
-            target_->resize(w, h);
+            return;
         }
+
+        // Surface exists: resize to the window/layer's TRUE physical size,
+        // queried straight from the driver. This is the authoritative size
+        // (HWND client area / CAMetalLayer drawableSize) and tracks both
+        // user-driven plugin resizes and host DPI changes. Only recreate when
+        // it actually changed — resize() destroys and rebuilds the swapchain,
+        // which is expensive and must not run every layout pass.
+        VkExtent2D want = target_->surfaceExtent();
+        if (want.width == 0xFFFFFFFFu) {
+            // Surface has no preferred size (some Wayland) — fall back to a
+            // logical*scale estimate so we still track resizes.
+            float scale = getDisplayScale();
+            want.width  = static_cast<uint32_t>(getWidth()  * scale);
+            want.height = static_cast<uint32_t>(getHeight() * scale);
+        }
+        if (want.width == 0 || want.height == 0) return; // minimized / hidden
+        if (want.width == target_->width() && want.height == target_->height())
+            return; // already correct
+
+        // resize destroys and recreates the swapchain. The worker must be idle
+        // — otherwise it could be mid-execute holding references to the
+        // swapchain images we're about to free. Brief wait (bounded by one
+        // execute duration) on this infrequent path.
+        renderer_->waitForIdle();
+        target_->resize(want.width, want.height);
     }
 
     void render()
@@ -281,8 +334,11 @@ private:
         // renderer before JUCE paint fills it up again.
         if (pathPipeline_) pathPipeline_->beginFrame();
 
-        // Phase 1: Record — JUCE paints, Graphics pushes commands into Renderer
-        float scale = getDisplayScale();
+        // Phase 1: Record — JUCE paints, Graphics pushes commands into Renderer.
+        // Paint scale comes from the live surface size (see getPaintScale), so
+        // content always fills the swapchain regardless of how the host reports
+        // DPI through getPlatformScaleFactor().
+        float scale = getPaintScale();
         jvk::Graphics graphics(*renderer_, scale);
         juce::Graphics g(graphics);
         paintEntireComponent(g, true);

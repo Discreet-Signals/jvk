@@ -98,6 +98,14 @@ public:
     uint32_t height() const override { return height_; }
     VkFormat format() const override { return format_; }
 
+    // The window/layer's current physical pixel size, straight from the driver
+    // (Win32: child HWND client area; Metal: CAMetalLayer drawableSize). This
+    // is the ground truth a caller should resize the swapchain to. Returns the
+    // 0xFFFFFFFF sentinel in .width when the surface has no preferred size
+    // (some Wayland compositors); callers then fall back to a logical*scale
+    // estimate. Cheap — a single vkGetPhysicalDeviceSurfaceCapabilitiesKHR.
+    VkExtent2D surfaceExtent() const;
+
     VkRenderPass sceneRenderPassClear() const override { return sceneRPClear_; }
     VkRenderPass sceneRenderPassLoad()  const override { return sceneRPLoad_;  }
     VkRenderPass effectRenderPass()     const override { return effectRP_;     }

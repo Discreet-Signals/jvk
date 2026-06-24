@@ -61,6 +61,13 @@ SwapchainTarget::~SwapchainTarget()
     vkDestroySurfaceKHR(device_.instance(), surface_, nullptr);
 }
 
+VkExtent2D SwapchainTarget::surfaceExtent() const
+{
+    VkSurfaceCapabilitiesKHR caps {};
+    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device_.physicalDevice(), surface_, &caps);
+    return caps.currentExtent;
+}
+
 void SwapchainTarget::createSwapchain()
 {
     VkDevice d = device_.device();
@@ -80,9 +87,32 @@ void SwapchainTarget::createSwapchain()
         if (f.format == VK_FORMAT_B8G8R8A8_UNORM) { colorSpace = f.colorSpace; break; }
     }
 
+    // The surface's currentExtent is the AUTHORITATIVE physical pixel size of
+    // the window/layer we render into. On Win32 it is exactly the child HWND's
+    // client area in device pixels; on Metal/MoltenVK it is the CAMetalLayer's
+    // drawableSize (layer bounds x contentsScale). It already reflects the host
+    // content-scale (which JUCE applies as an AffineTransform on the editor, so
+    // it is folded into the HWND size) AND the per-monitor DPI — neither of
+    // which getPlatformScaleFactor() reports reliably (it returns 1.0 for an
+    // embedded plugin window, and on macOS always). Trust currentExtent over
+    // the caller's hint, which can be derived from a host-misreported scale
+    // factor (e.g. Cubase on Windows reporting the wrong DPI). The 0xFFFFFFFF
+    // sentinel means "surface has no preferred size" (some Wayland) — only then
+    // fall back to clamping the requested size into the allowed range.
     VkExtent2D ext;
-    ext.width = std::clamp(width_, caps.minImageExtent.width, caps.maxImageExtent.width);
-    ext.height = std::clamp(height_, caps.minImageExtent.height, caps.maxImageExtent.height);
+    if (caps.currentExtent.width  != 0xFFFFFFFFu
+     && caps.currentExtent.width  != 0
+     && caps.currentExtent.height != 0) {
+        ext = caps.currentExtent;
+    } else {
+        // currentExtent is the 0xFFFFFFFF "no preferred size" sentinel (some
+        // Wayland) or a transient 0 (surface/layer not sized yet). Fall back to
+        // the exact pre-existing behaviour: clamp the caller's requested size
+        // into the allowed range. This guarantees we are never worse than the
+        // hint-based path in any case where currentExtent isn't usable.
+        ext.width  = std::clamp(width_,  caps.minImageExtent.width,  caps.maxImageExtent.width);
+        ext.height = std::clamp(height_, caps.minImageExtent.height, caps.maxImageExtent.height);
+    }
     width_ = ext.width;
     height_ = ext.height;
 
@@ -477,7 +507,15 @@ RenderTarget::Frame SwapchainTarget::beginFrame()
     VkResult result = vkAcquireNextImageKHR(d, swapchain_, UINT64_MAX,
         imageAvailable_[currentFrame_], VK_NULL_HANDLE, &imageIndex);
 
-    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+    // OUT_OF_DATE: swapchain no longer matches the surface (window resized /
+    // DPI changed) — must recreate before using. SUBOPTIMAL: still usable but
+    // a mismatch exists; recreate too so we converge on the surface's real
+    // size. This is the self-healing path for live DPI changes a host applies
+    // without a corresponding logical-size change (e.g. dragging a plugin
+    // window between monitors of different scale): componentMovedOrResized may
+    // not fire, but the surface goes out-of-date and we catch it here. resize()
+    // re-queries currentExtent, so passing the old size is fine.
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
         resize(width_, height_);
         return {}; // caller checks cmd == VK_NULL_HANDLE
     }
