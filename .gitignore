@@ -5,3 +5,4 @@ JuceLibraryCode/
 .cache/
 .clangd/
 compile_commands.json
+.claude/
