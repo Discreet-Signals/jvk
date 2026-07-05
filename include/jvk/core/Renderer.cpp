@@ -197,6 +197,17 @@ void Renderer::upload(Memory::L2::Allocation src, VkImage dst, uint32_t width, u
     pendingUploads_.push_back({ dst, width, height, src.buffer, src.offset });
 }
 
+void Renderer::uploadDynamic(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height)
+{
+    pendingUploads_.push_back({ dst, width, height, src.buffer, src.offset, true });
+}
+
+void Renderer::cancelUploads(VkImage dst)
+{
+    std::erase_if(pendingUploads_,
+                  [dst](const PendingUpload& u) { return u.dstImage == dst; });
+}
+
 void Renderer::upload(Memory::L2::Allocation src, VkBuffer dst,
                       VkDeviceSize size, VkDeviceSize dstOffset)
 {
@@ -204,7 +215,8 @@ void Renderer::upload(Memory::L2::Allocation src, VkBuffer dst,
 }
 
 void Renderer::recordImageUpload(VkCommandBuffer cmd, Memory::L2::Allocation src,
-                                  VkImage dst, uint32_t width, uint32_t height)
+                                  VkImage dst, uint32_t width, uint32_t height,
+                                  bool dynamicContent)
 {
     VkImageMemoryBarrier barrier {};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -217,8 +229,17 @@ void Renderer::recordImageUpload(VkCommandBuffer cmd, Memory::L2::Allocation src
     barrier.srcAccessMask = 0;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 
+    // Fresh images (cache inserts) have never been read — TOP_OF_PIPE orders
+    // nothing and lets the copy overlap prior GPU work. Dynamic re-uploads
+    // must wait for every previously submitted frame's fragment reads of this
+    // image (pipeline barriers order against ALL earlier commands on the
+    // queue, across command buffers). Write-after-read only needs the
+    // execution dependency, so srcAccessMask stays 0; UNDEFINED oldLayout is
+    // fine either way since the copy rewrites every texel.
     vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        dynamicContent ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                       : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
     VkBufferImageCopy region {};
@@ -245,7 +266,7 @@ void Renderer::flushUploads(VkCommandBuffer cmd)
         // The pending-upload struct carries the L2 allocation broken out into
         // (srcBuffer, srcOffset); repack so we can share recordImageUpload.
         Memory::L2::Allocation src { nullptr, u.srcBuffer, u.srcOffset };
-        recordImageUpload(cmd, src, u.dstImage, u.width, u.height);
+        recordImageUpload(cmd, src, u.dstImage, u.width, u.height, u.dynamicContent);
     }
     pendingUploads_.clear();
 

@@ -356,6 +356,22 @@ public:
     void upload(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height);
     void upload(Memory::L2::Allocation src, VkBuffer dst,
                 VkDeviceSize size, VkDeviceSize dstOffset = 0);
+
+    // upload() variant for images whose CONTENTS are refreshed every frame
+    // (jvk::Shader::update's per-binding video/procedural feeds). Identical
+    // queue/flush path, but the recorded pre-copy barrier waits for all
+    // previously submitted fragment-shader work: with two frames in flight,
+    // the copy would otherwise overwrite texels the prior frame is still
+    // sampling (plain upload() assumes a freshly created, never-read image
+    // and uses a TOP_OF_PIPE barrier that orders nothing).
+    void uploadDynamic(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height);
+
+    // Drop any queued uploads targeting `dst`. Call before destroying /
+    // retiring an image that may still have a pending entry (e.g. a dynamic
+    // shader input resized twice between executes) so flushUploads never
+    // records a copy into a freed VkImage.
+    void cancelUploads(VkImage dst);
+
     void flushUploads(VkCommandBuffer cmd);
 
     // Record a single image-copy upload (TRANSFER_DST barrier → copy →
@@ -363,8 +379,11 @@ public:
     // setup uploads that have to run before any Renderer exists
     // (Device::submitImmediate bootstrap paths). Per-frame work should go
     // through upload()/flushUploads() so it batches with the scene.
+    // `dynamicContent` selects the fragment-ordered pre-copy barrier
+    // described at uploadDynamic().
     static void recordImageUpload(VkCommandBuffer cmd, Memory::L2::Allocation src,
-                                   VkImage dst, uint32_t width, uint32_t height);
+                                   VkImage dst, uint32_t width, uint32_t height,
+                                   bool dynamicContent = false);
 
     // ---- Deferred destruction ----------------------------------------------
     //
@@ -448,6 +467,7 @@ private:
         uint32_t     width, height;
         VkBuffer     srcBuffer;
         VkDeviceSize srcOffset;
+        bool         dynamicContent = false;
     };
     struct PendingBufferUpload {
         VkBuffer     dstBuffer;

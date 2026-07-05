@@ -63,6 +63,94 @@ public:
         }
     }
 
+    // Dynamic image bindings: for sources whose CONTENT changes every frame
+    // (video feeds, CPU-composited animations). set() resolves through the
+    // shared texture cache, which keys on the pixel-buffer ADDRESS and never
+    // re-uploads on a hit — mutated (or freed-and-recycled) buffers keep
+    // showing their first upload — and every rebind of a live shader costs a
+    // device-wide vkDeviceWaitIdle. update() instead gives the binding its
+    // own VkImage, written once into the descriptor set, and re-records a
+    // pixel copy into it through the Renderer's per-frame upload queue on
+    // every call: no descriptor writes in steady state, no stalls, no cache
+    // churn. The copy is ordered after all previously submitted fragment
+    // work (uploadDynamic's barrier), so in-flight frames finish sampling
+    // the old contents first.
+    //
+    // Pixels are copied out at call time (BGRA, premultiplied — matching
+    // juce ARGB memory layout, so alpha-translucent sources stay
+    // premultiplied when sampled). Safe to reuse one juce::Image buffer
+    // across calls. Call from the message thread during record.
+    void update(const juce::String& name, const juce::Image& image, Renderer& r)
+    {
+        if (!image.isValid()) return;
+        for (auto& b : bindings_) {
+            if (b.name != name || b.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                continue;
+
+            auto& device = r.device();
+            const auto w = static_cast<uint32_t>(image.getWidth());
+            const auto h = static_cast<uint32_t>(image.getHeight());
+
+            // (Re)create the owned image on first use or resize — the only
+            // times the descriptor is written after creation.
+            if (b.ownedImage == nullptr
+                || b.ownedImage->width() != w || b.ownedImage->height() != h)
+            {
+                if (b.ownedImage != nullptr) {
+                    // The old image may have a queued upload (two updates
+                    // between executes) and in-flight frames sampling it —
+                    // drop the former, let the retire queue's fence proof
+                    // handle the latter. No stall.
+                    r.cancelUploads(b.ownedImage->image());
+                    r.retire(std::move(*b.ownedImage));
+                }
+                // VK_FORMAT_B8G8R8A8_UNORM matches juce ARGB's little-endian
+                // byte order (B,G,R,A), so the staging fill below is a
+                // straight row memcpy — no per-pixel conversion.
+                b.ownedImage = std::make_unique<Image>(device.pool(), device.device(),
+                    w, h, VK_FORMAT_B8G8R8A8_UNORM,
+                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+
+                // A binding switching over from set() releases its cache pin.
+                if (b.pinnedTexture) { b.pinnedTexture->unpin(); b.pinnedTexture = nullptr; }
+
+                b.imageView = b.ownedImage->view();
+                b.sampler   = b.ownedImage->sampler();
+                b.bound     = true;
+
+                // Same idle-gated one-off write as set() — see the comment
+                // there. Only hit when the shader is already live AND the
+                // source was resized; steady-state frames never enter here.
+                if (created_ && descriptorSet_ != VK_NULL_HANDLE) {
+                    const juce::ScopedLock queueSync(Renderer::queueLock());
+                    vkDeviceWaitIdle(device.device());
+                    Memory::M::writeImage(device.device(), descriptorSet_,
+                                          b.binding, b.imageView, b.sampler);
+                }
+            }
+
+            // Stage this frame's pixels and queue the copy into the frame's
+            // command buffer (flushUploads runs before the render pass).
+            const VkDeviceSize byteSize = VkDeviceSize(w) * h * 4;
+            auto staging = r.staging().alloc(byteSize);
+            if (staging.mappedPtr == nullptr) return;
+
+            juce::Image::BitmapData bd(image, juce::Image::BitmapData::readOnly);
+            auto* dst = static_cast<uint8_t*>(staging.mappedPtr);
+            for (uint32_t y = 0; y < h; ++y)
+                std::memcpy(dst + size_t(y) * w * 4,
+                            bd.getLinePointer(static_cast<int>(y)),
+                            size_t(w) * 4);
+
+            // Pin ourselves for this frame so ~Shader can't destroy the
+            // owned VkImage while the queued copy (or the frame that samples
+            // it) is still in flight — mirrors drawShader's retain.
+            r.retain(this);
+            r.uploadDynamic(staging, b.ownedImage->image(), w, h);
+            return;
+        }
+    }
+
     // Float bindings: stored locally, written to V during replay
     void set(const juce::String& name, float value)
     {
@@ -408,6 +496,12 @@ private:
         // while our descriptor still references them → UB on next draw.
         // Pinned in set(), swapped on rebind, released in ~Shader.
         CachedImage*     pinnedTexture = nullptr;
+        // Shader-owned texture for update()-driven bindings (per-frame
+        // dynamic content). Mutually exclusive with pinnedTexture: a binding
+        // is either a cached static image (set) or an owned dynamic one
+        // (update). Destroyed in ~Shader after waitUntilUnretained, so no
+        // in-flight frame can still be sampling it.
+        std::unique_ptr<Image> ownedImage;
     };
 
     void reflectShader()
@@ -453,7 +547,7 @@ private:
                 info.sizeInBuffer   = blockSize;
                 bufferOffset       += blockSize;
             }
-            bindings_.push_back(info);
+            bindings_.push_back(std::move(info));
         }
 
         uniformData_.resize(bufferOffset / sizeof(float), 0.0f);
