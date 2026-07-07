@@ -253,6 +253,14 @@ private:
     // events covers every peer-attachment path without requiring a
     // ComponentMovementWatcher. updateVulkanTarget is idempotent: no-op
     // when target_ already exists, retry otherwise.
+    //
+    // PROTECTED, and subclasses that override MUST chain: on Windows the
+    // surface is only created once the peer exists (initVulkan bails until
+    // then), and these hooks are the creation trigger — a subclass override
+    // that swallows parentHierarchyChanged leaves the GPU path permanently
+    // uninitialised. (TODO: replace with a ComponentMovementWatcher so
+    // subclass shadowing can't break this.)
+protected:
     void parentHierarchyChanged() override
     {
         if (target_ == nullptr)
@@ -265,6 +273,7 @@ private:
             updateVulkanTarget();
     }
 
+private:
     void updateVulkanTarget()
     {
         if (!vulkanEnabled_) return;
