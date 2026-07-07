@@ -28,11 +28,36 @@ RenderTarget::~RenderTarget()
 // SwapchainTarget
 // =============================================================================
 
+// Pins the calling thread to the surface window's DPI-awareness context for
+// the duration of any driver call whose result depends on the window's client
+// rect: capability queries (currentExtent), acquire and present. On Windows
+// the ICD resolves GetClientRect on the CALLING thread, and Win32 coordinate
+// APIs DPI-virtualize their results whenever the thread's context differs
+// from the window's — so without pinning, the "authoritative" currentExtent
+// changes value depending on who asks (message thread running in the host's
+// context vs. our render worker in the process-default context), the two
+// callers resize the swapchain to different sizes, every acquire reports
+// SUBOPTIMAL/OUT_OF_DATE, and the swapchain never converges (black screen in
+// hosts that run plugin UIs DPI-virtualized, e.g. Ableton's auto-scale).
+// No-op off Windows, without a native window, or pre-Win10-1607.
+namespace {
+struct SurfaceDpiScope
+{
+#ifdef _WIN32
+    core::windows::dpi::ScopedWindowContext scope;
+    explicit SurfaceDpiScope(void* nativeWindow) : scope(nativeWindow) {}
+#else
+    explicit SurfaceDpiScope(void*) {}
+#endif
+};
+} // namespace
+
 SwapchainTarget::SwapchainTarget(Device& device, VkSurfaceKHR surface,
                                  uint32_t w, uint32_t h,
+                                 void* nativeWindow,
                                  VkPresentModeKHR presentMode)
-    : RenderTarget(device), surface_(surface), presentMode_(presentMode),
-      width_(w), height_(h)
+    : RenderTarget(device), surface_(surface), nativeWindow_(nativeWindow),
+      presentMode_(presentMode), width_(w), height_(h)
 {
     createSwapchain();
     createRenderPasses();
@@ -63,6 +88,7 @@ SwapchainTarget::~SwapchainTarget()
 
 VkExtent2D SwapchainTarget::surfaceExtent() const
 {
+    SurfaceDpiScope dpiScope(nativeWindow_);
     VkSurfaceCapabilitiesKHR caps {};
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device_.physicalDevice(), surface_, &caps);
     return caps.currentExtent;
@@ -70,6 +96,7 @@ VkExtent2D SwapchainTarget::surfaceExtent() const
 
 void SwapchainTarget::createSwapchain()
 {
+    SurfaceDpiScope dpiScope(nativeWindow_);
     VkDevice d = device_.device();
     VkPhysicalDevice pd = device_.physicalDevice();
 
@@ -500,6 +527,7 @@ void SwapchainTarget::destroySwapchain()
 
 RenderTarget::Frame SwapchainTarget::beginFrame()
 {
+    SurfaceDpiScope dpiScope(nativeWindow_);
     VkDevice d = device_.device();
     vkWaitForFences(d, 1, &inFlightFence_[currentFrame_], VK_TRUE, UINT64_MAX);
 
@@ -508,14 +536,23 @@ RenderTarget::Frame SwapchainTarget::beginFrame()
         imageAvailable_[currentFrame_], VK_NULL_HANDLE, &imageIndex);
 
     // OUT_OF_DATE: swapchain no longer matches the surface (window resized /
-    // DPI changed) — must recreate before using. SUBOPTIMAL: still usable but
-    // a mismatch exists; recreate too so we converge on the surface's real
-    // size. This is the self-healing path for live DPI changes a host applies
-    // without a corresponding logical-size change (e.g. dragging a plugin
-    // window between monitors of different scale): componentMovedOrResized may
-    // not fire, but the surface goes out-of-date and we catch it here. resize()
-    // re-queries currentExtent, so passing the old size is fine.
-    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+    // DPI changed) and cannot present — recreate before using. No image was
+    // acquired and imageAvailable_[currentFrame_] was NOT signaled, so it is
+    // safe to drop this frame and retry the same slot next tick. resize()
+    // re-queries currentExtent (pinned to the window's own DPI context), so
+    // passing the old size is fine.
+    //
+    // SUBOPTIMAL is deliberately NOT handled here: an image WAS acquired and
+    // the semaphore WILL be signaled, so the frame must proceed and present
+    // normally — dropping it would leave a pending signal on
+    // imageAvailable_[currentFrame_], and the next acquire against that
+    // semaphore is a spec violation (VUID 01286) and a black screen on strict
+    // drivers. endFrame() sees the present-side SUBOPTIMAL report and
+    // recreates AFTER the image is consumed — that is the self-healing path
+    // for live DPI changes a host applies without a logical-size change
+    // (e.g. dragging a plugin window between monitors of different scale,
+    // where componentMovedOrResized may not fire).
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
         resize(width_, height_);
         return {}; // caller checks cmd == VK_NULL_HANDLE
     }
@@ -538,6 +575,7 @@ RenderTarget::Frame SwapchainTarget::beginFrame()
 
 void SwapchainTarget::endFrame(const Frame& frame)
 {
+    SurfaceDpiScope dpiScope(nativeWindow_);
     VkDevice d = device_.device();
     vkEndCommandBuffer(frame.cmd);
 
@@ -566,8 +604,24 @@ void SwapchainTarget::endFrame(const Frame& frame)
     pi.pSwapchains = swapchains;
     pi.pImageIndices = &frame.imageIndex;
 
-    vkQueuePresentKHR(device_.presentQueue(), &pi);
+    VkResult result = vkQueuePresentKHR(device_.presentQueue(), &pi);
     currentFrame_ = (currentFrame_ + 1) % MAX_FRAMES;
+
+    // Post-present is the safe place to recreate: the acquired image and its
+    // semaphores have been consumed, so no sync object holds a pending
+    // operation. OUT_OF_DATE must recreate. For SUBOPTIMAL — the frame DID
+    // present — rebuild only when the surface's size actually disagrees with
+    // ours: drivers can report SUBOPTIMAL for reasons a recreate won't cure
+    // (transform hints), and rebuilding every frame would turn a warning into
+    // a vkDeviceWaitIdle-per-frame stall.
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        resize(width_, height_);
+    } else if (result == VK_SUBOPTIMAL_KHR) {
+        VkExtent2D cur = surfaceExtent();
+        if (cur.width != 0xFFFFFFFFu && cur.width != 0 && cur.height != 0
+            && (cur.width != width_ || cur.height != height_))
+            resize(width_, height_);
+    }
 }
 
 void SwapchainTarget::resize(uint32_t w, uint32_t h)

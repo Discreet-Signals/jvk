@@ -171,10 +171,11 @@ private:
 
         // If we already have a size, stand up the swapchain + pipelines
         // immediately. Otherwise componentMovedOrResized will do it on the
-        // first layout pass. Scale may be 1.0 at this point if the peer
-        // isn't attached yet — that's fine; parentHierarchyChanged /
-        // visibilityChanged will call target_->resize() with the real
-        // per-monitor scale once the peer is live.
+        // first layout pass. On Windows initVulkan additionally defers until
+        // the peer exists — the child HWND must be created in the host
+        // tree's DPI-awareness context, which is only knowable from the
+        // peer — and parentHierarchyChanged / visibilityChanged re-enter
+        // once it does.
         const float scale = getDisplayScale();
         const auto w = static_cast<uint32_t>(getWidth()  * scale);
         const auto h = static_cast<uint32_t>(getHeight() * scale);
@@ -286,6 +287,28 @@ private:
             return;
         }
 
+#if JUCE_WINDOWS
+        // The child HWND's DPI-awareness context is fixed at creation, but a
+        // host can move the editor into a tree with a DIFFERENT context
+        // (toggling Ableton's "Auto-Scale Plugin Window" rebuilds the plugin
+        // window in the opposite awareness). A mismatched tree makes every
+        // cross-window coordinate exchange DPI-virtualized — mis-positioned
+        // child, swapchain that never converges — and a live window's context
+        // cannot be changed, so rebuild the whole Vulkan stack in the new
+        // context. Cheap comparison; no-op in the steady state.
+        if (auto* peer = getPeer())
+        {
+            if (hwndGen_ && hwndGen_->get() != nullptr
+                && !jvk::core::windows::dpi::sameContext(
+                        hwndGen_->get(), (HWND) peer->getNativeHandle()))
+            {
+                teardownVulkan();
+                acquireVulkan();
+                return;
+            }
+        }
+#endif
+
         // Surface exists: resize to the window/layer's TRUE physical size,
         // queried straight from the driver. This is the authoritative size
         // (HWND client area / CAMetalLayer drawableSize) and tracks both
@@ -351,6 +374,7 @@ private:
 
     void initVulkan(uint32_t w, uint32_t h)
     {
+        void* nativeWindow = nullptr;
 #if JUCE_MAC
         nsViewGen_ = std::make_unique<jvk::core::macos::NSViewGenerator>();
         void* nsView = nsViewGen_->create();
@@ -364,10 +388,20 @@ private:
         if (vkCreateMacOSSurfaceMVK(device_->instance(), &ci, nullptr, &surface) != VK_SUCCESS)
             return;
 #elif JUCE_WINDOWS
+        // The child HWND must be created in the SAME DPI-awareness context
+        // as the host window tree it is about to join: Windows does not
+        // support parenting across contexts (juce::HWNDComponent's
+        // SetParent), and JUCE positions this window with coordinates
+        // computed in the peer's coordinate space. Defer until the peer
+        // exists so its context can be read — parentHierarchyChanged /
+        // visibilityChanged re-enter here once it does.
+        auto* peer = getPeer();
+        if (peer == nullptr) return;
         hwndGen_ = std::make_unique<jvk::core::windows::HWNDGenerator>();
-        HWND childHwnd = hwndGen_->create();
+        HWND childHwnd = hwndGen_->create(peer->getNativeHandle());
         if (!childHwnd) return;
         metalView_.setHWND((void*)childHwnd);
+        nativeWindow = (void*)childHwnd;
 
         VkSurfaceKHR surface = VK_NULL_HANDLE;
         VkWin32SurfaceCreateInfoKHR ci {};
@@ -384,7 +418,10 @@ private:
 #endif
         if (surface == VK_NULL_HANDLE) return;
 
-        target_ = std::make_unique<SwapchainTarget>(*device_, surface, w, h);
+        // nativeWindow lets the target pin surface-size queries, acquire and
+        // present to the window's own DPI-awareness context — every thread
+        // then sees the same physical size (see SurfaceDpiScope).
+        target_ = std::make_unique<SwapchainTarget>(*device_, surface, w, h, nativeWindow);
         renderer_ = std::make_unique<Renderer>(*device_, *target_);
         registerPipelines();
     }

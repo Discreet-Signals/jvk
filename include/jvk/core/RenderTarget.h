@@ -86,8 +86,17 @@ protected:
 
 class SwapchainTarget : public RenderTarget {
 public:
+    // `nativeWindow` is the platform window the surface was created from
+    // (Win32: the child HWND; unused elsewhere). On Windows every driver
+    // call whose result depends on the window's client rect — capability
+    // queries, acquire, present — runs with the calling thread pinned to
+    // that window's DPI-awareness context, so the size the driver reports
+    // is the same on every thread (see the SurfaceDpiScope note in
+    // RenderTarget.cpp). Pass null only for targets that never need
+    // consistent surface metrics (tests, offscreen experiments).
     SwapchainTarget(Device& device, VkSurfaceKHR surface,
                     uint32_t w, uint32_t h,
+                    void* nativeWindow = nullptr,
                     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR);
     ~SwapchainTarget();
 
@@ -124,6 +133,7 @@ private:
     void destroySceneBuffers();
 
     VkSurfaceKHR   surface_;
+    void*          nativeWindow_ = nullptr; // Win32 HWND behind surface_ (DPI-context pinning)
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
     VkFormat       format_    = VK_FORMAT_B8G8R8A8_UNORM;
     VkPresentModeKHR presentMode_;
