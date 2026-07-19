@@ -385,8 +385,13 @@ private:
     {
         void* nativeWindow = nullptr;
 #if JUCE_MAC
+        // The metal view must be BORN at the editor's size: the first
+        // swapchain is built from the layer's currentExtent, and a
+        // wrong-aspect birth frame presents the opening frames stretched
+        // (the open-time vertical squish) until the next extent check.
         nsViewGen_ = std::make_unique<jvk::core::macos::NSViewGenerator>();
-        void* nsView = nsViewGen_->create();
+        metalView_.setBounds(getLocalBounds());
+        void* nsView = nsViewGen_->create(getWidth(), getHeight());
         if (!nsView) return;
         metalView_.setView(nsView);
 

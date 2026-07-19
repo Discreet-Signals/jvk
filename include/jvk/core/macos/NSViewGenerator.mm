@@ -52,9 +52,9 @@ bool NSViewGenerator::isValid()
     return view;
 }
 
-void* NSViewGenerator::create()
+void* NSViewGenerator::create(int width, int height)
 {
-    NSView* view = [[JVKMetalView alloc] initWithFrame:NSMakeRect(0, 0, 800, 600)];
+    NSView* view = [[JVKMetalView alloc] initWithFrame:NSMakeRect(0, 0, width, height)];
     if (!view.layer || ![view.layer isKindOfClass:[CAMetalLayer class]])
     {
         view.wantsLayer = YES;

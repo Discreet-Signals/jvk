@@ -30,7 +30,11 @@ public:
     ~NSViewGenerator();
 
     bool isValid();
-    void* create();
+    /** Width/height in logical points — the layer's frame at birth. MoltenVK's
+        currentExtent reads it, and createSwapchain treats currentExtent as
+        authoritative, so a wrong birth frame becomes a wrong-aspect first
+        swapchain, presented stretched until the next extent check. */
+    void* create(int width, int height);
     void release();
 private:
     void* ptr;
