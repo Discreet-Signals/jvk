@@ -83,6 +83,11 @@ Renderer::~Renderer()
     }
     if (worker_) worker_.reset();
     flushRetains();
+    // Return slot-parked staging blocks to the belt so ~L2 frees them —
+    // Block is a plain handle struct, so destroying the vectors alone would
+    // leak the VkBuffer/VkDeviceMemory. GPU is idle per the dtor contract.
+    for (auto& slot : stagingBySlot_)
+        staging_.recycle(slot);
 }
 
 // =============================================================================
@@ -370,6 +375,7 @@ void Renderer::execute()
     // won't be touched until the slot next comes around.
     activeRetireSlot_ = frame.frameSlot % kRetireSlots;
     retired_[activeRetireSlot_].flush();
+    staging_.recycle(stagingBySlot_[activeRetireSlot_]);
 
     // Pipeline prepare (atlas dirty pages, etc.) and gradient/texture uploads.
     // Each pipeline pushes its pending uploads onto *this* Renderer's queue,
@@ -392,6 +398,11 @@ void Renderer::execute()
     // and is not touched.
     if (pathPipeline_) pathPipeline_->flushToGPU(frame.frameSlot);
     flushUploads(frame.cmd);
+
+    // Every belt allocation for this frame has been recorded above (record-
+    // phase texture/dynamic-image staging, pipeline prepare, gradient rows) —
+    // park the blocks against this slot until its fence next signals.
+    staging_.moveActiveTo(stagingBySlot_[activeRetireSlot_]);
 
     auto const& sb = target_.sceneBuffers(frame.frameSlot);
 

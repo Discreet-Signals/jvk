@@ -488,6 +488,13 @@ private:
     std::array<jvk::core::DeletionQueue, kRetireSlots> retired_ {};
     int activeRetireSlot_ = 0;
 
+    // Staging blocks consumed by each slot's submitted frame, recycled when
+    // that slot's fence next signals — same discipline as retired_. This is
+    // the v1 belt rotation (recycle → record uploads → moveActiveTo) that the
+    // v2 refactor dropped; without it the belt is append-only and every
+    // staged byte permanently grows activeBlocks.
+    std::array<std::vector<Memory::L2::Block>, kRetireSlots> stagingBySlot_ {};
+
     // Per-Renderer gradient atlas (see public accessors above for rationale).
     // unique_ptr so this header only needs a forward declaration.
     std::unique_ptr<GradientAtlas> gradientAtlas_;
