@@ -1,5 +1,7 @@
 #pragma once
 
+#include <unordered_map>
+
 namespace jvk {
 namespace Memory {
 
@@ -368,7 +370,8 @@ public:
     // Locks are not movable — but the members we actually care about are.
     // Leave lock_ default-constructed on the moved-to instance.
     M(M&& o) noexcept
-        : device(o.device), layouts(std::move(o.layouts)), pools(std::move(o.pools))
+        : device(o.device), layouts(std::move(o.layouts)), pools(std::move(o.pools)),
+          setToPool(std::move(o.setToPool))
     { o.device = VK_NULL_HANDLE; }
 
     M& operator=(M&& o) noexcept
@@ -378,6 +381,7 @@ public:
             device = o.device;
             layouts = std::move(o.layouts);
             pools = std::move(o.pools);
+            setToPool = std::move(o.setToPool);
             o.device = VK_NULL_HANDLE;
         }
         return *this;
@@ -425,28 +429,43 @@ public:
         ai.descriptorSetCount = 1;
         ai.pSetLayouts = &entry.layout;
 
-        // Try existing pools
-        for (auto& pool : pools) {
-            ai.descriptorPool = pool;
+        // Try existing pools that serve this layout AND still have room. A FULL
+        // pool is skipped, never handed to vkAllocateDescriptorSets — MoltenVK
+        // crashes on that instead of returning VK_ERROR_OUT_OF_POOL_MEMORY.
+        for (size_t i = 0; i < pools.size(); ++i) {
+            if (pools[i].layout != id || pools[i].used >= SETS_PER_POOL)
+                continue;
+            ai.descriptorPool = pools[i].pool;
             VkDescriptorSet set = VK_NULL_HANDLE;
-            if (vkAllocateDescriptorSets(device, &ai, &set) == VK_SUCCESS)
+            if (vkAllocateDescriptorSets(device, &ai, &set) == VK_SUCCESS) {
+                pools[i].used++;
+                setToPool[set] = i;
                 return set;
+            }
         }
 
-        // Grow: create a new pool
-        growPool(entry.poolSizes);
-        ai.descriptorPool = pools.back();
+        // None had room — grow a fresh pool for this layout and allocate there.
+        growPool(id, entry.poolSizes);
+        const size_t last = pools.size() - 1;
+        ai.descriptorPool = pools[last].pool;
         VkDescriptorSet set = VK_NULL_HANDLE;
-        vkAllocateDescriptorSets(device, &ai, &set);
+        if (vkAllocateDescriptorSets(device, &ai, &set) == VK_SUCCESS) {
+            pools[last].used++;
+            setToPool[set] = last;
+        }
         return set;
     }
 
     void free(VkDescriptorSet set)
     {
         const juce::ScopedLock lk(lock_);
-        for (auto& pool : pools)
-            if (vkFreeDescriptorSets(device, pool, 1, &set) == VK_SUCCESS)
-                return;
+        auto it = setToPool.find(set);
+        if (it == setToPool.end())
+            return;                                  // not ours / already freed
+        auto& p = pools[it->second];
+        if (vkFreeDescriptorSets(device, p.pool, 1, &set) == VK_SUCCESS && p.used > 0)
+            p.used--;
+        setToPool.erase(it);
     }
 
     static void writeImage(VkDevice device, VkDescriptorSet set, uint32_t binding,
@@ -494,13 +513,25 @@ private:
         std::vector<VkDescriptorPoolSize> poolSizes;
     };
 
+    // A pool, tagged with the layout it serves and the number of live sets in
+    // it. Tracking `used` lets alloc() SKIP a pool that has hit maxSets rather
+    // than ask Vulkan to allocate from a full pool — MoltenVK crashes on that
+    // (memset past its internal set array) instead of returning an error, and a
+    // silently-null set draws as a black frame.
+    struct Pool {
+        VkDescriptorPool pool   = VK_NULL_HANDLE;
+        LayoutID         layout = 0;
+        uint32_t         used   = 0;
+    };
+
     VkDevice device = VK_NULL_HANDLE;
     std::vector<LayoutEntry> layouts;
-    std::vector<VkDescriptorPool> pools;
+    std::vector<Pool> pools;
+    std::unordered_map<VkDescriptorSet, size_t> setToPool;  // set -> index into `pools`
     mutable juce::CriticalSection lock_;
 
     // Caller holds lock_.
-    void growPool(const std::vector<VkDescriptorPoolSize>& sizes)
+    void growPool(LayoutID layout, const std::vector<VkDescriptorPoolSize>& sizes)
     {
         std::vector<VkDescriptorPoolSize> scaled = sizes;
         for (auto& ps : scaled) ps.descriptorCount *= SETS_PER_POOL;
@@ -514,17 +545,18 @@ private:
 
         VkDescriptorPool pool = VK_NULL_HANDLE;
         vkCreateDescriptorPool(device, &ci, nullptr, &pool);
-        pools.push_back(pool);
+        pools.push_back({ pool, layout, 0 });
     }
 
     void destroy()
     {
         if (device == VK_NULL_HANDLE) return;
-        for (auto& pool : pools)
-            if (pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, pool, nullptr);
+        for (auto& p : pools)
+            if (p.pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, p.pool, nullptr);
         for (auto& entry : layouts)
             if (entry.layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, entry.layout, nullptr);
         pools.clear();
+        setToPool.clear();
         layouts.clear();
         device = VK_NULL_HANDLE;
     }
