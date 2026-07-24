@@ -476,6 +476,14 @@ private:
         VkBuffer     srcBuffer;
         VkDeviceSize srcOffset;
     };
+    // Both queues are pushed from the message thread (record: Shader::update
+    // dynamic feeds, cache inserts, atlas pages) while the render worker
+    // drains them in flushUploads — every access goes through uploadLock_.
+    // Without it a push_back racing the worker's drain is silently lost, and
+    // a per-frame dynamic texture (CRT screen) can miss EVERY upload when the
+    // two clocks phase-lock: the image never leaves UNDEFINED and samples
+    // black.
+    juce::CriticalSection            uploadLock_;
     std::vector<PendingUpload>       pendingUploads_;
     std::vector<PendingBufferUpload> pendingBufferUploads_;
 
