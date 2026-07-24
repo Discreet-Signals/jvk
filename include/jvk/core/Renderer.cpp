@@ -199,16 +199,19 @@ void FrameRetained::waitUntilUnretained() const noexcept
 
 void Renderer::upload(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height)
 {
+    const juce::ScopedLock lk(uploadLock_);
     pendingUploads_.push_back({ dst, width, height, src.buffer, src.offset });
 }
 
 void Renderer::uploadDynamic(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height)
 {
+    const juce::ScopedLock lk(uploadLock_);
     pendingUploads_.push_back({ dst, width, height, src.buffer, src.offset, true });
 }
 
 void Renderer::cancelUploads(VkImage dst)
 {
+    const juce::ScopedLock lk(uploadLock_);
     std::erase_if(pendingUploads_,
                   [dst](const PendingUpload& u) { return u.dstImage == dst; });
 }
@@ -216,6 +219,7 @@ void Renderer::cancelUploads(VkImage dst)
 void Renderer::upload(Memory::L2::Allocation src, VkBuffer dst,
                       VkDeviceSize size, VkDeviceSize dstOffset)
 {
+    const juce::ScopedLock lk(uploadLock_);
     pendingBufferUploads_.push_back({ dst, dstOffset, size, src.buffer, src.offset });
 }
 
@@ -267,15 +271,24 @@ void Renderer::recordImageUpload(VkCommandBuffer cmd, Memory::L2::Allocation src
 
 void Renderer::flushUploads(VkCommandBuffer cmd)
 {
-    for (auto& u : pendingUploads_) {
+    // Swap the queues out under the lock, record from the local copies — the
+    // message thread can keep queueing next frame's uploads while we record.
+    std::vector<PendingUpload>       imageUploads;
+    std::vector<PendingBufferUpload> bufferUploads;
+    {
+        const juce::ScopedLock lk(uploadLock_);
+        imageUploads.swap(pendingUploads_);
+        bufferUploads.swap(pendingBufferUploads_);
+    }
+
+    for (auto& u : imageUploads) {
         // The pending-upload struct carries the L2 allocation broken out into
         // (srcBuffer, srcOffset); repack so we can share recordImageUpload.
         Memory::L2::Allocation src { nullptr, u.srcBuffer, u.srcOffset };
         recordImageUpload(cmd, src, u.dstImage, u.width, u.height, u.dynamicContent);
     }
-    pendingUploads_.clear();
 
-    for (auto& u : pendingBufferUploads_) {
+    for (auto& u : bufferUploads) {
         VkBufferCopy region {};
         region.srcOffset = u.srcOffset;
         region.dstOffset = u.dstOffset;
@@ -295,7 +308,6 @@ void Renderer::flushUploads(VkCommandBuffer cmd)
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
             0, 0, nullptr, 1, &bb, 0, nullptr);
     }
-    pendingBufferUploads_.clear();
 }
 
 // =============================================================================
