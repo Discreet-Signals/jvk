@@ -46,6 +46,20 @@ public:
     // our reference only destroys the instance if nothing else holds it.)
     void setVulkanEnabled(bool enabled)
     {
+        // REENTRANCY GUARD: this is legitimately called from INSIDE paint()
+        // (the benchmark switches renderer between timed phases from its
+        // paint code). Applying the toggle immediately would run
+        // teardownVulkan mid-paintEntireComponent — destroying the
+        // paintContext_/renderer the live paint stack is standing on, so the
+        // unwinding ScopedSaveState destructors call restoreState() on a
+        // freed object (measured: garbage-vptr SIGSEGV at the Vulkan→JUCE
+        // phase boundary). Defer to the end of the render tick instead;
+        // render() applies it after paintEntireComponent returns and skips
+        // submitting the half-valid frame.
+        if (inRenderTick_) {
+            pendingVulkanToggle_ = enabled;
+            return;
+        }
         if (enabled == vulkanEnabled_) return;
         vulkanEnabled_ = enabled;
         if (enabled) acquireVulkan();
@@ -189,6 +203,11 @@ private:
 
     void teardownVulkan()
     {
+        // Must never run while a jvk-driven paint is on the stack — it
+        // destroys paintContext_/renderer_/pipelines the paint is executing
+        // through. setVulkanEnabled defers to end-of-tick; direct callers
+        // (destructor, mode-switch helpers) run outside the tick.
+        jassert(!inRenderTick_);
         renderTimer_.stopTimer();
         // Ensure the worker finished any in-flight execute before we
         // vkDeviceWaitIdle / free resources. Renderer's dtor also stops
@@ -196,7 +215,20 @@ private:
         // is quiescent before any pipeline/target reset runs below.
         if (renderer_) renderer_->waitForIdle();
         if (device_ && device_->device() != VK_NULL_HANDLE)
+        {
+            // Same external-sync rule as every other device-idle: don't race
+            // a sibling editor's worker mid-submit.
+            const juce::ScopedLock queueSync(Renderer::queueLock());
             vkDeviceWaitIdle(device_->device());
+        }
+
+        // The Renderer still holds raw pointers to the pipeline modules
+        // (dispatch table + module attachments) — clear them FIRST so no
+        // window exists in which renderer_ points at destroyed pipelines
+        // (nothing runs in that window today, but a future callback landing
+        // between the two blocks would fault).
+        if (renderer_)
+            renderer_->clearPipelines();
 
         // Pipelines hold VkPipeline handles against device_ and render
         // passes from target_ — must go before both. Reverse registration
@@ -213,6 +245,7 @@ private:
         blendPipeline_.reset();
         colorPipeline_.reset();
 
+        paintContext_.reset();   // references renderer_ — must go first
         renderer_.reset();
         target_.reset();
 
@@ -370,10 +403,35 @@ private:
         // Paint scale comes from the live surface size (see getPaintScale), so
         // content always fills the swapchain regardless of how the host reports
         // DPI through getPlatformScaleFactor().
+        //
+        // ONE persistent Graphics, reset per tick: a stack-local per frame
+        // threw away every scratch vector's capacity (path flattening, state
+        // stack) 60×/s, and reset getFrameId() to zero each frame — breaking
+        // JUCE's per-frame caches, which key on a monotonic id.
         float scale = getPaintScale();
-        jvk::Graphics graphics(*renderer_, scale);
-        juce::Graphics g(graphics);
-        paintEntireComponent(g, true);
+        if (!paintContext_)
+            paintContext_ = std::make_unique<jvk::Graphics>(*renderer_, scale);
+        else
+            paintContext_->beginFrame(scale);
+        {
+            juce::Graphics g(*paintContext_);
+            inRenderTick_ = true;
+            paintEntireComponent(g, true);
+            inRenderTick_ = false;
+        }
+
+        // A setVulkanEnabled() call landed DURING paint (benchmark phase
+        // switches do this): apply it now that the paint stack has fully
+        // unwound, and drop this frame's recording — its commands reference
+        // state that the toggle is about to destroy (disable) or that was
+        // recorded against a renderer mid-transition (enable). ~Renderer's
+        // flushRetains releases any pins the aborted record took.
+        if (pendingVulkanToggle_.has_value()) {
+            const bool enable = *pendingVulkanToggle_;
+            pendingVulkanToggle_.reset();
+            setVulkanEnabled(enable);
+            return;
+        }
 
         // Phase 2: Submit to worker — non-blocking. The worker's execute()
         // handles prepare pipelines, flush uploads, render pass, replay,
@@ -452,6 +510,9 @@ private:
         colorPipeline_ = std::make_unique<pipelines::ColorPipeline>(
             *device_, spv(vert_spv, vert_spvSize), spv(frag_spv, frag_spvSize));
         renderer_->registerPipeline(*colorPipeline_);
+        // Attached so Graphics::drawGlyphs can rasterize missing glyphs into
+        // the atlas at RECORD time (see Renderer::setColorPipeline).
+        renderer_->setColorPipeline(colorPipeline_.get());
 
         blendPipeline_ = std::make_unique<pipelines::BlendPipeline>(
             *device_, spv(vert_spv, vert_spvSize), spv(frag_spv, frag_spvSize));
@@ -567,6 +628,16 @@ private:
     std::shared_ptr<Device> device_;
     std::unique_ptr<SwapchainTarget> target_;
     std::unique_ptr<Renderer> renderer_;
+    // Persistent record context, reset via beginFrame() each tick (scratch
+    // capacity + monotonic getFrameId survive across frames). References
+    // renderer_, so teardown resets it first.
+    std::unique_ptr<jvk::Graphics> paintContext_;
+    // True while paintEntireComponent is on the stack in render(). A
+    // setVulkanEnabled() arriving then is DEFERRED (pendingVulkanToggle_)
+    // and applied after the paint unwinds — tearing down mid-paint destroys
+    // the objects the paint stack is executing through.
+    bool                inRenderTick_ = false;
+    std::optional<bool> pendingVulkanToggle_;
 
 #if JUCE_MAC
     std::unique_ptr<jvk::core::macos::NSViewGenerator> nsViewGen_;
@@ -593,7 +664,6 @@ private:
     RenderTimer renderTimer_;
     bool vulkanEnabled_ = true;
     bool vulkanAvailable_ = false;
-    uint64_t frameCounter_ = 0;
 };
 
 } // namespace jvk

@@ -20,10 +20,12 @@ layout(push_constant) uniform PC {
     vec2  halfSize;
     float cornerRadius;
     uint  shapeType;
-    uint  segmentStart;
+    uint  segmentStart;   // strip TABLE start when stripCount > 0 (see path_sdf.frag)
     uint  segmentCount;
     uint  fillRule;
-    uint  _pad;
+    uint  stripCount;     // 0 = flat list (no binning)
+    float stripMinY;
+    float invStripH;
 } pc;
 
 // Shared segment ring — owned by PathPipeline, bound here at clip dispatch.
@@ -58,10 +60,25 @@ void main() {
         vec2 p = fragPos - pc.center;
         inside = roundedRectSDF(p, pc.halfSize, pc.cornerRadius) < 0.0;
     } else if (pc.shapeType == 2u) {
-        // Path clip — walk flattened segments from the shared SSBO.
+        // Path clip — walk flattened segments from the shared SSBO. With
+        // Y-strip binning (stripCount > 0), only the fragment's strip is
+        // walked: winding is EXACT because any segment straddling frag.y
+        // overlaps frag's strip by construction.
+        uint segsBase;
+        uint count;
+        if (pc.stripCount > 0u) {
+            int strip = clamp(int((fragPos.y - pc.stripMinY) * pc.invStripH),
+                              0, int(pc.stripCount) - 1);
+            vec4 entry = segments.data[pc.segmentStart + uint(strip)];
+            segsBase = pc.segmentStart + pc.stripCount + uint(entry.x);
+            count    = uint(entry.y);
+        } else {
+            segsBase = pc.segmentStart;
+            count    = pc.segmentCount;
+        }
         int winding = 0;
-        for (uint i = 0u; i < pc.segmentCount; ++i) {
-            vec4 seg = segments.data[pc.segmentStart + i];
+        for (uint i = 0u; i < count; ++i) {
+            vec4 seg = segments.data[segsBase + i];
             winding += crossing(fragPos, seg.xy, seg.zw);
         }
         inside = (pc.fillRule == 0u) ? (winding != 0)

@@ -93,7 +93,9 @@ float sdfCapsule(vec2 p, vec2 b, float r) {
 
 // ---- Per-fragment blur radius ----
 
-float computeRadius(vec2 fragCoord) {
+// Signed distance to the shape (ring-modified for outline variants) in
+// LOGICAL units, from a PHYSICAL-pixel coordinate.
+float shapeDist(vec2 fragCoord) {
     vec2 local = pc.invCol0 * fragCoord.x
                + pc.invCol1 * fragCoord.y
                + pc.invCol2;
@@ -112,7 +114,17 @@ float computeRadius(vec2 fragCoord) {
     if (pc.shapeType != 3 && pc.lineThickness > 0.0) {
         d = abs(d) - pc.lineThickness * 0.5;
     }
+    return d;
+}
 
+// Distance → blur radius in PHYSICAL pixels. blurStep folds in both the
+// user's transform scale and displayScale. Cost scales with it (more
+// samples at higher scale) but we sample every physical pixel, which
+// avoids the moiré you get from striding > 1 texel per sample. Sampling is
+// unclamped so the kernel can reach scene content outside the shape's
+// bounds; sampleSrc below only mirror-wraps at the physical ping-pong
+// buffer edge.
+float radiusFromDist(float d) {
     float bandMin, bandMax;
     if (pc.edgePlacement == 0) {
         bandMin = -pc.falloff * 0.5;
@@ -129,14 +141,11 @@ float computeRadius(vec2 fragCoord) {
     float t = 1.0 - smoothstep(bandMin, bandMax, d);
     if (pc.inverted != 0) t = 1.0 - t;
 
-    // Blur radius in PHYSICAL pixels — blurStep folds in both the user's
-    // transform scale and displayScale. Cost scales with it (more samples
-    // at higher scale) but we sample every physical pixel, which avoids
-    // the moiré you get from striding > 1 texel per sample.
-    // Sampling is unclamped so the kernel can reach scene content outside
-    // the shape's bounds; sampleSrc below only mirror-wraps at the
-    // physical ping-pong buffer edge.
     return pc.maxRadius * t * pc.blurStep;
+}
+
+float computeRadius(vec2 fragCoord) {
+    return radiusFromDist(shapeDist(fragCoord));
 }
 
 // Vogel / phi-spiral disc sampling. Given the golden angle θ = 2π(1 − 1/φ),
@@ -189,6 +198,20 @@ void main() {
         // integer taps (1,2), (3,4), ... into a single bilinear sample at
         // the weighted midpoint. Caller runs this shader twice along
         // `direction`s (0°, 90°) and ping-pongs between them.
+        //
+        // SECOND (vertical) pass taps are GATED by the TAP's own radius:
+        // it gathers from the H-blurred intermediate, and a row whose own
+        // radius is small (the falloff band) was barely H-blurred — mixing
+        // it into a deep-interior pixel drags sharp content into the shape
+        // as streaks along this pass's axis (the classic variable-radius
+        // separability error; the pass RECTANGLES cover everything, the
+        // FIELD doesn't). Scatter logic says a source only reaches taps
+        // within its own radius, so each tap's weight ramps out unless
+        // radius(tap) ≥ its distance (soft ±2px knee). Measured on the
+        // disc benchmark vs a true 2D gather: streak structure drops 13×
+        // to reference level and deep-region RMS improves 3.6×. The first
+        // pass reads the true scene — always valid, no gate.
+        bool gated = pc.direction.y != 0.0;
         for (int p = 0; p < MAX_PAIRS; ++p) {
             int i1 = 2 * p + 1;
             if (i1 > N) break;
@@ -200,9 +223,15 @@ void main() {
             float o  = (float(i1) * w1 + float(i2) * w2) / w;
 
             vec2 off = pc.direction * o * texelSize;
-            color += sampleSrc(fragUV + off) * w;
-            color += sampleSrc(fragUV - off) * w;
-            totalWeight += 2.0 * w;
+            float gP = 1.0, gM = 1.0;
+            if (gated) {
+                vec2 tapOff = pc.direction * o;   // physical px
+                gP = clamp((computeRadius(fragCoord + tapOff) - o) * 0.5 + 1.0, 0.0, 1.0);
+                gM = clamp((computeRadius(fragCoord - tapOff) - o) * 0.5 + 1.0, 0.0, 1.0);
+            }
+            color += sampleSrc(fragUV + off) * (w * gP);
+            color += sampleSrc(fragUV - off) * (w * gM);
+            totalWeight += w * (gP + gM);
         }
     } else if (pc.kernelType == 1) {
         // 2D blue-noise disc via Vogel / phi-spiral. Radius-scaled tap

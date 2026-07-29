@@ -48,16 +48,20 @@ public:
             device_->bindings().free(descriptorSet_);
     }
 
-    void beginFrame()
-    {
-        cursor_ = 0;
-        hashToRow_.clear();
-    }
+    // Rows now PERSIST across frames. The old per-frame clear meant every
+    // unique gradient was re-rasterized (256 getColourAtPosition calls),
+    // re-hashed, and re-uploaded EVERY frame, and the map churned nodes.
+    // A gradient's hash covers its full content, so a cached row can never
+    // go stale — steady-state frames do zero rasterization and zero upload.
+    // When the atlas fills, it resets wholesale (rare: >4096 distinct
+    // gradients) rather than evicting piecemeal.
+    void beginFrame() {}
 
     // Returns normalized row y-coord (row center) for this gradient.
     // Sampling the atlas at (t, rowNorm) yields the gradient's colour at t.
-    // On overflow (>= HEIGHT), the last row is reused — visible artifacts are
-    // preferable to silent black fills.
+    // On overflow (>= HEIGHT), the atlas resets and starts refilling; the
+    // brief re-rasterization burst beats reusing one row for every
+    // overflowed gradient.
     float getRow(const juce::ColourGradient& g, uint64_t hash)
     {
         auto it = hashToRow_.find(hash);
@@ -65,24 +69,41 @@ public:
         if (it != hashToRow_.end()) {
             row = it->second;
         } else {
-            row = (cursor_ < HEIGHT) ? cursor_++ : (HEIGHT - 1);
+            if (cursor_ >= HEIGHT) {
+                hashToRow_.clear();
+                cursor_ = 0;
+                uploadedRows_ = 0;
+            }
+            row = cursor_++;
             hashToRow_.emplace(hash, row);
             rasterizeRow(g, row);
         }
         return (static_cast<float>(row) + 0.5f) / static_cast<float>(HEIGHT);
     }
 
-    // Push this frame's new rows to the GPU. Both the staging allocation
-    // and the upload-queue entry come from the Renderer (per-Renderer so
-    // two editors' workers never share either structure). The copy command
-    // is recorded into the frame's command buffer by flushUploads().
+    // Push NEW rows (since the last upload) to the GPU — a partial-image
+    // rect upload of just the added band, not the whole [0, cursor) prefix.
+    // Both the staging allocation and the upload-queue entry come from the
+    // Renderer (per-Renderer so two editors' workers never share either
+    // structure).
     void stageUploads(Renderer& r)
     {
-        if (cursor_ == 0 || !device_) return;
-        VkDeviceSize byteSize = static_cast<VkDeviceSize>(WIDTH) * cursor_ * 4;
+        if (!device_ || cursor_ <= uploadedRows_) return;
+
+        const uint32_t first = uploadedRows_;
+        const uint32_t count = cursor_ - first;
+        VkDeviceSize byteSize = static_cast<VkDeviceSize>(WIDTH) * count * 4;
         auto staging = r.staging().alloc(byteSize);
-        memcpy(staging.mappedPtr, cpuBuffer_.data(), static_cast<size_t>(byteSize));
-        r.upload(staging, image_.image(), WIDTH, cursor_);
+        if (staging.mappedPtr == nullptr) return;   // OOM — retry next frame
+        memcpy(staging.mappedPtr,
+               cpuBuffer_.data() + static_cast<size_t>(first) * WIDTH * 4,
+               static_cast<size_t>(byteSize));
+        if (first == 0)
+            r.upload(staging, image_.image(), WIDTH, count);
+        else
+            r.uploadRect(staging, image_.image(), 0, static_cast<int32_t>(first),
+                         WIDTH, count);
+        uploadedRows_ = cursor_;
     }
 
     VkDescriptorSet descriptorSet() const { return descriptorSet_; }
@@ -108,6 +129,7 @@ private:
     std::vector<uint8_t>              cpuBuffer_;
     std::unordered_map<uint64_t, uint32_t> hashToRow_;
     uint32_t        cursor_ = 0;
+    uint32_t        uploadedRows_ = 0;   // rows already on the GPU
 };
 
 // =============================================================================
@@ -387,34 +409,56 @@ public:
 
         auto w = static_cast<uint32_t>(img.getWidth());
         auto h = static_cast<uint32_t>(img.getHeight());
+        if (w == 0 || h == 0) return VK_NULL_HANDLE;
+
+        // Stage the pixels FIRST — if the staging allocator is out of memory
+        // there is nothing sane to insert into the cache (a never-uploaded
+        // entry samples UNDEFINED forever).
+        VkDeviceSize byteSize = static_cast<VkDeviceSize>(w) * h * 4;
+        auto staging = r.staging().alloc(byteSize);
+        if (staging.mappedPtr == nullptr) return VK_NULL_HANDLE;
+        auto* dst = static_cast<uint8_t*>(staging.mappedPtr);
+        juce::Image::BitmapData bmp(img, juce::Image::BitmapData::readOnly);
+
+        // Fast path for JUCE ARGB (byte order B,G,R,A on little-endian):
+        // row copy + in-register swizzle to the texture's R,G,B,A. The old
+        // per-pixel getPixelColour was ~1M virtual format-dispatch calls for
+        // a 1024² image, on the message thread, inside paint.
+        if (img.getFormat() == juce::Image::ARGB) {
+            for (uint32_t y = 0; y < h; y++) {
+                const auto* src = bmp.getLinePointer(static_cast<int>(y));
+                auto* out = dst + static_cast<size_t>(y) * w * 4;
+                for (uint32_t x = 0; x < w; x++) {
+                    out[x * 4 + 0] = src[x * 4 + 2]; // R
+                    out[x * 4 + 1] = src[x * 4 + 1]; // G
+                    out[x * 4 + 2] = src[x * 4 + 0]; // B
+                    out[x * 4 + 3] = src[x * 4 + 3]; // A
+                }
+            }
+        } else {
+            for (uint32_t y = 0; y < h; y++) {
+                for (uint32_t x = 0; x < w; x++) {
+                    auto c = bmp.getPixelColour(static_cast<int>(x), static_cast<int>(y));
+                    auto idx = (y * w + x) * 4;
+                    dst[idx + 0] = c.getRed();
+                    dst[idx + 1] = c.getGreen();
+                    dst[idx + 2] = c.getBlue();
+                    dst[idx + 3] = c.getAlpha();
+                }
+            }
+        }
 
         auto ci = std::make_unique<CachedImage>();
         ci->image = Image(device_.pool(), device_.device(), w, h,
             VK_FORMAT_R8G8B8A8_UNORM,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        if (!ci->image.valid()) return VK_NULL_HANDLE;
         ci->descriptorSet = device_.bindings().alloc();
+        if (ci->descriptorSet == VK_NULL_HANDLE) return VK_NULL_HANDLE;
         ci->bindings = &device_.bindings();
 
         Memory::M::writeImage(device_.device(), ci->descriptorSet, 0,
             ci->image.view(), ci->image.sampler());
-
-        // Stage pixel upload (JUCE → RGBA8) into the Renderer's per-instance
-        // staging allocator — keeps all per-frame staging off the shared
-        // Device L2.
-        VkDeviceSize byteSize = static_cast<VkDeviceSize>(w) * h * 4;
-        auto staging = r.staging().alloc(byteSize);
-        auto* dst = static_cast<uint8_t*>(staging.mappedPtr);
-        juce::Image::BitmapData bmp(img, juce::Image::BitmapData::readOnly);
-        for (uint32_t y = 0; y < h; y++) {
-            for (uint32_t x = 0; x < w; x++) {
-                auto c = bmp.getPixelColour(static_cast<int>(x), static_cast<int>(y));
-                auto idx = (y * w + x) * 4;
-                dst[idx + 0] = c.getRed();
-                dst[idx + 1] = c.getGreen();
-                dst[idx + 2] = c.getBlue();
-                dst[idx + 3] = c.getAlpha();
-            }
-        }
 
         // Snapshot the VkImage handle from the freshly-created Image while
         // `ci` still owns it. We need this handle for the upload queue entry
@@ -461,7 +505,12 @@ public:
     void beginFrame(uint64_t frameId)
     {
         currentFrame_ = frameId;
-        textures_.evict(frameId);
+        // Eviction sweep every 16 ticks, not every frame: the sweep walks
+        // the whole map under the cache lock with an atomic load per entry,
+        // per editor per frame — pointless at 60 Hz for a cache whose
+        // maxAge is measured in hundreds of frames.
+        if ((frameId & 0xF) == 0)
+            textures_.evict(frameId);
     }
 
     Device& device() { return device_; }
@@ -486,17 +535,49 @@ private:
         Memory::M::writeImage(vkd, blackPixel_.descriptorSet, 0,
             blackPixel_.image.view(), blackPixel_.image.sampler());
 
-        // Upload 1x1 black pixel via a one-shot command buffer. Runs during
-        // Device setup (before any Renderer exists), so it can't use the
-        // Renderer-owned upload queue — record the copy directly using
-        // Renderer's static helper so the barrier sequence stays in one place.
+        // Upload 1x1 black pixel via a one-shot command buffer with a SCOPED
+        // staging buffer. This used to be the only user of Device::staging_ —
+        // a whole 4 MB L2 block pinned for the Device's lifetime to carry
+        // 4 bytes, once. submitImmediate waits the queue idle before
+        // returning, so the transient buffer is destroyed immediately after.
         uint32_t black = 0xFF000000;
-        auto staging = device_.staging().alloc(4);
-        memcpy(staging.mappedPtr, &black, 4);
+        VkBufferCreateInfo bci {};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size  = 4;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkBuffer buf = VK_NULL_HANDLE;
+        if (vkCreateBuffer(vkd, &bci, nullptr, &buf) != VK_SUCCESS) return;
+
+        VkMemoryRequirements req {};
+        vkGetBufferMemoryRequirements(vkd, buf, &req);
+        VkMemoryAllocateInfo ai {};
+        ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        ai.allocationSize  = req.size;
+        ai.memoryTypeIndex = Memory::findMemoryType(device_.physicalDevice(),
+            req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VkDeviceMemory mem = VK_NULL_HANDLE;
+        void* mapped = nullptr;
+        if (ai.memoryTypeIndex == Memory::kNoMemoryType
+            || vkAllocateMemory(vkd, &ai, nullptr, &mem) != VK_SUCCESS
+            || vkBindBufferMemory(vkd, buf, mem, 0) != VK_SUCCESS
+            || vkMapMemory(vkd, mem, 0, 4, 0, &mapped) != VK_SUCCESS)
+        {
+            if (mem != VK_NULL_HANDLE) vkFreeMemory(vkd, mem, nullptr);
+            vkDestroyBuffer(vkd, buf, nullptr);
+            return;
+        }
+        memcpy(mapped, &black, 4);
+        vkUnmapMemory(vkd, mem);
+
         VkImage dst = blackPixel_.image.image();
+        Memory::L2::Allocation staging { nullptr, buf, 0 };
         device_.submitImmediate([&](VkCommandBuffer cmd) {
             Renderer::recordImageUpload(cmd, staging, dst, 1, 1);
         });
+        vkDestroyBuffer(vkd, buf, nullptr);
+        vkFreeMemory(vkd, mem, nullptr);
     }
 };
 

@@ -46,10 +46,12 @@ public:
         float    halfW,     halfH;       // 16..24  — rrect half-extent
         float    cornerRadius;           // 24..28
         uint32_t shapeType;              // 28..32  — 1 = rrect, 2 = path
-        uint32_t segmentStart;           // 32..36  — path only
+        uint32_t segmentStart;           // 32..36  — path only (strip TABLE when binned)
         uint32_t segmentCount;           // 36..40  — path only
         uint32_t fillRule;               // 40..44  — 0 = non-zero, 1 = even-odd
-        uint32_t _pad;                   // 44..48
+        uint32_t stripCount = 0;         // 44..48  — Y-strip binning; 0 = flat
+        float    stripMinY  = 0.0f;      // 48..52
+        float    invStripH  = 0.0f;      // 52..56
     };
 
     ClipPipeline() = default;
@@ -335,7 +337,7 @@ private:
         pci.renderPass = renderPass;
 
         VkPipeline result = VK_NULL_HANDLE;
-        vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &result);
+        vkCreateGraphicsPipelines(d, device_->pipelineCache(), 1, &pci, nullptr, &result);
 
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);

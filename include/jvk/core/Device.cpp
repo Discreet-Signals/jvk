@@ -70,21 +70,159 @@ Device::Device()
     if (!createLogicalDevice()) return;
     if (!createCommandPool()) return;
 
-    pool_    = Memory::L1(physDevice_, device_);
-    staging_ = Memory::L2(physDevice_, device_);
+    // VMA allocator — created before the memory tiers that view it. API
+    // version matches the instance (created for Vulkan 1.0 above), so VMA
+    // sticks to core-1.0 entry points.
+    {
+        VmaAllocatorCreateInfo aci {};
+        aci.instance         = instance_;
+        aci.physicalDevice   = physDevice_;
+        aci.device           = device_;
+        aci.vulkanApiVersion = VK_API_VERSION_1_0;
+        if (vmaCreateAllocator(&aci, &allocator_) != VK_SUCCESS) {
+            allocator_ = nullptr;
+            return;   // half-dead Device; editors probe device()/pool() results
+        }
+    }
+
+    pool_    = Memory::L1(allocator_);
     bindings_ = Memory::M(device_);
+
+    loadPipelineCache();
+}
+
+// =============================================================================
+// Pipeline cache — disk-backed (write-to-temp + atomic rename; own header
+// with vendor/device/driver/pipelineCacheUUID so stale or foreign data falls
+// back to an empty cache instead of feeding a strict driver garbage).
+// =============================================================================
+
+namespace {
+struct PipelineCacheFileHeader {
+    uint32_t magic;
+    uint32_t dataSize;
+    uint32_t vendorID;
+    uint32_t deviceID;
+    uint32_t driverVersion;
+    uint8_t  uuid[VK_UUID_SIZE];
+};
+constexpr uint32_t kPipelineCacheMagic = 0x4A564B50u; // "JVKP"
+} // namespace
+
+juce::File Device::pipelineCacheFile()
+{
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("jvk").getChildFile("pipeline.cache");
+}
+
+void Device::loadPipelineCache()
+{
+    VkPhysicalDeviceProperties props {};
+    vkGetPhysicalDeviceProperties(physDevice_, &props);
+
+    std::vector<uint8_t> data;
+    juce::MemoryBlock blob;
+    auto f = pipelineCacheFile();
+    if (f.existsAsFile() && f.loadFileAsData(blob)
+        && blob.getSize() > sizeof(PipelineCacheFileHeader))
+    {
+        PipelineCacheFileHeader h {};
+        memcpy(&h, blob.getData(), sizeof(h));
+        if (h.magic == kPipelineCacheMagic
+            && h.dataSize == blob.getSize() - sizeof(h)
+            && h.vendorID == props.vendorID
+            && h.deviceID == props.deviceID
+            && h.driverVersion == props.driverVersion
+            && memcmp(h.uuid, props.pipelineCacheUUID, VK_UUID_SIZE) == 0)
+        {
+            data.resize(h.dataSize);
+            memcpy(data.data(),
+                   static_cast<const uint8_t*>(blob.getData()) + sizeof(h),
+                   h.dataSize);
+        }
+    }
+
+    VkPipelineCacheCreateInfo ci {};
+    ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    ci.initialDataSize = data.size();
+    ci.pInitialData    = data.empty() ? nullptr : data.data();
+    if (vkCreatePipelineCache(device_, &ci, nullptr, &pipelineCache_) != VK_SUCCESS)
+    {
+        // Corrupt initial data on a strict driver — retry empty.
+        pipelineCache_ = VK_NULL_HANDLE;
+        ci.initialDataSize = 0;
+        ci.pInitialData    = nullptr;
+        if (vkCreatePipelineCache(device_, &ci, nullptr, &pipelineCache_) != VK_SUCCESS)
+            pipelineCache_ = VK_NULL_HANDLE;   // fine — creates just run uncached
+    }
+}
+
+void Device::savePipelineCache()
+{
+    if (pipelineCache_ == VK_NULL_HANDLE || device_ == VK_NULL_HANDLE) return;
+
+    size_t size = 0;
+    if (vkGetPipelineCacheData(device_, pipelineCache_, &size, nullptr) != VK_SUCCESS
+        || size == 0)
+        return;
+    std::vector<uint8_t> data(size);
+    if (vkGetPipelineCacheData(device_, pipelineCache_, &size, data.data()) != VK_SUCCESS)
+        return;
+
+    VkPhysicalDeviceProperties props {};
+    vkGetPhysicalDeviceProperties(physDevice_, &props);
+
+    PipelineCacheFileHeader h {};
+    h.magic         = kPipelineCacheMagic;
+    h.dataSize      = static_cast<uint32_t>(size);
+    h.vendorID      = props.vendorID;
+    h.deviceID      = props.deviceID;
+    h.driverVersion = props.driverVersion;
+    memcpy(h.uuid, props.pipelineCacheUUID, VK_UUID_SIZE);
+
+    auto f = pipelineCacheFile();
+    f.getParentDirectory().createDirectory();
+    auto tmp = f.getSiblingFile(f.getFileName() + ".tmp");
+    {
+        juce::FileOutputStream out(tmp);
+        if (out.failedToOpen()) return;
+        out.setPosition(0);
+        out.truncate();
+        out.write(&h, sizeof(h));
+        out.write(data.data(), size);
+        out.flush();
+    }
+    // Atomic replace: last writer wins if two plugin processes race.
+    tmp.moveFileTo(f);
 }
 
 Device::~Device()
 {
-    if (device_) vkDeviceWaitIdle(device_);
+    if (device_) {
+        // External-sync: idle the device under the process queue lock so a
+        // teardown never races another editor's worker inside vkQueueSubmit.
+        const juce::ScopedLock queueSync(Renderer::queueLock());
+        vkDeviceWaitIdle(device_);
+    }
 
     caches_.reset();
 
+    if (pipelineCache_ != VK_NULL_HANDLE) {
+        savePipelineCache();
+        vkDestroyPipelineCache(device_, pipelineCache_, nullptr);
+        pipelineCache_ = VK_NULL_HANDLE;
+    }
+
     // Destroy memory tiers BEFORE the VkDevice — their destructors call vkDestroy*
     bindings_ = Memory::M();
-    staging_  = Memory::L2();
     pool_     = Memory::L1();
+
+    // After every allocation owner has torn down. In debug builds VMA
+    // asserts on leaked allocations here — a free leak detector.
+    if (allocator_ != nullptr) {
+        vmaDestroyAllocator(allocator_);
+        allocator_ = nullptr;
+    }
 
     if (commandPool_ != VK_NULL_HANDLE) vkDestroyCommandPool(device_, commandPool_, nullptr);
     if (device_) vkDestroyDevice(device_, nullptr);
@@ -199,17 +337,6 @@ static int scorePhysicalDevice(VkPhysicalDevice d)
     return score;
 }
 
-static VkSampleCountFlagBits getMaxSampleCount(VkPhysicalDevice d)
-{
-    VkPhysicalDeviceProperties props;
-    vkGetPhysicalDeviceProperties(d, &props);
-    VkSampleCountFlags c = props.limits.framebufferColorSampleCounts;
-    if (c & VK_SAMPLE_COUNT_8_BIT)  return VK_SAMPLE_COUNT_8_BIT;
-    if (c & VK_SAMPLE_COUNT_4_BIT)  return VK_SAMPLE_COUNT_4_BIT;
-    if (c & VK_SAMPLE_COUNT_2_BIT)  return VK_SAMPLE_COUNT_2_BIT;
-    return VK_SAMPLE_COUNT_1_BIT;
-}
-
 bool Device::selectPhysicalDevice()
 {
     uint32_t count = 0;
@@ -251,8 +378,6 @@ bool Device::selectPhysicalDevice()
         }
     }
     if (physDevice_ == VK_NULL_HANDLE) return false;
-
-    maxMSAA_ = getMaxSampleCount(physDevice_);
 
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(physDevice_, &props);

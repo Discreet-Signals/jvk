@@ -144,26 +144,34 @@ struct DrawShaderParams {
     float                  scale;
 };
 
-// Analytical SDF path fill. Graphics::fillPath flattens the path to line
-// segments in physical-pixel space, uploads them to PathPipeline's storage
-// buffer ring (via uploadSegments()), and packs the cover-quad vertices +
-// segment range here for later replay. The fragment shader then iterates
-// `segmentCount` segments starting at `segmentStart` in the SSBO.
+// Analytical SDF path fill, TILE mode (see path_sdf.frag). Graphics::fillPath
+// flattens the path to line segments in physical-pixel space, uploads the
+// tile-local segment lists to PathPipeline's storage buffer ring (via
+// uploadSegments()), and records the tile quads here. `fillRule` matches
+// juce::Path::isUsingNonZeroWinding() — 0 for non-zero, 1 for even-odd.
 //
-// `quadVerts[6]` is a triangle-list quad in physical pixels covering the
-// path bounds + 1 AA pixel. The quad carries the fill colour in vertex
-// attrs. `fillRule` matches juce::Path::isUsingNonZeroWinding() — 0 for
-// non-zero, 1 for even-odd.
+// Empty tiles are never drawn, interior runs merge into single flat quads,
+// edge tiles carry small local segment lists. The per-tile UIVertex span
+// follows this struct in the arena (4-byte aligned). This replaced the
+// single bounds-covering quad whose every fragment walked the full (or
+// strip-binned) segment list.
 struct FillPathParams {
-    UIVertex quadVerts[6];  // color + gradientInfo pre-baked per corner
-    uint32_t segmentStart;
-    uint32_t segmentCount;
+    uint32_t vertexCount;   // 6 × emitted quads; UIVertex span follows in arena
+    uint32_t segmentStart;  // base of this path's tile-local segment data
     uint32_t fillRule;      // 0 = non-zero winding, 1 = even-odd
     uint32_t fillIndex;     // renderer.getFill() slot → chooses colorLUT descriptor
+    float    tileSize;      // tile width in physical px (16, coarsened if huge)
 };
 
-struct PushClipRectParams {
-    juce::Rectangle<int>   rect;
+// One command + one arena span of juce::Rectangle<float> for a whole
+// RectangleList fill. The rect span immediately follows this struct in the
+// arena (4-byte aligned).
+struct FillRectListParams {
+    uint32_t              rectCount;
+    uint32_t              fillIndex;
+    juce::AffineTransform transform;
+    float                 opacity;
+    float                 scale;
 };
 
 // Clip shape for the stencil push/pop pipelines. One payload shared by both
@@ -194,10 +202,14 @@ struct ClipShapeParams {
     float                  centerX, centerY; // rrect only (physical px)
     float                  halfW, halfH;     // rrect only (physical px)
     float                  cornerRadius;     // rrect only (physical px)
-    uint32_t               segmentStart;     // path only
+    uint32_t               segmentStart;     // path only (strip TABLE when binned)
     uint32_t               segmentCount;     // path only
     uint32_t               fillRule;         // path only
     juce::Rectangle<float> coverRect;        // quad to cover in physical px
+    // Y-strip binning (path only). 0 = flat list.
+    uint32_t               stripCount = 0;
+    float                  stripMinY  = 0.0f;
+    float                  invStripH  = 0.0f;
 };
 
 struct EffectBlendParams {
@@ -252,13 +264,10 @@ struct BlurShapeParams {
     uint32_t edgePlacement;        // BlurEdge as uint32
     uint32_t inverted;             // 0 or 1
     uint32_t mode;                 // BlurMode as uint32 (pass count / type lives here)
-};
-
-struct EffectResolveParams {
-    float                  param;
-    uint32_t               type;
+    // ROI: physical-pixel AABB of every pixel this blur can touch (shape
+    // bounds + blur reach, transformed). Record-side computed; replay walks
+    // the pass chain backward from it. Empty = whole clip (inverted blurs).
     juce::Rectangle<float> region;
-    float                  scale;
 };
 
 // Analytical path SDF blur. Graphics::{draw,fill}BlurredPath flattens the
@@ -276,6 +285,12 @@ struct BlurPathParams {
     uint32_t edgePlacement;   // BlurEdge as uint32
     uint32_t inverted;        // 0 or 1
     uint32_t mode;            // BlurMode as uint32 (pass count / type lives here)
+    // ROI: physical-pixel AABB of the path + blur reach. Empty = whole clip.
+    juce::Rectangle<float> region;
+    // Y-strip binning (pad = the blur's full reach). 0 = flat list.
+    uint32_t stripCount = 0;
+    float    stripMinY  = 0.0f;
+    float    invStripH  = 0.0f;
 };
 
 } // namespace jvk

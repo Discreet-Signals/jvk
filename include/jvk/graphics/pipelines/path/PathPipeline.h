@@ -189,19 +189,22 @@ public:
     }
 
     // Dispatch a single FillPath draw inside the active scene render pass.
-    // `fanVerts` is a 6-vertex UIVertex quad emitted by Graphics::fillPath
-    // with per-vertex color + gradientInfo populated exactly like the 2D
-    // color pipeline. `colorDesc` is the shared color-source descriptor
+    // `tileVerts` is the per-tile quad list emitted by Graphics::fillPath
+    // (TILE mode — see path_sdf.frag): 6 vertices per emitted tile/run,
+    // per-vertex color + gradientInfo populated exactly like the 2D color
+    // pipeline, uv = tile origin, shapeInfo = (localStart, localCount,
+    // backdrop, 0). `colorDesc` is the shared color-source descriptor
     // (`ResourceCaches::gradientDescriptor()` or `defaultDescriptor()`) —
-    // path_sdf.frag samples it iff gradientInfo.z > 0. `segmentStart` /
-    // `segmentCount` point into the storage buffer this pipeline owns.
+    // path_sdf.frag samples it iff gradientInfo.z > 0. `segmentStart` is
+    // the base of the path's tile-local segment data in the SSBO.
     void dispatch(State& state, VkCommandBuffer cmd, Renderer& r,
                   const DrawCommand& drawCmd,
-                  const UIVertex* fanVerts, uint32_t vertexCount,
-                  uint32_t segmentStart, uint32_t segmentCount,
+                  const UIVertex* tileVerts, uint32_t vertexCount,
+                  uint32_t segmentStart,
                   uint32_t fillRule,
                   VkDescriptorSet colorDesc,
-                  float viewportW, float viewportH)
+                  float viewportW, float viewportH,
+                  float tileSize)
     {
         if (!ready() || vertexCount == 0) return;
 
@@ -234,22 +237,21 @@ public:
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
             layout_, 1, 1, &ssboDescSets_[currentFrameSlot_], 0, nullptr);
 
-        // Push constants — viewport + segment range + fill rule.
+        // Push constants — viewport + segment base + fill rule + tile size.
         PushConstants pc {};
         pc.viewportW    = viewportW;
         pc.viewportH    = viewportH;
         pc.segmentStart = segmentStart;
-        pc.segmentCount = segmentCount;
         pc.fillRule     = fillRule;
-        pc._pad         = 0.0f;
+        pc.tileW        = tileSize;
         vkCmdPushConstants(cmd, layout_,
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
             0, sizeof(pc), &pc);
 
-        // Write the quad vertices into the State's vertex ring buffer and
+        // Write the tile quads into the State's vertex ring buffer and
         // issue the draw. State::draw wraps all of this; it also owns the
         // current-bound vertex buffer cache, so we let it handle binding.
-        state.draw(drawCmd, fanVerts, vertexCount);
+        state.draw(drawCmd, tileVerts, vertexCount);
 
         // State's pipeline/descriptor tracker doesn't know about our
         // custom layout → force a full rebind for the next op.
@@ -269,12 +271,15 @@ public:
     VkDescriptorSetLayout ssboSetLayout() const { return ssboSetLayout_; }
 
 private:
+    // Must mirror the PC block in path_sdf.vert/.frag (32 bytes).
     struct PushConstants {
         float    viewportW, viewportH;
-        uint32_t segmentStart;
-        uint32_t segmentCount;
+        uint32_t segmentStart;   // base of tile-local segment data
+        uint32_t segmentCount = 0; // unused in tile mode (layout stability)
         uint32_t fillRule;       // 0 = non-zero, 1 = even-odd
-        float    _pad;
+        uint32_t _reserved0 = 0;
+        float    tileW = 16.0f;  // tile width in physical px
+        float    _reserved1 = 0.0f;
     };
 
     // Grow one slot's SSBO to fit `neededBytes` (doubling). Only the
@@ -462,7 +467,7 @@ private:
         pci.renderPass = renderPass;
 
         VkPipeline result = VK_NULL_HANDLE;
-        vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &result);
+        vkCreateGraphicsPipelines(d, device_->pipelineCache(), 1, &pci, nullptr, &result);
 
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);

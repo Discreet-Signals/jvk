@@ -181,7 +181,7 @@ public:
         pci.layout = layout_;
         pci.renderPass = compatibleRenderPass;
 
-        vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline_);
+        vkCreateGraphicsPipelines(d, device_->pipelineCache(), 1, &pci, nullptr, &pipeline_);
 
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);
@@ -195,6 +195,13 @@ public:
     // `stencilRef` selects which clip depth this pass writes at. Pass 0
     // for unclipped effects (stencil buffer starts at 0 everywhere and the
     // pre-copy step is skipped anyway).
+    // `scissor` (optional) confines the pass to a sub-rect — the ROI walk in
+    // Renderer::execute computes it per pass from the effect's region + each
+    // pass's kernel read margin. Null = full extent (legacy behavior). The
+    // render area shrinks with it: pixels outside the render area are
+    // untouched by LOAD/STORE, which on tile GPUs skips their tiles
+    // entirely. The viewport stays full-extent so gl_FragCoord remains
+    // screen-space.
     void applyPass(VkCommandBuffer cmd,
                    VkDescriptorSet srcDesc,
                    VkFramebuffer   dstFramebuffer,
@@ -202,16 +209,20 @@ public:
                    VkExtent2D      extent,
                    float           dirX, float dirY,
                    float           radius,
-                   uint32_t        stencilRef = 0)
+                   uint32_t        stencilRef = 0,
+                   const VkRect2D* scissor = nullptr)
     {
         // The effect RP has two attachments (color + depth/stencil), but
         // both have LOAD_OP_LOAD / LOAD_OP_DONT_CARE on the relevant aspects,
         // so no clear values are required at begin time.
+        VkRect2D sc = scissor ? *scissor : VkRect2D { {0, 0}, extent };
+        if (sc.extent.width == 0 || sc.extent.height == 0) return;
+
         VkRenderPassBeginInfo rpbi {};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpbi.renderPass = dstRenderPass;
         rpbi.framebuffer = dstFramebuffer;
-        rpbi.renderArea.extent = extent;
+        rpbi.renderArea = sc;
         rpbi.clearValueCount = 0;
         rpbi.pClearValues = nullptr;
         vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
@@ -222,7 +233,6 @@ public:
         vp.maxDepth = 1.0f;
         vkCmdSetViewport(cmd, 0, 1, &vp);
 
-        VkRect2D sc { {0, 0}, extent };
         vkCmdSetScissor(cmd, 0, 1, &sc);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);

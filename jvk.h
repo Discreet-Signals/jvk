@@ -49,6 +49,9 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include <vulkan/vulkan.h>
+// Vulkan Memory Allocator (vendored, v3.1.0). Declarations only here — the
+// implementation is compiled once in jvk.cpp via VMA_IMPLEMENTATION.
+#include "include/jvk/vendor/vk_mem_alloc.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -56,7 +59,6 @@
 #include "include/jvk/core/PipelineConfig.h"
 #include "include/jvk/core/Memory.h"
 #include "include/jvk/core/Resource.h"
-#include "include/jvk/core/DeletionQueue.h"
 #include "include/jvk/core/Device.h"
 #include "include/jvk/core/FrameRetained.h"
 #include "include/jvk/core/Renderer.h"

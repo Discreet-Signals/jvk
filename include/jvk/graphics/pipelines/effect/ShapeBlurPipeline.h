@@ -169,7 +169,7 @@ public:
         pci.layout = layout_;
         pci.renderPass = compatibleRenderPass;
 
-        vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline_);
+        vkCreateGraphicsPipelines(d, device_->pipelineCache(), 1, &pci, nullptr, &pipeline_);
 
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);
@@ -189,11 +189,14 @@ public:
                    const PushConstants& params,
                    uint32_t        stencilRef = 0)
     {
+        if (scissor.extent.width == 0 || scissor.extent.height == 0) return;
         VkRenderPassBeginInfo rpbi {};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpbi.renderPass = dstRenderPass;
         rpbi.framebuffer = dstFramebuffer;
-        rpbi.renderArea.extent = extent;
+        // Render area = scissor: pixels outside are untouched by LOAD/STORE,
+        // so tile GPUs skip their tiles entirely.
+        rpbi.renderArea = scissor;
         rpbi.clearValueCount = 0;
         rpbi.pClearValues = nullptr;
         vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);

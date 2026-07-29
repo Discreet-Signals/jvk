@@ -4,6 +4,7 @@ namespace jvk {
 
 class Pipeline;
 class RenderTarget;
+namespace pipelines { class ColorPipeline; }
 class EffectPipeline;
 class HSVPipeline;
 class ShapeBlurPipeline;
@@ -37,7 +38,6 @@ enum class DrawOp : uint8_t {
     DrawShader,
     EffectBlend,
     EffectNoise,        // procedural white-noise overlay (Graphics::drawNoise)
-    EffectResolve,
     EffectKernel,
     EffectHSV,          // full-screen HSV scale/delta (saturate, shiftHue, etc.)
     BlurShape,
@@ -51,14 +51,15 @@ enum class DrawOp : uint8_t {
 // DrawCommand — one entry in the command vector
 // =============================================================================
 
+// Slimmed to what replay actually reads. The old zOrder/dataSize/scopeDepth
+// fields were written on every push and never read — the z-sort they were
+// designed for was never implemented, and commands replay in recording order
+// (JUCE's painter's algorithm order, which is already correct).
 struct DrawCommand {
-    float                zOrder;
     DrawOp               op;
-    uint32_t             dataOffset;
-    uint32_t             dataSize;
-    juce::Rectangle<int> clipBounds;
     uint8_t              stencilDepth;
-    uint32_t             scopeDepth;
+    uint32_t             dataOffset;
+    juce::Rectangle<int> clipBounds;
 };
 
 // =============================================================================
@@ -139,9 +140,6 @@ public:
     void setShapeResource(VkDescriptorSet shapeSet);
     void setColorResource(VkDescriptorSet colorSet);
     void draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count);
-    // Push a payload to the vertex-stage push-constant range at the given
-    // byte offset (after the viewport already written by setPipeline()).
-    void pushConstants(uint32_t offset, uint32_t size, const void* data);
 
     void pushClipRect(const juce::Rectangle<int>& rect);
     void pushStencilDepth(); // CPU-only: increment the clip counter used as
@@ -190,14 +188,11 @@ public:
     ~Renderer();
 
     template <typename Params>
-    void push(DrawOp op, float zOrder, const juce::Rectangle<int>& clip,
-              uint8_t stencilDepth, uint32_t scopeDepth, const Params& params)
+    void push(DrawOp op, const juce::Rectangle<int>& clip,
+              uint8_t stencilDepth, const Params& params)
     {
         uint32_t offset = arena_.push(params);
-        commands_.push_back({
-            zOrder, op, offset, static_cast<uint32_t>(sizeof(Params)),
-            clip, stencilDepth, scopeDepth
-        });
+        commands_.push_back({ op, stencilDepth, offset, clip });
     }
 
     // Pin a FrameRetained so its destructor will block until the GPU is
@@ -221,10 +216,32 @@ public:
         if (!obj) return;
         FrameRetained* base = obj;
         base->pin();
-        recordingRetains_.push_back(base);
+        // uploadLock_ guards every record↔worker shared container. retain()
+        // is reachable from the message thread OUTSIDE the isBusy() gate
+        // (Shader::update, Cache::getTexture via Shader::set), so an
+        // unlocked push_back can race the worker's swap — a lost entry means
+        // the pin is never dropped (object leaks pinned forever) or, torn,
+        // the vector corrupts. Same bug class as the fixed upload-queue race.
+        {
+            const juce::ScopedLock lk(uploadLock_);
+            recordingRetains_.push_back(base);
+        }
     }
 
     void registerPipeline(Pipeline& pipeline);
+
+    // Drop every registered pipeline pointer (dispatch table + module
+    // attachments). Teardown calls this BEFORE destroying the pipeline
+    // objects so the Renderer never holds dangling pipeline pointers.
+    void clearPipelines()
+    {
+        for (auto& p : pipelineForOp_) p = nullptr;
+        postProcess_ = nullptr;  copyEffect_   = nullptr;
+        hsvPipeline_ = nullptr;  shapeBlur_    = nullptr;
+        pathBlur_    = nullptr;  shaderPipeline_ = nullptr;
+        pathPipeline_ = nullptr; clipPipeline_ = nullptr;
+        colorPipeline_ = nullptr;
+    }
 
     // ---- Threaded execution -------------------------------------------------
     //
@@ -344,18 +361,32 @@ public:
     void setClipPipeline(ClipPipeline* p) { clipPipeline_ = p; }
     ClipPipeline* clipPipeline() const { return clipPipeline_; }
 
+    // Attach the color pipeline (glyph atlas owner). Graphics::drawGlyphs
+    // rasterizes missing glyphs through this at RECORD time (message thread),
+    // so the atlas page is staged + uploaded before the frame's render pass —
+    // the old replay-time rasterization created pages AFTER the upload flush,
+    // sampling them in UNDEFINED layout the frame a glyph first appeared.
+    void setColorPipeline(pipelines::ColorPipeline* cp) { colorPipeline_ = cp; }
+    pipelines::ColorPipeline* colorPipeline() const { return colorPipeline_; }
+
     // ---- Deferred uploads ---------------------------------------------------
     //
-    // Every texture / buffer GPU upload triggered during record (image cache
-    // inserts, glyph-atlas dirty pages, gradient-atlas row uploads, path-mesh
-    // buffer inserts) queues into THIS Renderer's pending list. flushUploads
-    // records the copy + barrier commands into the frame's command buffer
-    // just before the scene render pass. Keeping the queue on the Renderer —
-    // not Device — means each editor's worker drains its own queue and two
-    // editors never race on a shared vector.
+    // Every texture GPU upload triggered during record (image cache
+    // inserts, glyph-atlas dirty pages, gradient-atlas row uploads) queues
+    // into THIS Renderer's pending list. flushUploads records the copy +
+    // barrier commands into the frame's command buffer just before the
+    // scene render pass. Keeping the queue on the Renderer — not Device —
+    // means each editor's worker drains its own queue and two editors never
+    // race on a shared vector.
     void upload(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height);
-    void upload(Memory::L2::Allocation src, VkBuffer dst,
-                VkDeviceSize size, VkDeviceSize dstOffset = 0);
+
+    // Partial-image upload: copies a w×h rect (tightly packed in staging)
+    // into dst at (x, y), PRESERVING the rest of the image — the pre-copy
+    // barrier transitions from SHADER_READ_ONLY instead of UNDEFINED. Used
+    // by the glyph atlas to upload only the dirty rect of a page instead of
+    // re-staging all 16 MB for one new glyph.
+    void uploadRect(Memory::L2::Allocation src, VkImage dst,
+                    int32_t x, int32_t y, uint32_t width, uint32_t height);
 
     // upload() variant for images whose CONTENTS are refreshed every frame
     // (jvk::Shader::update's per-binding video/procedural feeds). Identical
@@ -372,6 +403,11 @@ public:
     // records a copy into a freed VkImage.
     void cancelUploads(VkImage dst);
 
+    // Same, across every live Renderer in the process. For destructors that
+    // have no Renderer back-pointer (~Shader): a queued upload must never
+    // outlive its destination image.
+    static void cancelUploadsAllRenderers(VkImage dst);
+
     void flushUploads(VkCommandBuffer cmd);
 
     // Record a single image-copy upload (TRANSFER_DST barrier → copy →
@@ -383,23 +419,43 @@ public:
     // described at uploadDynamic().
     static void recordImageUpload(VkCommandBuffer cmd, Memory::L2::Allocation src,
                                    VkImage dst, uint32_t width, uint32_t height,
-                                   bool dynamicContent = false);
+                                   bool dynamicContent = false,
+                                   bool partial = false,
+                                   int32_t dstX = 0, int32_t dstY = 0);
 
     // ---- Deferred destruction ----------------------------------------------
     //
-    // Per-frame-slot deletion queues. Resources that get replaced mid-frame
-    // (e.g. vertex-ring-buffer growth) move into this slot's bucket. The
-    // bucket's flush runs at the top of the NEXT time this slot rolls around,
-    // which is after target_.beginFrame() has waited on the slot's fence —
-    // so the GPU is provably done with whatever we're about to destroy.
-    // Per-Renderer (not per-Device) so two editors' workers never share the
-    // same bucket vector.
-    void retire(Image&& img)    { retired_[activeRetireSlot_].retire(std::move(img)); }
-    void retire(Buffer&& buf)   { retired_[activeRetireSlot_].retire(std::move(buf)); }
+    // Resources replaced mid-frame (e.g. a dynamic shader input resized)
+    // move into the active FrameSlot's retired bucket. The bucket is drained
+    // the NEXT time the slot rolls around — after target_.beginFrame() has
+    // waited on the slot's fence — so the GPU is provably done with whatever
+    // we destroy. Locked: retire() is message-thread-reachable outside the
+    // isBusy() gate (Shader::update) while the worker rotates the slot.
+    void retire(Image&& img)
+    {
+        const juce::ScopedLock lk(uploadLock_);
+        frameSlots_[activeRetireSlot_].retiredImages.push_back(std::move(img));
+    }
 
-    // Capture non-POD types into side vectors. Returns index.
-    uint32_t captureFont(const juce::Font& f)     { fonts_.push_back(f); return static_cast<uint32_t>(fonts_.size() - 1); }
-    uint32_t captureFill(const juce::FillType& f)  { fills_.push_back(f); return static_cast<uint32_t>(fills_.size() - 1); }
+    // Capture non-POD types into side vectors. Returns index. Consecutive
+    // duplicates dedupe: JUCE paints whole components with one fill/font, so
+    // most captures repeat the previous entry — and a gradient FillType copy
+    // heap-allocates a fresh ColourGradient every time. One equality check
+    // saves an allocation per draw in the common case.
+    uint32_t captureFont(const juce::Font& f)
+    {
+        if (!fonts_.empty() && fonts_.back() == f)
+            return static_cast<uint32_t>(fonts_.size() - 1);
+        fonts_.push_back(f);
+        return static_cast<uint32_t>(fonts_.size() - 1);
+    }
+    uint32_t captureFill(const juce::FillType& f)
+    {
+        if (!fills_.empty() && fills_.back() == f)
+            return static_cast<uint32_t>(fills_.size() - 1);
+        fills_.push_back(f);
+        return static_cast<uint32_t>(fills_.size() - 1);
+    }
 
     const juce::Font&     getFont(uint32_t i) const { return fonts_[i]; }
     const juce::FillType& getFill(uint32_t i) const { return fills_[i]; }
@@ -408,10 +464,6 @@ public:
     void arena_align(uint32_t alignment) { arena_.align(alignment); }
     template <typename T>
     void arena_pushSpan(std::span<const T> data) { arena_.pushSpan(data); }
-    // Byte offset where the next push will land. Capture before an
-    // arena_pushSpan call to remember that data's location for later
-    // cross-command references (e.g. PopClip reusing PushClipPath's verts).
-    uint32_t arena_offset() const { return arena_.size(); }
 
     // Per-frame reset: drop the command list, arena, captured non-POD types,
     // and the gradient atlas's per-frame state. Out-of-line because
@@ -442,7 +494,6 @@ public:
     // those two threads inside one editor only, so two editors never race
     // on cursor_/hashToRow_/cpuBuffer_. Accessors are out-of-line so this
     // header only needs a forward declaration of GradientAtlas.
-    GradientAtlas&  gradients();
     float           registerGradient(const juce::ColourGradient& g);
     VkDescriptorSet gradientDescriptor() const;
 
@@ -468,53 +519,58 @@ private:
         VkBuffer     srcBuffer;
         VkDeviceSize srcOffset;
         bool         dynamicContent = false;
+        // Partial-rect upload (uploadRect): copy lands at (dstX, dstY) and
+        // the pre-copy barrier preserves existing contents.
+        bool         partial = false;
+        int32_t      dstX = 0, dstY = 0;
     };
-    struct PendingBufferUpload {
-        VkBuffer     dstBuffer;
-        VkDeviceSize dstOffset;
-        VkDeviceSize size;
-        VkBuffer     srcBuffer;
-        VkDeviceSize srcOffset;
+    // The upload queue is pushed from the message thread (record:
+    // Shader::update dynamic feeds, cache inserts, atlas pages) while the
+    // render worker drains it in flushUploads — every access goes through
+    // uploadLock_. Without it a push_back racing the worker's drain is
+    // silently lost, and a per-frame dynamic texture (CRT screen) can miss
+    // EVERY upload when the two clocks phase-lock: the image never leaves
+    // UNDEFINED and samples black.
+    //
+    // uploadLock_ is THE record↔worker shared-state lock: it also guards
+    // recordingRetains_, activeRetireSlot_, and every FrameSlot vector.
+    juce::CriticalSection      uploadLock_;
+    std::vector<PendingUpload> pendingUploads_;
+    std::vector<PendingUpload> uploadScratch_;   // worker-only swap target
+
+    // ---- Per-frame-slot lifetime rotation ----------------------------------
+    //
+    // ONE structure per frame-in-flight slot holding everything whose release
+    // is keyed to that slot's fence:
+    //   - retiredImages: resources replaced mid-frame, destroyed post-fence
+    //   - staging:       L2 blocks consumed by the slot's submitted frame,
+    //                    recycled post-fence
+    //   - pins:          FrameRetained objects referenced by the slot's
+    //                    command buffer, unpinned post-fence
+    // execute() drains the slot in ONE place at the top (after
+    // target_.beginFrame() waited the slot's fence) and refills it at the
+    // bottom. A single rotation makes the historical failure modes
+    // structurally impossible: the v2-refactor L2 leak (one leg of the
+    // rotation dropped) and the retain/retire races (vectors mutated from
+    // the message thread while the worker moved them).
+    struct FrameSlot {
+        std::vector<Image>             retiredImages;
+        std::vector<Memory::L2::Block> staging;
+        std::vector<FrameRetained*>    pins;
     };
-    // Both queues are pushed from the message thread (record: Shader::update
-    // dynamic feeds, cache inserts, atlas pages) while the render worker
-    // drains them in flushUploads — every access goes through uploadLock_.
-    // Without it a push_back racing the worker's drain is silently lost, and
-    // a per-frame dynamic texture (CRT screen) can miss EVERY upload when the
-    // two clocks phase-lock: the image never leaves UNDEFINED and samples
-    // black.
-    juce::CriticalSection            uploadLock_;
-    std::vector<PendingUpload>       pendingUploads_;
-    std::vector<PendingBufferUpload> pendingBufferUploads_;
-
-    // Deferred-destruction buckets, keyed by frame slot. execute() sets
-    // activeRetireSlot_ to the current frame's slot at entry so any retire()
-    // calls made during that execute's prepare/upload phase go into the
-    // matching bucket, then flushes that bucket at the top of the NEXT time
-    // the same slot is used (post-fence-wait). Matches MAX_FRAMES_IN_FLIGHT.
-    static constexpr int kRetireSlots = 2;
-    std::array<jvk::core::DeletionQueue, kRetireSlots> retired_ {};
-    int activeRetireSlot_ = 0;
-
-    // Staging blocks consumed by each slot's submitted frame, recycled when
-    // that slot's fence next signals — same discipline as retired_. This is
-    // the v1 belt rotation (recycle → record uploads → moveActiveTo) that the
-    // v2 refactor dropped; without it the belt is append-only and every
-    // staged byte permanently grows activeBlocks.
-    std::array<std::vector<Memory::L2::Block>, kRetireSlots> stagingBySlot_ {};
+    static constexpr int kFrameSlots = 2; // matches MAX_FRAMES_IN_FLIGHT
+    std::array<FrameSlot, kFrameSlots> frameSlots_;
+    int       activeRetireSlot_ = 0;      // guarded by uploadLock_
+    FrameSlot flushScratch_;              // worker-only swap target (keeps capacity)
 
     // Per-Renderer gradient atlas (see public accessors above for rationale).
     // unique_ptr so this header only needs a forward declaration.
     std::unique_ptr<GradientAtlas> gradientAtlas_;
 
-    // FrameRetained pins gathered during record (msg thread). At execute
-    // time these are moved into retainsBySlot_[slot]; they get unpinned the
-    // next time that slot rolls around — i.e. after target_.beginFrame()
-    // has waited on the slot's fence and the GPU has provably finished
-    // consuming any command buffer that referenced them.
+    // FrameRetained pins gathered during record (msg thread, under
+    // uploadLock_). At the end of execute they swap into the active
+    // FrameSlot's pins; unpinned the next time that slot rolls around.
     std::vector<FrameRetained*> recordingRetains_;
-    static constexpr int kRetainSlots = 2; // matches MAX_FRAMES_IN_FLIGHT
-    std::array<std::vector<FrameRetained*>, kRetainSlots> retainsBySlot_;
 
     // Process-wide registry of live Renderer instances. Walked by
     // forceDrainAll (invoked from FrameRetained destructors) so a
@@ -526,6 +582,7 @@ private:
     static std::vector<Renderer*>& registry();
 
     Pipeline* pipelineForOp_[static_cast<size_t>(DrawOp::COUNT)] = {};
+    pipelines::ColorPipeline* colorPipeline_ = nullptr;
     EffectPipeline*    postProcess_      = nullptr;
     EffectPipeline*    copyEffect_       = nullptr;
     HSVPipeline*       hsvPipeline_      = nullptr;
@@ -534,7 +591,6 @@ private:
     ShaderPipeline*    shaderPipeline_   = nullptr;
     PathPipeline*      pathPipeline_     = nullptr;
     ClipPipeline*      clipPipeline_     = nullptr;
-    uint64_t frameCounter_ = 0;
 
 public:
     // ---- Threading ---------------------------------------------------------

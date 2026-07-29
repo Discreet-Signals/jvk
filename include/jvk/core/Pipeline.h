@@ -25,7 +25,6 @@ public:
     void loadVertexShader(std::span<const uint32_t> spirv);
     void loadFragmentShader(std::span<const uint32_t> spirv);
 
-    virtual void defineLayout(Memory::M& bindings);
 
     // Builds up to two VkPipelines — normal and (optional) clip variant —
     // sharing one layout and one set of shader modules. Both are single-

@@ -68,7 +68,10 @@ SwapchainTarget::SwapchainTarget(Device& device, VkSurfaceKHR surface,
 SwapchainTarget::~SwapchainTarget()
 {
     VkDevice d = device_.device();
-    vkDeviceWaitIdle(d);
+    {
+        const juce::ScopedLock queueSync(Renderer::queueLock());
+        vkDeviceWaitIdle(d);
+    }
 
     for (int i = 0; i < MAX_FRAMES; i++) {
         vkDestroySemaphore(d, imageAvailable_[i], nullptr);
@@ -100,8 +103,11 @@ void SwapchainTarget::createSwapchain()
     VkDevice d = device_.device();
     VkPhysicalDevice pd = device_.physicalDevice();
 
-    VkSurfaceCapabilitiesKHR caps;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd, surface_, &caps);
+    // Zero-init + check: on query failure the fallback path below would
+    // otherwise clamp against garbage min/maxImageExtent.
+    VkSurfaceCapabilitiesKHR caps {};
+    if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd, surface_, &caps) != VK_SUCCESS)
+        return;
 
     uint32_t fmtCount = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(pd, surface_, &fmtCount, nullptr);
@@ -173,7 +179,15 @@ void SwapchainTarget::createSwapchain()
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = swapchain_;
 
-    vkCreateSwapchainKHR(d, &ci, nullptr, &swapchain_);
+    if (vkCreateSwapchainKHR(d, &ci, nullptr, &swapchain_) != VK_SUCCESS) {
+        // Leave swapchain_ null — beginFrame guards and returns a null frame,
+        // and the next resize retries. ci.oldSwapchain (if any) is retired by
+        // the create call per spec regardless of success; destroy our handle.
+        swapchain_ = VK_NULL_HANDLE;
+        if (ci.oldSwapchain != VK_NULL_HANDLE)
+            vkDestroySwapchainKHR(d, ci.oldSwapchain, nullptr);
+        return;
+    }
 
     if (ci.oldSwapchain != VK_NULL_HANDLE)
         vkDestroySwapchainKHR(d, ci.oldSwapchain, nullptr);
@@ -181,17 +195,9 @@ void SwapchainTarget::createSwapchain()
     vkGetSwapchainImagesKHR(d, swapchain_, &imageCount, nullptr);
     swapImages_.resize(imageCount);
     vkGetSwapchainImagesKHR(d, swapchain_, &imageCount, swapImages_.data());
-
-    swapImageViews_.resize(imageCount);
-    for (uint32_t i = 0; i < imageCount; i++) {
-        VkImageViewCreateInfo vi {};
-        vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        vi.image = swapImages_[i];
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vi.format = format_;
-        vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        vkCreateImageView(d, &vi, nullptr, &swapImageViews_[i]);
-    }
+    // No per-image views: the scene renders offscreen and is BLITTED into the
+    // raw swap images — views were created and destroyed on every resize
+    // without ever being read.
 }
 
 void SwapchainTarget::createRenderPasses()
@@ -470,6 +476,34 @@ void SwapchainTarget::createSceneBuffers()
         Memory::M::writeImage(d, sb.samplerA, 0, sb.colorA.view(), sb.colorA.sampler());
         Memory::M::writeImage(d, sb.samplerB, 0, sb.colorB.view(), sb.colorB.sampler());
     }
+
+    // colorA always enters the frame through sceneRPClear_ (initialLayout
+    // UNDEFINED), but colorB is only ever entered through effectFBtoB /
+    // framebufferB, whose render passes declare initialLayout
+    // SHADER_READ_ONLY — a declared layout must match the image's ACTUAL
+    // layout (VUID-vkCmdBeginRenderPass-initialLayout-00900). Freshly
+    // created images are UNDEFINED, so the first effect pass after startup
+    // and after every resize violated it (the familiar "expects
+    // SHADER_READ_ONLY_OPTIMAL — current layout is UNDEFINED" signature).
+    // One-shot transition here makes the declared contract true.
+    device_.submitImmediate([this](VkCommandBuffer cmd) {
+        VkImageMemoryBarrier barriers[MAX_FRAMES] {};
+        for (int i = 0; i < MAX_FRAMES; i++) {
+            auto& b = barriers[i];
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = sceneBuffers_[i].colorB.image();
+            b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            b.srcAccessMask = 0;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        }
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, MAX_FRAMES, barriers);
+    });
 }
 
 void SwapchainTarget::destroySceneBuffers()
@@ -516,8 +550,6 @@ void SwapchainTarget::createSyncObjects()
 void SwapchainTarget::destroySwapchain()
 {
     VkDevice d = device_.device();
-    for (auto v : swapImageViews_) vkDestroyImageView(d, v, nullptr);
-    swapImageViews_.clear();
     swapImages_.clear();
     if (swapchain_ != VK_NULL_HANDLE) {
         vkDestroySwapchainKHR(d, swapchain_, nullptr);
@@ -529,9 +561,26 @@ RenderTarget::Frame SwapchainTarget::beginFrame()
 {
     SurfaceDpiScope dpiScope(nativeWindow_);
     VkDevice d = device_.device();
-    vkWaitForFences(d, 1, &inFlightFence_[currentFrame_], VK_TRUE, UINT64_MAX);
 
-    uint32_t imageIndex;
+    // A lost device or a failed swapchain create leaves nothing to render
+    // into — return a null frame instead of touching dead handles.
+    if (device_.isLost() || swapchain_ == VK_NULL_HANDLE)
+        return {};
+
+    // Finite timeout instead of UINT64_MAX: if a submit failed (fence never
+    // signals) or the driver hangs, an infinite wait wedges the worker
+    // forever — the message thread then spins in waitForIdle and teardown
+    // force-kills the thread mid-Vulkan-call. 2 s is far beyond any real
+    // frame; on timeout treat the device as unusable and bail gracefully.
+    VkResult waitResult = vkWaitForFences(d, 1, &inFlightFence_[currentFrame_],
+                                          VK_TRUE, 2'000'000'000ull);
+    if (waitResult != VK_SUCCESS) {
+        if (waitResult == VK_ERROR_DEVICE_LOST || waitResult == VK_TIMEOUT)
+            device_.markLost();
+        return {};
+    }
+
+    uint32_t imageIndex = 0;
     VkResult result = vkAcquireNextImageKHR(d, swapchain_, UINT64_MAX,
         imageAvailable_[currentFrame_], VK_NULL_HANDLE, &imageIndex);
 
@@ -556,6 +605,16 @@ RenderTarget::Frame SwapchainTarget::beginFrame()
         resize(width_, height_);
         return {}; // caller checks cmd == VK_NULL_HANDLE
     }
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        // SURFACE_LOST (host destroyed the parent window under us — routine
+        // for embedded plugin views), DEVICE_LOST, OOM. No image acquired,
+        // no semaphore signaled: dropping the frame is safe. The old code
+        // fell through here with an UNINITIALIZED imageIndex and indexed
+        // swapImages_ with garbage.
+        if (result == VK_ERROR_DEVICE_LOST)
+            device_.markLost();
+        return {};
+    }
 
     vkResetFences(d, 1, &inFlightFence_[currentFrame_]);
     vkResetCommandBuffer(commandBuffers_[currentFrame_], 0);
@@ -576,10 +635,12 @@ RenderTarget::Frame SwapchainTarget::beginFrame()
 void SwapchainTarget::endFrame(const Frame& frame)
 {
     SurfaceDpiScope dpiScope(nativeWindow_);
-    VkDevice d = device_.device();
     vkEndCommandBuffer(frame.cmd);
 
-    VkSemaphore waitSems[] = { imageAvailable_[currentFrame_] };
+    // Index sync objects by the frame's OWN slot, not the member counter —
+    // identical while exactly one frame records at a time, but the member
+    // breaks silently the moment frames-in-flight changes.
+    VkSemaphore waitSems[] = { imageAvailable_[frame.frameSlot] };
     VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_TRANSFER_BIT };
     VkSemaphore sigSems[]  = { renderFinished_[frame.imageIndex] };
 
@@ -593,7 +654,17 @@ void SwapchainTarget::endFrame(const Frame& frame)
     si.signalSemaphoreCount = 1;
     si.pSignalSemaphores = sigSems;
 
-    vkQueueSubmit(device_.graphicsQueue(), 1, &si, inFlightFence_[currentFrame_]);
+    // A failed submit means the fence NEVER signals — unchecked, the next
+    // beginFrame waited on it forever, the message thread spun in
+    // waitForIdle, and plugin close force-killed the worker mid-call.
+    // Mark the device unusable; beginFrame's guard + finite wait handle the
+    // rest gracefully.
+    if (vkQueueSubmit(device_.graphicsQueue(), 1, &si,
+                      inFlightFence_[frame.frameSlot]) != VK_SUCCESS) {
+        device_.markLost();
+        currentFrame_ = (currentFrame_ + 1) % MAX_FRAMES;
+        return;
+    }
 
     VkSwapchainKHR swapchains[] = { swapchain_ };
     VkPresentInfoKHR pi {};
@@ -621,13 +692,23 @@ void SwapchainTarget::endFrame(const Frame& frame)
         if (cur.width != 0xFFFFFFFFu && cur.width != 0 && cur.height != 0
             && (cur.width != width_ || cur.height != height_))
             resize(width_, height_);
+    } else if (result == VK_ERROR_DEVICE_LOST) {
+        device_.markLost();
     }
 }
 
 void SwapchainTarget::resize(uint32_t w, uint32_t h)
 {
     VkDevice d = device_.device();
-    vkDeviceWaitIdle(d);
+    // vkDeviceWaitIdle is spec-equivalent to vkQueueWaitIdle on EVERY queue
+    // and carries the same external-sync requirement — unguarded, a resize
+    // on this editor races a sibling editor's worker inside vkQueueSubmit.
+    // Renderer::queueLock() is reentrant (juce::CriticalSection), so taking
+    // it here is safe on the endFrame path that already holds it.
+    {
+        const juce::ScopedLock queueSync(Renderer::queueLock());
+        vkDeviceWaitIdle(d);
+    }
     width_ = w;
     height_ = h;
     destroySceneBuffers();
@@ -705,12 +786,41 @@ void OffscreenTarget::create()
     subpass.pColorAttachments = &colorRef;
     subpass.pDepthStencilAttachment = &depthRef;
 
+    // External dependencies, mirroring SwapchainTarget's scene RP: incoming
+    // (prior sampling/transfer of the render image must complete before we
+    // write it again) and outgoing (our color writes must be visible to the
+    // sampling/copy that consumes the result). The old pass declared NONE —
+    // the implicit BOTTOM_OF_PIPE dependency makes writes available but not
+    // visible, so sampling or copying the image after endFrame was racy.
+    VkSubpassDependency offDeps[2] {};
+    offDeps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
+    offDeps[0].dstSubpass    = 0;
+    offDeps[0].srcStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                             | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    offDeps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT
+                             | VK_ACCESS_TRANSFER_READ_BIT;
+    offDeps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                             | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                             | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    offDeps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                             | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    offDeps[1].srcSubpass    = 0;
+    offDeps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
+    offDeps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    offDeps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    offDeps[1].dstStageMask  = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                             | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    offDeps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT
+                             | VK_ACCESS_TRANSFER_READ_BIT;
+
     VkRenderPassCreateInfo rpci {};
     rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rpci.attachmentCount = 2;
     rpci.pAttachments = atts;
     rpci.subpassCount = 1;
     rpci.pSubpasses = &subpass;
+    rpci.dependencyCount = 2;
+    rpci.pDependencies = offDeps;
     vkCreateRenderPass(d, &rpci, nullptr, &renderPass_);
 
     VkImageView views[] = { renderImage_.view(), depthStencil_.view() };
@@ -744,13 +854,18 @@ void OffscreenTarget::destroy()
 {
     VkDevice d = device_.device();
     if (d == VK_NULL_HANDLE) return;
-    vkDeviceWaitIdle(d);
+    {
+        const juce::ScopedLock queueSync(Renderer::queueLock());
+        vkDeviceWaitIdle(d);
+    }
 
     if (fence_ != VK_NULL_HANDLE) vkDestroyFence(d, fence_, nullptr);
     // cmd_ is freed by ~RenderTarget destroying our per-target VkCommandPool.
     if (framebuffer_ != VK_NULL_HANDLE) vkDestroyFramebuffer(d, framebuffer_, nullptr);
     if (renderPass_ != VK_NULL_HANDLE) vkDestroyRenderPass(d, renderPass_, nullptr);
     renderImage_ = {};
+    depthStencil_ = {};
+    sceneBuffers_ = {};   // framebufferA aliased the just-destroyed handle
     fence_ = VK_NULL_HANDLE;
     cmd_ = VK_NULL_HANDLE;
     framebuffer_ = VK_NULL_HANDLE;
@@ -760,7 +875,12 @@ void OffscreenTarget::destroy()
 RenderTarget::Frame OffscreenTarget::beginFrame()
 {
     VkDevice d = device_.device();
-    vkWaitForFences(d, 1, &fence_, VK_TRUE, UINT64_MAX);
+    if (device_.isLost() || fence_ == VK_NULL_HANDLE)
+        return {};
+    if (vkWaitForFences(d, 1, &fence_, VK_TRUE, 2'000'000'000ull) != VK_SUCCESS) {
+        device_.markLost();
+        return {};
+    }
     vkResetFences(d, 1, &fence_);
     vkResetCommandBuffer(cmd_, 0);
 
@@ -783,14 +903,13 @@ void OffscreenTarget::endFrame(const Frame& frame)
     si.commandBufferCount = 1;
     si.pCommandBuffers = &frame.cmd;
 
-    vkQueueSubmit(device_.graphicsQueue(), 1, &si, fence_);
+    if (vkQueueSubmit(device_.graphicsQueue(), 1, &si, fence_) != VK_SUCCESS)
+        device_.markLost();
 }
 
 void OffscreenTarget::resize(uint32_t w, uint32_t h)
 {
-    VkDevice d = device_.device();
-    vkDeviceWaitIdle(d);
-    destroy();
+    destroy();   // includes the queue-locked vkDeviceWaitIdle
     width_ = w;
     height_ = h;
     create();

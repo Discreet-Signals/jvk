@@ -61,9 +61,15 @@ void* NSViewGenerator::create(int width, int height)
         view.layer = [CAMetalLayer layer];
     }
     view.layer.opaque = NO;
-    view.layer.contentsScale = 2.0;  // Match Retina backing scale; MSAA handles anti-aliasing
+    // NOTE: hardcoded 2.0 is wrong on non-Retina / mixed-DPI — deliberately
+    // left as-is here (changing it interacts with getPaintScale and the
+    // hard-won per-DAW DPI fixes; it gets its own DAW-tested change).
+    view.layer.contentsScale = 2.0;
     view.layer.backgroundColor = CGColorGetConstantColor(kCGColorClear);
-    [view retain];
+    // alloc/init already returned ownership (+1); release() balances exactly
+    // that. The old extra [view retain] made it +2 against one release — the
+    // JVKMetalView AND its CAMetalLayer leaked on every editor teardown /
+    // setVulkanEnabled toggle.
     ptr = (void*)view;
     return (void*)view;
 }

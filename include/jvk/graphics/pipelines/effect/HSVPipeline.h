@@ -169,7 +169,7 @@ public:
         pci.layout = layout_;
         pci.renderPass = compatibleRenderPass;
 
-        vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline_);
+        vkCreateGraphicsPipelines(d, device_->pipelineCache(), 1, &pci, nullptr, &pipeline_);
 
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);
@@ -178,19 +178,26 @@ public:
     // One HSV pass. Samples `srcDesc`, writes the transformed result into
     // `dstFramebuffer`. Caller is responsible for the ping-pong pair so
     // the final result lands back in "current".
+    // `scissor` (optional): ROI sub-rect from Renderer::execute's walk —
+    // render area + scissor shrink together; viewport stays full-extent so
+    // gl_FragCoord remains screen-space. Null = full extent.
     void applyPass(VkCommandBuffer cmd,
                    VkDescriptorSet srcDesc,
                    VkFramebuffer   dstFramebuffer,
                    VkRenderPass    dstRenderPass,
                    VkExtent2D      extent,
                    const PushConstants& pcData,
-                   uint32_t        stencilRef = 0)
+                   uint32_t        stencilRef = 0,
+                   const VkRect2D* scissor = nullptr)
     {
+        VkRect2D sc = scissor ? *scissor : VkRect2D { {0, 0}, extent };
+        if (sc.extent.width == 0 || sc.extent.height == 0) return;
+
         VkRenderPassBeginInfo rpbi {};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpbi.renderPass = dstRenderPass;
         rpbi.framebuffer = dstFramebuffer;
-        rpbi.renderArea.extent = extent;
+        rpbi.renderArea = sc;
         rpbi.clearValueCount = 0;
         rpbi.pClearValues = nullptr;
         vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
@@ -201,7 +208,6 @@ public:
         vp.maxDepth = 1.0f;
         vkCmdSetViewport(cmd, 0, 1, &vp);
 
-        VkRect2D sc { {0, 0}, extent };
         vkCmdSetScissor(cmd, 0, 1, &sc);
 
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);

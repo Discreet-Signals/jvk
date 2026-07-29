@@ -29,11 +29,6 @@ void Pipeline::loadFragmentShader(std::span<const uint32_t> spirv)
     fragSpirv_.assign(spirv.begin(), spirv.end());
 }
 
-void Pipeline::defineLayout(Memory::M& bindings)
-{
-    // Default: 1 combined image sampler at binding 0 (already registered as IMAGE_SAMPLER)
-}
-
 void Pipeline::build(VkRenderPass renderPass)
 {
     if (built_) return;
@@ -53,16 +48,24 @@ void Pipeline::build(VkRenderPass renderPass)
     pli.pushConstantRangeCount = static_cast<uint32_t>(cfg.pushConstantRanges.size());
     pli.pPushConstantRanges = cfg.pushConstantRanges.empty() ? nullptr : cfg.pushConstantRanges.data();
 
-    vkCreatePipelineLayout(d, &pli, nullptr, &layout_);
+    if (vkCreatePipelineLayout(d, &pli, nullptr, &layout_) != VK_SUCCESS) {
+        layout_ = VK_NULL_HANDLE;
+        return;   // built_ stays false — retried next frame, never bound null
+    }
 
     // Single-sample only. Geometric AA comes from SDF/MSDF shaders per-pixel;
     // path-fill edges and shader-rendered content can optionally be smoothed
     // via a final subpixel-offset supersample effect pass.
     pipeline_ = buildVariant(cfg, renderPass, layout_);
+    if (pipeline_ == VK_NULL_HANDLE)
+        return;   // built_ stays false
 
     auto clip = clipConfig();
-    if (clip)
+    if (clip) {
         clipPipeline_ = buildVariant(*clip, renderPass, layout_);
+        if (clipPipeline_ == VK_NULL_HANDLE)
+            return;
+    }
 
     built_ = true;
 }
@@ -72,20 +75,27 @@ VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass render
 {
     VkDevice d = device_.device();
 
-    // Shader modules
+    // Shader modules. Null-init + checked: an uninitialized handle passed to
+    // pipeline creation / destroy on the failure path is UB.
     VkShaderModuleCreateInfo vci {};
     vci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     vci.codeSize = vertSpirv_.size() * 4;
     vci.pCode = vertSpirv_.data();
-    VkShaderModule vertModule;
+    VkShaderModule vertModule = VK_NULL_HANDLE;
     vkCreateShaderModule(d, &vci, nullptr, &vertModule);
 
     VkShaderModuleCreateInfo fci {};
     fci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     fci.codeSize = fragSpirv_.size() * 4;
     fci.pCode = fragSpirv_.data();
-    VkShaderModule fragModule;
+    VkShaderModule fragModule = VK_NULL_HANDLE;
     vkCreateShaderModule(d, &fci, nullptr, &fragModule);
+
+    if (vertModule == VK_NULL_HANDLE || fragModule == VK_NULL_HANDLE) {
+        if (vertModule != VK_NULL_HANDLE) vkDestroyShaderModule(d, vertModule, nullptr);
+        if (fragModule != VK_NULL_HANDLE) vkDestroyShaderModule(d, fragModule, nullptr);
+        return VK_NULL_HANDLE;
+    }
 
     VkPipelineShaderStageCreateInfo stages[2] {};
     stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -241,7 +251,7 @@ VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass render
     pci.renderPass = renderPass;
 
     VkPipeline result = VK_NULL_HANDLE;
-    vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &result);
+    vkCreateGraphicsPipelines(d, device_.pipelineCache(), 1, &pci, nullptr, &result);
 
     vkDestroyShaderModule(d, vertModule, nullptr);
     vkDestroyShaderModule(d, fragModule, nullptr);

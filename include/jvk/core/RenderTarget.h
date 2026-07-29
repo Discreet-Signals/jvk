@@ -140,8 +140,7 @@ private:
     uint32_t       width_  = 0;
     uint32_t       height_ = 0;
 
-    std::vector<VkImage>     swapImages_;
-    std::vector<VkImageView> swapImageViews_;
+    std::vector<VkImage> swapImages_;
 
     // Three render passes total:
     //   sceneRPClear_  : scene attachments, loadOp=CLEAR  (frame start)

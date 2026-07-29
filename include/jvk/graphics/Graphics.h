@@ -9,16 +9,30 @@ public:
     Graphics(Renderer& renderer, float displayScale)
         : renderer_(renderer), displayScale_(displayScale)
     {
-        stateStack_.push_back({});
-        auto& s = stateStack_.back();
-        s.clipBounds = { 0, 0,
-            static_cast<int>(renderer_.target().width()),
-            static_cast<int>(renderer_.target().height()) };
+        beginFrame(displayScale);
     }
 
     ~Graphics() override = default;
 
-    void setZOrder(float z) { state().zOrder = z; }
+    // Reset the record state for a new frame WITHOUT freeing any scratch
+    // capacity. The editor holds ONE Graphics for its lifetime and calls
+    // this each tick — the old stack-constructed-per-frame object threw
+    // away every scratch vector's capacity 60×/s, so the "allocation-free
+    // after the first frame" property only held within a single frame.
+    // frameId_ deliberately survives: juce::Graphics::getFrameId must be
+    // monotonic across frames (JUCE keys per-frame caches on it).
+    void beginFrame(float displayScale)
+    {
+        displayScale_ = displayScale;
+        stateStack_.clear();
+        stateStack_.push_back({});
+        pathClipShared_.clear();
+        auto& s = stateStack_.back();
+        s.clipBounds = { 0, 0,
+            static_cast<int>(renderer_.target().width()),
+            static_cast<int>(renderer_.target().height()) };
+        frameId_++;
+    }
 
     // Extract a jvk::Graphics* from a juce::Graphics (for effects API)
     static Graphics* create(juce::Graphics& g)
@@ -32,15 +46,18 @@ public:
 
     void setOrigin(juce::Point<int> o) override
     {
-        auto& ct = state().transform;
-        ct = juce::AffineTransform::translation(static_cast<float>(o.x),
-                                                 static_cast<float>(o.y))
-                 .followedBy(ct);
+        auto& s = state();
+        s.transform = juce::AffineTransform::translation(static_cast<float>(o.x),
+                                                          static_cast<float>(o.y))
+                          .followedBy(s.transform);
+        s.inverseValid = false;
     }
 
     void addTransform(const juce::AffineTransform& t) override
     {
-        state().transform = t.followedBy(state().transform);
+        auto& s = state();
+        s.transform = t.followedBy(s.transform);
+        s.inverseValid = false;
     }
 
     float getPhysicalPixelScaleFactor() const override { return displayScale_; }
@@ -48,16 +65,20 @@ public:
     bool clipToRectangle(const juce::Rectangle<int>& r) override
     {
         auto& s = state();
-        auto transformed = r.transformedBy(s.transform);
-        // Scale logical→pixel for Vulkan scissor
-        auto pixel = juce::Rectangle<int>(
-            static_cast<int>(transformed.getX() * displayScale_),
-            static_cast<int>(transformed.getY() * displayScale_),
-            static_cast<int>(transformed.getWidth() * displayScale_),
-            static_cast<int>(transformed.getHeight() * displayScale_));
-        s.clipBounds = s.clipBounds.getIntersection(pixel);
-        renderer_.push(DrawOp::PushClipRect, s.zOrder, s.clipBounds,
-                       s.stencilDepth, s.scopeDepth, PushClipRectParams { transformed });
+        auto tf = r.toFloat().transformedBy(s.transform);
+        // Scale logical→pixel for the Vulkan scissor. floor/ceil (outward),
+        // NOT truncation: at fractional DPI (125%/150% Windows) truncating
+        // x*scale and w*scale lost up to a pixel on the right/bottom edge —
+        // and rounded toward zero, i.e. the WRONG way for negative origins.
+        // Outward rounding never clips away content the caller asked to keep
+        // (matches fillPath's bounds convention).
+        const int x0 = static_cast<int>(std::floor(tf.getX()      * displayScale_));
+        const int y0 = static_cast<int>(std::floor(tf.getY()      * displayScale_));
+        const int x1 = static_cast<int>(std::ceil (tf.getRight()  * displayScale_));
+        const int y1 = static_cast<int>(std::ceil (tf.getBottom() * displayScale_));
+        s.clipBounds = s.clipBounds.getIntersection({ x0, y0, x1 - x0, y1 - y0 });
+        struct Empty {};   // replay uses cmd.clipBounds only
+        renderer_.push(DrawOp::PushClipRect, s.clipBounds, s.stencilDepth, Empty {});
         s.scopeDepth++;
         return !s.clipBounds.isEmpty();
     }
@@ -153,14 +174,17 @@ public:
         flattenPathToSegments(path, combined, scratchSegments_);
         if (scratchSegments_.empty()) return;
 
-        uint32_t segStart = pp->uploadSegments(
-            scratchSegments_.data(),
-            static_cast<uint32_t>(scratchSegments_.size()));
-
         // Cover rect in physical pixels, expanded by 1 pixel so the clip
         // fragment shader runs for every pixel the path's SDF could mark
         // as inside.
         auto px = pathBounds.transformedBy(combined).expanded(1.0f);
+
+        // Y-strip binned upload — clip is winding-only (hard edge), so a
+        // small pad suffices.
+        uint32_t stripCount; float stripMinY, invStripH;
+        uint32_t segStart = binAndUploadSegments(pp, px.getY(), px.getBottom(),
+                                                 2.0f, stripCount, stripMinY,
+                                                 invStripH);
         int bx  = static_cast<int>(std::floor(px.getX()));
         int by  = static_cast<int>(std::floor(px.getY()));
         int bx2 = static_cast<int>(std::ceil(px.getRight()));
@@ -182,13 +206,18 @@ public:
         params.segmentCount = static_cast<uint32_t>(scratchSegments_.size());
         params.fillRule     = path.isUsingNonZeroWinding() ? 0u : 1u;
         params.coverRect    = coverRect;
+        params.stripCount   = stripCount;
+        params.stripMinY    = stripMinY;
+        params.invStripH    = invStripH;
 
         // Remember for the matching pop — same segment range + cover rect
-        // so DECR cancels INCR exactly.
-        s.pathClipStack.push_back(params);
+        // so DECR cancels INCR exactly. Shared stack + per-state watermark:
+        // the old per-RecordState vector was deep-copied on EVERY saveState
+        // (JUCE brackets every component paint with one) — a heap alloc per
+        // component per frame for data that is strictly stack-shaped.
+        pathClipShared_.push_back(params);
 
-        renderer_.push(DrawOp::PushClipPath, s.zOrder, outerBounds,
-                       s.stencilDepth, s.scopeDepth, params);
+        renderer_.push(DrawOp::PushClipPath, outerBounds, s.stencilDepth, params);
 
         s.clipBounds = outerBounds;
         s.stencilDepth++;
@@ -212,11 +241,16 @@ public:
         // what Component::paintChildren compares each child's local bounds
         // against when deciding whether to paint. `s.clipBounds` is in root
         // pixels, so invert the local→pixel transform to get back to the
-        // caller's local coord space.
+        // caller's local coord space. The inverse is cached on the state:
+        // JUCE calls this once per CHILD, and a matrix inversion per call
+        // added up (invalidated by setOrigin/addTransform).
         auto& s = state();
         if (s.clipBounds.isEmpty()) return {};
-        auto pixelToLocal = s.transform.scaled(displayScale_).inverted();
-        auto local = s.clipBounds.toFloat().transformedBy(pixelToLocal);
+        if (!s.inverseValid) {
+            s.pixelToLocal = s.transform.scaled(displayScale_).inverted();
+            s.inverseValid = true;
+        }
+        auto local = s.clipBounds.toFloat().transformedBy(s.pixelToLocal);
         return local.getSmallestIntegerContainer();
     }
     bool isClipEmpty() const override { return state().clipBounds.isEmpty(); }
@@ -225,7 +259,10 @@ public:
 
     void restoreState() override
     {
-        if (stateStack_.size() <= 1) return;
+        if (stateStack_.size() <= 1) {
+            jassertfalse; // unbalanced restoreState — dropped silently before
+            return;
+        }
         auto& old = stateStack_.back();
         auto& prev = stateStack_[stateStack_.size() - 2];
         while (old.scopeDepth > prev.scopeDepth) {
@@ -236,19 +273,37 @@ public:
                 // Rect clip — no GPU work, just a CPU-side scissor pop at
                 // replay. Payload is empty; op type conveys the kind.
                 struct Empty {};
-                renderer_.push(DrawOp::PopClipRect, old.zOrder, old.clipBounds,
-                               old.stencilDepth, old.scopeDepth, Empty {});
+                renderer_.push(DrawOp::PopClipRect, old.clipBounds,
+                               old.stencilDepth, Empty {});
                 old.scopeDepth--;
             }
         }
         stateStack_.pop_back();
     }
 
-    void beginTransparencyLayer(float opacity) override { state().opacity *= opacity; }
-    void endTransparencyLayer() override {}
+    // Transparency layers are approximated by an alpha multiplier on every
+    // draw inside the layer (true offscreen layers are the Phase 6 rebuild).
+    // The multiplier lives in its own scope so it unwinds at end — it used
+    // to be written into the CURRENT state with an empty end, leaking the
+    // layer alpha into everything painted after the layer.
+    void beginTransparencyLayer(float opacity) override
+    {
+        saveState();
+        state().opacity *= opacity;
+    }
+    void endTransparencyLayer() override { restoreState(); }
 
     void setFill(const juce::FillType& fill) override { state().fill = fill; }
-    void setOpacity(float opacity) override { state().opacity = opacity; }
+
+    // juce contract (FillType::setOpacity → colour.withAlpha): setOpacity
+    // REPLACES the current fill colour's alpha in place. Modeling it as a
+    // separate sticky multiplier broke the standard idiom
+    //     g.setColour(c.withAlpha(0.06f)); ...; g.setOpacity(1.0f); g.drawImage(...)
+    // — the image kept the stale 0.06 fill alpha (melatonin::DropShadow does
+    // exactly this before compositing, which made pedal shadows vanish after
+    // any glass-panel paint). state().opacity is the transparency-LAYER
+    // multiplier only; plain setOpacity must never touch it.
+    void setOpacity(float opacity) override { state().fill.setOpacity(opacity); }
     void setInterpolationQuality(juce::Graphics::ResamplingQuality) override {}
 
     void fillRect(const juce::Rectangle<int>& r, bool) override { fillRect(r.toFloat()); }
@@ -261,20 +316,51 @@ public:
         // Stage gradient LUT upload if this is a gradient fill
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::FillRect, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::FillRect, s.clipBounds, s.stencilDepth,
             FillRectParams { r, fi, s.transform, s.opacity, displayScale_ });
     }
 
     void fillRectList(const juce::RectangleList<float>& list) override
     {
-        for (auto& r : list) fillRect(r);
+        if (isClipEmpty() || list.isEmpty()) return;
+        if (list.getNumRectangles() == 1) { fillRect(*list.begin()); return; }
+
+        // ONE command + one arena span for the whole list. The old loop
+        // exploded an N-rect list (common from JUCE text/clip internals)
+        // into N commands + N FillType captures + N draw calls.
+        auto& s = state();
+        auto fi = renderer_.captureFill(s.fill);
+        if (s.fill.isGradient() && s.fill.gradient)
+            renderer_.registerGradient(*s.fill.gradient);
+        FillRectListParams p {};
+        p.rectCount = static_cast<uint32_t>(list.getNumRectangles());
+        p.fillIndex = fi;
+        p.transform = s.transform;
+        p.opacity   = s.opacity;
+        p.scale     = displayScale_;
+        renderer_.push(DrawOp::FillRectList, s.clipBounds, s.stencilDepth, p);
+        renderer_.arena_align(4);
+        // RectangleList's iterators walk a contiguous juce::Array — a span
+        // over [begin, end) is valid.
+        renderer_.arena_pushSpan(std::span<const juce::Rectangle<float>>(
+            list.begin(), static_cast<size_t>(list.getNumRectangles())));
     }
 
-    // Analytical-SDF path fill (vger / Slug-style). CPU flattens the path's
-    // curves to line segments in physical-pixel space, uploads them to
-    // PathPipeline's per-frame storage buffer, and emits a single draw
-    // covering the path's bounds. The fragment shader evaluates the SDF
-    // analytically per pixel — no atlas, no rasterisation preprocessing.
+    // Analytical-SDF path fill, TILE mode (piet-gpu style). CPU flattens
+    // the path's curves to line segments in physical-pixel space, then
+    // decomposes the (clip-restricted) bounds into tiles:
+    //   - tiles the path never touches are NOT drawn;
+    //   - interior tiles carry only a constant winding ("backdrop") and
+    //     merge into single row-run quads — flat fill, zero segment work;
+    //   - edge tiles carry a small tile-local segment list; the fragment
+    //     shader reconstructs the EXACT winding as backdrop + local
+    //     crossings (derivation in path_sdf.frag) and the exact SDF within
+    //     the AA band.
+    // This replaced (a) one bounds-covering quad whose every fragment
+    // walked the whole segment list — quadratic on big paths and ~90%
+    // wasted fragments on waveform-like content — and (b) the Y-strip
+    // binning that fixed neither overdraw nor horizontal-heavy paths and
+    // whose fwidth() AA streaked at strip boundaries.
     //
     // Colour is sourced the same way as every other 2D op: per-vertex
     // `color` + `gradientInfo` populated via the shared GradientCtx /
@@ -298,20 +384,139 @@ public:
         flattenPathToSegments(path, combined, scratchSegments_);
         if (scratchSegments_.empty()) return;
 
-        uint32_t segStart = pp->uploadSegments(
-            scratchSegments_.data(),
-            static_cast<uint32_t>(scratchSegments_.size()));
+        // Segment-bbox pad: covers the 1px AA band (a segment farther than
+        // this from a tile cannot influence any of its fragments' alpha).
+        constexpr float pad = 2.0f;
 
-        // Path bounds in physical pixels, expanded by 1 pixel for the AA
-        // ramp that smoothstep() kernels around the SDF zero-crossing.
-        auto pxBounds = pathBounds.transformedBy(combined).expanded(1.0f);
+        auto pxBounds = pathBounds.transformedBy(combined).expanded(pad);
+
+        // The grid only needs to cover what's visible: winding at a point
+        // depends solely on crossings of that point's own horizontal line
+        // (accounted exactly via backdrop/overflow below), so restricting
+        // the grid to clip ∩ bounds stays exact — off-clip tiles are never
+        // rasterised anyway (scissor = clipBounds).
         int bx  = static_cast<int>(std::floor(pxBounds.getX()));
         int by  = static_cast<int>(std::floor(pxBounds.getY()));
         int bx2 = static_cast<int>(std::ceil(pxBounds.getRight()));
         int by2 = static_cast<int>(std::ceil(pxBounds.getBottom()));
-        juce::Rectangle<int> quadPxRect { bx, by, bx2 - bx, by2 - by };
-        auto clipRect = s.clipBounds.getIntersection(quadPxRect);
+        auto clipRect = s.clipBounds.getIntersection(
+            juce::Rectangle<int> { bx, by, bx2 - bx, by2 - by });
         if (clipRect.isEmpty()) return;
+
+        const float gx0 = static_cast<float>(clipRect.getX());
+        const float gy0 = static_cast<float>(clipRect.getY());
+
+        // Tile size: 16px nominal, doubled while the grid would exceed the
+        // scratch budget (huge transforms / 4K-filling paths degrade toward
+        // the old one-big-tile behaviour instead of exploding memory).
+        float tileW = kPathTileSize;
+        constexpr int kMaxTiles = 1 << 16;
+        int nx = 0, ny = 0;
+        for (;;) {
+            nx = std::max(1, (int) std::ceil((float) clipRect.getWidth()  / tileW));
+            ny = std::max(1, (int) std::ceil((float) clipRect.getHeight() / tileW));
+            if ((int64_t) nx * ny <= kMaxTiles) break;
+            tileW *= 2.0f;
+        }
+        const int nTiles = nx * ny;
+
+        // --- Pass 1: per-tile local-list counts + horizontal-crossing
+        // deltas. A segment lands in every tile its pad-expanded bbox
+        // touches (winding needs only true overlap; pad keeps the SDF exact
+        // through the AA band). Its crossings of each row's top line are
+        // binned by x-column so pass 2 can turn them into per-tile backdrop
+        // windings by suffix-summing right-to-left.
+        scratchTileCounts_.assign((size_t) nTiles, 0u);
+        scratchTileWind_.assign((size_t) nTiles, 0);
+        scratchRowOverflow_.assign((size_t) ny, 0);
+
+        const float gridRight  = gx0 + (float) nx * tileW;
+        const float gridBottom = gy0 + (float) ny * tileW;
+        const float invTileW   = 1.0f / tileW;
+
+        auto tileRange = [&](float lo, float hi, int n, float g0) {
+            int i0 = std::max(0,     (int) std::floor((lo - g0) * invTileW));
+            int i1 = std::min(n - 1, (int) std::floor((hi - g0) * invTileW));
+            return std::pair<int, int> { i0, i1 };
+        };
+
+        for (auto& seg : scratchSegments_) {
+            const float xLo = std::min(seg.x, seg.z), xHi = std::max(seg.x, seg.z);
+            const float yLo = std::min(seg.y, seg.w), yHi = std::max(seg.y, seg.w);
+
+            // Local lists (pad-expanded bbox ∩ grid).
+            if (xHi + pad >= gx0 && xLo - pad < gridRight
+             && yHi + pad >= gy0 && yLo - pad < gridBottom) {
+                auto [tx0, tx1] = tileRange(xLo - pad, xHi + pad, nx, gx0);
+                auto [ty0, ty1] = tileRange(yLo - pad, yHi + pad, ny, gy0);
+                for (int ty = ty0; ty <= ty1; ty++)
+                    for (int tx = tx0; tx <= tx1; tx++)
+                        scratchTileCounts_[(size_t)(ty * nx + tx)]++;
+            }
+
+            // Row-top crossings. Half-open in y (a.y > T) != (b.y > T),
+            // matching the shader's ray convention exactly.
+            int r0 = std::max(0, (int) std::ceil((yLo - gy0) * invTileW));
+            int r1 = std::min(ny - 1, (int) std::floor((yHi - gy0) * invTileW));
+            for (int r = r0; r <= r1; r++) {
+                const float T = gy0 + (float) r * tileW;
+                const bool aAbove = seg.y > T, bAbove = seg.w > T;
+                if (aAbove == bAbove) continue;
+                // Statement-split so clang can't contract to FMA — must
+                // stay bit-identical to the shader's `precise` evaluation
+                // (see path_sdf.frag's top term) or a crossing exactly on a
+                // tile edge could be counted in both B and the local term.
+                const float tt = (T - seg.y) / (seg.w - seg.y);
+                const float dx = tt * (seg.z - seg.x);
+                const float xc = seg.x + dx;
+                const int sign = bAbove ? 1 : -1;
+                if (xc <= gx0) continue;   // left of every tile's ray origin
+                // Column bucket, half-open (colLeft, colRight] — pairs with
+                // the shader's `xc <= tileRight` so B excludes exactly the
+                // crossings the local top-term adds.
+                const float fc = std::ceil((xc - gx0) * invTileW) - 1.0f;
+                if (fc >= (float) nx)
+                    scratchRowOverflow_[(size_t) r] += sign; // right of grid
+                else
+                    scratchTileWind_[(size_t)(r * nx + std::max(0, (int) fc))] += sign;
+            }
+        }
+
+        // --- Pass 2: suffix-sum each row right-to-left; the array turns
+        // from per-column deltas into B = winding at (tileRight, tileTop).
+        for (int r = 0; r < ny; r++) {
+            int acc = scratchRowOverflow_[(size_t) r];
+            for (int c = nx - 1; c >= 0; c--) {
+                const size_t idx = (size_t)(r * nx + c);
+                const int h = scratchTileWind_[idx];
+                scratchTileWind_[idx] = acc;
+                acc += h;
+            }
+        }
+
+        // --- Pass 3: place segments tile-major. Offsets are an exclusive
+        // prefix over counts and double as write cursors; the emission loop
+        // recovers each tile's start as cursor − count.
+        scratchTileOffsets_.resize((size_t) nTiles);
+        uint32_t total = 0;
+        for (int i = 0; i < nTiles; i++) {
+            scratchTileOffsets_[(size_t) i] = total;
+            total += scratchTileCounts_[(size_t) i];
+        }
+        scratchBinned_.resize(total);
+        for (auto& seg : scratchSegments_) {
+            const float xLo = std::min(seg.x, seg.z), xHi = std::max(seg.x, seg.z);
+            const float yLo = std::min(seg.y, seg.w), yHi = std::max(seg.y, seg.w);
+            if (xHi + pad < gx0 || xLo - pad >= gridRight
+             || yHi + pad < gy0 || yLo - pad >= gridBottom) continue;
+            auto [tx0, tx1] = tileRange(xLo - pad, xHi + pad, nx, gx0);
+            auto [ty0, ty1] = tileRange(yLo - pad, yHi + pad, ny, gy0);
+            for (int ty = ty0; ty <= ty1; ty++)
+                for (int tx = tx0; tx <= tx1; tx++)
+                    scratchBinned_[scratchTileOffsets_[(size_t)(ty * nx + tx)]++] = seg;
+        }
+        const uint32_t segStart =
+            (total > 0) ? pp->uploadSegments(scratchBinned_.data(), total) : 0u;
 
         // Register the gradient row up-front so the atlas upload happens in
         // this frame's staging pass. makeGradientCtx below also registers
@@ -319,9 +524,9 @@ public:
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
 
-        // Build the per-vertex colour source the same way ColorDraw's
-        // primitive ops do: solid colour folded into the vertex attribute,
-        // or gradient mode/row packed into gradientInfo via gradientAt().
+        // Per-vertex colour source, same as ColorDraw's primitive ops:
+        // solid colour folded into the vertex attribute, or gradient
+        // mode/row packed into gradientInfo via gradientAt().
         pipelines::GradientCtx grad = pipelines::makeGradientCtx(renderer_, s.fill, combined);
         glm::vec4 color = pipelines::fillColorAttr(grad, s.fill.colour, s.opacity);
 
@@ -330,32 +535,75 @@ public:
                                  : glm::vec4(0.0f);
         };
 
-        auto mkv = [&](float x, float y) {
-            return UIVertex {
-                glm::vec2 { x, y },
-                color,
-                glm::vec2 { 0.0f, 0.0f },          // uv unused by path_sdf
-                glm::vec4 { 0.0f, 0.0f, 0.0f, 0.0f }, // shapeInfo unused
-                gi(x, y)
-            };
+        // --- Pass 4: emit quads. Edge tiles (count > 0) get their own
+        // quad; consecutive INSIDE interior tiles with equal backdrop merge
+        // into one wide quad (interior fragments only read the backdrop, so
+        // uv/tile geometry doesn't matter there); outside tiles emit
+        // nothing at all.
+        const uint32_t fillRule = path.isUsingNonZeroWinding() ? 0u : 1u;
+        scratchTileVerts_.clear();
+
+        auto emitQuad = [&](float x, float y, float w,
+                            uint32_t localStart, uint32_t localCount, int backdrop) {
+            const glm::vec2 uv { x, y };
+            const glm::vec4 shape { (float) localStart, (float) localCount,
+                                    (float) backdrop, 0.0f };
+            const float x2 = x + w, y2 = y + tileW;
+            UIVertex v0 { { x,  y  }, color, uv, shape, gi(x,  y ) };
+            UIVertex v1 { { x2, y  }, color, uv, shape, gi(x2, y ) };
+            UIVertex v2 { { x2, y2 }, color, uv, shape, gi(x2, y2) };
+            UIVertex v3 { { x,  y2 }, color, uv, shape, gi(x,  y2) };
+            scratchTileVerts_.push_back(v0);
+            scratchTileVerts_.push_back(v1);
+            scratchTileVerts_.push_back(v2);
+            scratchTileVerts_.push_back(v0);
+            scratchTileVerts_.push_back(v2);
+            scratchTileVerts_.push_back(v3);
         };
-        float fbx  = static_cast<float>(bx),  fby  = static_cast<float>(by);
-        float fbx2 = static_cast<float>(bx2), fby2 = static_cast<float>(by2);
+
+        for (int r = 0; r < ny; r++) {
+            const float ty = gy0 + (float) r * tileW;
+            int runStart = -1;
+            int runB     = 0;
+            auto flushRun = [&](int cEnd) {
+                if (runStart < 0) return;
+                emitQuad(gx0 + (float) runStart * tileW, ty,
+                         (float)(cEnd - runStart) * tileW, 0u, 0u, runB);
+                runStart = -1;
+            };
+            for (int c = 0; c < nx; c++) {
+                const size_t idx  = (size_t)(r * nx + c);
+                const uint32_t cnt = scratchTileCounts_[idx];
+                const int B        = scratchTileWind_[idx];
+                if (cnt == 0) {
+                    const bool inside = (fillRule == 0u) ? (B != 0)
+                                                         : ((B & 1) != 0);
+                    if (!inside)            { flushRun(c); continue; }
+                    if (runStart >= 0 && runB == B) continue;
+                    flushRun(c);
+                    runStart = c;
+                    runB     = B;
+                } else {
+                    flushRun(c);
+                    emitQuad(gx0 + (float) c * tileW, ty, tileW,
+                             scratchTileOffsets_[idx] - cnt, cnt, B);
+                }
+            }
+            flushRun(nx);
+        }
+        if (scratchTileVerts_.empty()) return;
 
         FillPathParams p {};
-        p.quadVerts[0] = mkv(fbx,  fby);
-        p.quadVerts[1] = mkv(fbx2, fby);
-        p.quadVerts[2] = mkv(fbx2, fby2);
-        p.quadVerts[3] = mkv(fbx,  fby);
-        p.quadVerts[4] = mkv(fbx2, fby2);
-        p.quadVerts[5] = mkv(fbx,  fby2);
+        p.vertexCount  = static_cast<uint32_t>(scratchTileVerts_.size());
         p.segmentStart = segStart;
-        p.segmentCount = static_cast<uint32_t>(scratchSegments_.size());
-        p.fillRule     = path.isUsingNonZeroWinding() ? 0u : 1u;
+        p.fillRule     = fillRule;
         p.fillIndex    = renderer_.captureFill(s.fill);
+        p.tileSize     = tileW;
 
-        renderer_.push(DrawOp::FillPath, s.zOrder, clipRect,
-                       s.stencilDepth, s.scopeDepth, p);
+        renderer_.push(DrawOp::FillPath, clipRect, s.stencilDepth, p);
+        renderer_.arena_align(4);
+        renderer_.arena_pushSpan(std::span<const UIVertex>(
+            scratchTileVerts_.data(), scratchTileVerts_.size()));
     }
 
     void drawImage(const juce::Image& img, const juce::AffineTransform& t) override
@@ -370,9 +618,17 @@ public:
         // into the draw command. The worker thread never touches the cache
         // map for this draw.
         auto desc = renderer_.caches().getTexture(hash, img, renderer_);
+        if (desc == VK_NULL_HANDLE) return;   // staging/descriptor OOM
 
-        renderer_.push(DrawOp::DrawImage, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            DrawImageParams { desc, t.followedBy(s.transform), s.opacity, displayScale_,
+        // juce semantics: the current fill colour's ALPHA modulates image
+        // draws (g.setColour(c.withAlpha(0.5f)); g.drawImage(...) renders at
+        // 50%) — UNCONDITIONALLY: the software renderer reads
+        // fillType.colour.getAlpha() for gradient/image fills too
+        // (juce_RenderingHelpers.h renderImage). s.opacity is the
+        // transparency-layer multiplier on top.
+        const float alpha = s.opacity * s.fill.colour.getFloatAlpha();
+        renderer_.push(DrawOp::DrawImage, s.clipBounds, s.stencilDepth,
+            DrawImageParams { desc, t.followedBy(s.transform), alpha, displayScale_,
                               img.getWidth(), img.getHeight() });
     }
 
@@ -388,7 +644,7 @@ public:
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::DrawLine, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::DrawLine, s.clipBounds, s.stencilDepth,
             DrawLineParams { line, lineThickness, fi, s.transform, s.opacity, displayScale_ });
     }
 
@@ -403,6 +659,31 @@ public:
         auto& s = state();
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
+
+        // Rasterize missing glyphs NOW, at record time on the message
+        // thread. The worker's prepare pass (stageDirtyPages) then stages +
+        // uploads the touched atlas rects BEFORE this frame's render pass,
+        // so replay only ever samples initialized pages. The old flow
+        // rasterized during REPLAY — after the upload flush had already run
+        // — so a page created for a new glyph was bound and sampled in
+        // UNDEFINED layout, and its pixels arrived one frame late.
+        // (rasterizeBudget inside the atlas caps worst-case first-paint
+        // hitches; over-budget glyphs simply appear next frame.)
+        if (auto* cp = renderer_.colorPipeline())
+        {
+            auto& atlas = cp->atlas();
+            // ONE key, glyphId mutated per iteration — constructing a key
+            // per glyph paid an atomic Typeface::Ptr refcount pair per
+            // glyph per frame (real cost on 10k+ glyph scenes).
+            GlyphAtlas::GlyphKey key { s.font.getTypefacePtr(), 0,
+                                       static_cast<int>(s.font.getMetricsKind()) };
+            for (auto gid : glyphs)
+            {
+                key.glyphId = gid;
+                atlas.getGlyph(key, s.font);
+            }
+        }
+
         DrawGlyphsParams params;
         params.glyphCount = static_cast<uint32_t>(glyphs.size());
         params.transform = t.followedBy(s.transform);
@@ -410,7 +691,7 @@ public:
         params.fillIndex = renderer_.captureFill(s.fill);
         params.opacity = s.opacity;
         params.scale = displayScale_;
-        renderer_.push(DrawOp::DrawGlyphs, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth, params);
+        renderer_.push(DrawOp::DrawGlyphs, s.clipBounds, s.stencilDepth, params);
         // Append glyph POD data to arena (align before float data)
         renderer_.arena_pushSpan(std::span<const uint16_t>(glyphs.data(), glyphs.size()));
         renderer_.arena_align(4); // Point<float> requires 4-byte alignment
@@ -424,7 +705,7 @@ public:
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::FillRoundedRect, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::FillRoundedRect, s.clipBounds, s.stencilDepth,
             FillRoundedRectParams { r, cornerSize, fi, s.transform, s.opacity, displayScale_ });
     }
 
@@ -435,7 +716,7 @@ public:
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::FillEllipse, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::FillEllipse, s.clipBounds, s.stencilDepth,
             FillEllipseParams { area, fi, s.transform, s.opacity, displayScale_ });
     }
 
@@ -447,7 +728,7 @@ public:
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::StrokeRoundedRect, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::StrokeRoundedRect, s.clipBounds, s.stencilDepth,
             StrokeRoundedRectParams { rect, cornerSize, lineThickness, fi, s.transform,
                                       s.opacity, displayScale_ });
     }
@@ -465,7 +746,7 @@ public:
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::StrokeEllipse, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::StrokeEllipse, s.clipBounds, s.stencilDepth,
             StrokeEllipseParams { area, lineThickness, fi, s.transform, s.opacity, displayScale_ });
     }
 
@@ -474,7 +755,10 @@ public:
         return std::make_unique<juce::SoftwareImageType>();
     }
 
-    uint64_t getFrameId() const override { return frameId_++; }
+    // Monotonic across frames (incremented by beginFrame): JUCE keys
+    // per-frame caches on this, and the old per-frame Graphics object reset
+    // it to zero every tick.
+    uint64_t getFrameId() const override { return frameId_; }
 
     // ===== GPU Effects =====
     void darken(float amount, juce::Rectangle<float> region = {})
@@ -482,7 +766,7 @@ public:
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
         float v = 1.0f - amount;
-        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::EffectBlend, s.clipBounds, s.stencilDepth,
             EffectBlendParams { v, v, v, region, displayScale_ });
     }
 
@@ -491,7 +775,7 @@ public:
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
         float v = 1.0f + amount;
-        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::EffectBlend, s.clipBounds, s.stencilDepth,
             EffectBlendParams { v, v, v, region, displayScale_ });
     }
 
@@ -499,7 +783,7 @@ public:
     {
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
-        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::EffectBlend, s.clipBounds, s.stencilDepth,
             EffectBlendParams { c.getFloatRed(), c.getFloatGreen(), c.getFloatBlue(), region, displayScale_ });
     }
 
@@ -507,7 +791,7 @@ public:
     {
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
-        renderer_.push(DrawOp::EffectBlend, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::EffectBlend, s.clipBounds, s.stencilDepth,
             EffectBlendParams { 1.0f + amount * 0.2f, 1.0f, 1.0f - amount * 0.1f, region, displayScale_ });
     }
 
@@ -529,16 +813,23 @@ public:
         const float timeOffset = staticHash
             ? 0.0f
             : static_cast<float>(juce::Time::getMillisecondCounter() & 0xFFFFu);
-        renderer_.push(DrawOp::EffectNoise, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::EffectNoise, s.clipBounds, s.stencilDepth,
             NoiseParams { amount, timeOffset, physRegion, 1.0f });
     }
 
     void blur(float radius, juce::Rectangle<float> region = {})
     {
-        if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
-        renderer_.push(DrawOp::EffectKernel, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
-            BlurParams { radius, region, displayScale_ });
+        // Default region = current clip bounds (already physical). An
+        // explicit region is in the caller's LOGICAL space — resolve to
+        // physical (transform + displayScale), same convention as drawNoise.
+        // The replay-side ROI walk scissors every pass of the blur chain to
+        // this rect (padded per pass by the kernel's read margin).
+        const juce::Rectangle<float> physRegion = region.isEmpty()
+            ? s.clipBounds.toFloat()
+            : region.transformedBy(s.transform.scaled(displayScale_));
+        renderer_.push(DrawOp::EffectKernel, s.clipBounds, s.stencilDepth,
+            BlurParams { radius, physRegion, displayScale_ });
     }
 
     // =========================================================================
@@ -560,12 +851,15 @@ public:
              float deltaH, float deltaS, float deltaV,
              juce::Rectangle<float> region = {})
     {
-        if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
-        renderer_.push(DrawOp::EffectHSV, s.zOrder, s.clipBounds,
-                       s.stencilDepth, s.scopeDepth,
+        // Same region convention as blur() — default = clip bounds
+        // (physical), explicit = logical resolved to physical here.
+        const juce::Rectangle<float> physRegion = region.isEmpty()
+            ? s.clipBounds.toFloat()
+            : region.transformedBy(s.transform.scaled(displayScale_));
+        renderer_.push(DrawOp::EffectHSV, s.clipBounds, s.stencilDepth,
             HSVParams { scaleH, scaleS, scaleV, deltaH, deltaS, deltaV,
-                        region, displayScale_ });
+                        physRegion, displayScale_ });
     }
 
     // amount: 0 = grayscale, 1 = original, >1 = boosted saturation.
@@ -741,7 +1035,7 @@ public:
                          transformed.getWidth()  * displayScale_,
                          transformed.getHeight() * displayScale_ };
         }
-        renderer_.push(DrawOp::DrawShader, s.zOrder, s.clipBounds, s.stencilDepth, s.scopeDepth,
+        renderer_.push(DrawOp::DrawShader, s.clipBounds, s.stencilDepth,
             DrawShaderParams { &shader, regionPx, displayScale_ });
     }
 
@@ -751,13 +1045,21 @@ private:
     struct RecordState {
         juce::AffineTransform transform;
         juce::FillType        fill { juce::Colours::black };
+        // Transparency-LAYER alpha only (beginTransparencyLayer multiplies it
+        // in its own saved scope). Plain setOpacity follows the juce contract
+        // instead: it rewrites fill.colour's alpha (FillType::setOpacity).
         float                 opacity = 1.0f;
         juce::Font            font { juce::FontOptions {} };
         juce::Rectangle<int>  clipBounds;
-        float                 zOrder = 0.0f;
         uint32_t              scopeDepth = 0;
         uint8_t               stencilDepth = 0;
-        std::vector<ClipShapeParams> pathClipStack;
+        // Cached inverse of transform.scaled(displayScale) for getClipBounds
+        // (JUCE calls it per child). Copied validly on saveState (same
+        // transform); invalidated by setOrigin/addTransform.
+        mutable juce::AffineTransform pixelToLocal;
+        mutable bool                  inverseValid = false;
+        // Path clips live in Graphics::pathClipShared_ (stack-shaped across
+        // states); no per-state vector to deep-copy on every saveState.
     };
 
     RecordState& state() { return stateStack_.back(); }
@@ -770,11 +1072,10 @@ private:
     void recordPopClip()
     {
         auto& s = state();
-        if (!s.pathClipStack.empty()) {
-            ClipShapeParams params = s.pathClipStack.back();
-            renderer_.push(DrawOp::PopClipPath, s.zOrder, s.clipBounds,
-                           s.stencilDepth, s.scopeDepth, params);
-            s.pathClipStack.pop_back();
+        if (!pathClipShared_.empty()) {
+            ClipShapeParams params = pathClipShared_.back();
+            renderer_.push(DrawOp::PopClipPath, s.clipBounds, s.stencilDepth, params);
+            pathClipShared_.pop_back();
         }
         s.scopeDepth--;
         if (s.stencilDepth > 0) s.stencilDepth--;
@@ -845,8 +1146,25 @@ private:
         p.inverted      = inverted ? 1u : 0u;
         p.mode          = static_cast<uint32_t>(mode);
 
-        renderer_.push(DrawOp::BlurShape, s.zOrder, s.clipBounds,
-                       s.stencilDepth, s.scopeDepth, p);
+        // ROI: every pixel this blur can touch — the shape's bounds expanded
+        // by the blur reach (+stroke ring), in LOGICAL space, then mapped to
+        // physical. For lines the anchor rect is degenerate at A, so fold in
+        // endpoint B first. Inverted blurs touch everything OUTSIDE the
+        // shape: leave the region empty = replay uses the full clip.
+        if (!inverted) {
+            auto reach = blurRadius + falloffRadius + lineThickness + 2.0f;
+            juce::Rectangle<float> logical = boundsRect;
+            if (shapeType == 3)
+                logical = juce::Rectangle<float>::leftTopRightBottom(
+                    juce::jmin(boundsRect.getX(), boundsRect.getX() + lineB.x),
+                    juce::jmin(boundsRect.getY(), boundsRect.getY() + lineB.y),
+                    juce::jmax(boundsRect.getX(), boundsRect.getX() + lineB.x),
+                    juce::jmax(boundsRect.getY(), boundsRect.getY() + lineB.y));
+            p.region = logical.expanded(reach)
+                           .transformedBy(s.transform.scaled(displayScale_));
+        }
+
+        renderer_.push(DrawOp::BlurShape, s.clipBounds, s.stencilDepth, p);
     }
 
     // Pack a BlurPath draw command. Flattens the path to line segments
@@ -878,10 +1196,6 @@ private:
         flattenPathToSegments(path, combined, scratchSegments_);
         if (scratchSegments_.empty()) return;
 
-        uint32_t segStart = pp->uploadSegments(
-            scratchSegments_.data(),
-            static_cast<uint32_t>(scratchSegments_.size()));
-
         // Pre-multiply radius params to physical pixels so the shader runs
         // entirely in one coord space (segments are already physical too).
         // `blurStep` folds both the user's transform scale and displayScale,
@@ -890,7 +1204,6 @@ private:
         const float blurStep = s.transform.getScaleFactor() * displayScale_;
 
         BlurPathParams p {};
-        p.segmentStart    = segStart;
         p.segmentCount    = static_cast<uint32_t>(scratchSegments_.size());
         p.fillRule        = path.isUsingNonZeroWinding() ? 0u : 1u;
         p.maxRadius       = blurRadius       * blurStep;
@@ -900,8 +1213,26 @@ private:
         p.inverted        = inverted ? 1u : 0u;
         p.mode            = static_cast<uint32_t>(mode);
 
-        renderer_.push(DrawOp::BlurPath, s.zOrder, s.clipBounds,
-                       s.stencilDepth, s.scopeDepth, p);
+        // Y-strip binned upload. The pad must cover the blur's FULL reach:
+        // the falloff curve needs true distances out to
+        // maxRadius + falloff + strokeHalfWidth; beyond that a segment
+        // cannot influence the result. Inverted blurs sample everywhere,
+        // but their SDF is exact under the same pad (distance beyond reach
+        // saturates the band either way).
+        const float reach = p.maxRadius + p.falloff + p.strokeHalfWidth + 2.0f;
+        const auto  pxB   = pathBounds.transformedBy(combined).expanded(reach);
+        p.segmentStart = binAndUploadSegments(pp, pxB.getY(), pxB.getBottom(),
+                                              reach, p.stripCount,
+                                              p.stripMinY, p.invStripH);
+
+        // ROI: path bounds (already transformed to physical by `combined`)
+        // expanded by the blur reach + stroke ring, all physical px. Inverted
+        // blurs leave it empty = full clip at replay.
+        if (!inverted)
+            p.region = pathBounds.transformedBy(combined)
+                           .expanded(p.maxRadius + p.falloff + p.strokeHalfWidth + 2.0f);
+
+        renderer_.push(DrawOp::BlurPath, s.clipBounds, s.stencilDepth, p);
     }
 
     // Flatten a path to a flat list of line segments in the supplied
@@ -996,14 +1327,26 @@ private:
         // so segments never cross contour boundaries. Zero-length segments
         // are discarded — they contribute nothing to either distance or
         // winding and would waste SSBO slots.
-        glm::vec2 prev(0); bool havePrev = false;
+        //
+        // Every subpath is IMPLICITLY CLOSED (a closing segment back to its
+        // first point when the author didn't closePath) — juce fills treat
+        // open subpaths as closed, and winding is only well-defined over
+        // closed contours: the tile decomposition in fillPath (and the ray
+        // counts in clip/blur) assume the segment set forms closed curves.
+        glm::vec2 prev(0), chainStart(0); bool havePrev = false;
+        auto closeChain = [&] {
+            if (havePrev && prev != chainStart)
+                segs.push_back({ prev.x, prev.y, chainStart.x, chainStart.y });
+            havePrev = false;
+        };
         for (size_t i = 0; i < scratchPoints_.size(); ++i) {
             if (scratchPoints_[i].x == SUBPATH_MARKER) {
-                havePrev = false;
+                closeChain();
                 continue;
             }
             if (!havePrev) {
                 prev = scratchPoints_[i];
+                chainStart = prev;
                 havePrev = true;
                 continue;
             }
@@ -1012,22 +1355,126 @@ private:
                 segs.push_back({ prev.x, prev.y, cur.x, cur.y });
             prev = cur;
         }
+        closeChain();
     }
 
 
     Renderer& renderer_;
     float     displayScale_;
     std::vector<RecordState> stateStack_;
-    mutable uint64_t frameId_ = 0;
+    uint64_t frameId_ = 0;
 
-    // Flatten scratch buffers — cleared-but-not-freed between paths so the
-    // hot path is allocation-free after the first frame. Used by both
+    // Active path-clip params, shared across the state stack (strictly
+    // stack-shaped: pushes in clipToPath, pops in recordPopClip; saveState
+    // copies nothing).
+    std::vector<ClipShapeParams> pathClipShared_;
+
+    // Flatten scratch buffers — cleared-but-not-freed between paths AND
+    // between frames (the editor reuses one Graphics via beginFrame), so
+    // the hot path is genuinely allocation-free after warmup. Used by both
     // Graphics::fillPath (segments → PathPipeline SSBO) and clipToPath
     // (segments → ClipPipeline via the same shared SSBO).
     struct Seg { glm::vec2 a, b, c, d; };
     std::vector<glm::vec2> scratchPoints_;
     std::vector<Seg>       scratchSegStack_;
     std::vector<glm::vec4> scratchSegments_;
+    std::vector<glm::vec4> scratchBinned_;
+    std::vector<uint32_t>  scratchStripCounts_;
+
+    // Tile-mode fill scratch (Graphics::fillPath). kPathTileSize must match
+    // nothing on the GPU side — the actual tile width travels in the push
+    // constants (it doubles when a huge path would blow the tile budget).
+    static constexpr float kPathTileSize = 16.0f;
+    std::vector<uint32_t>  scratchTileCounts_;
+    std::vector<uint32_t>  scratchTileOffsets_;
+    std::vector<int32_t>   scratchTileWind_;
+    std::vector<int32_t>   scratchRowOverflow_;
+    std::vector<UIVertex>  scratchTileVerts_;
+
+    // ------------------------------------------------------------------
+    // Y-strip binning — used by clipToPath (clip.frag) and pushBlurPath
+    // (path_blur.frag); FILLS use the exact tile decomposition in fillPath
+    // instead. The path fragment shaders were O(pixels × segments): every
+    // fragment of the cover quad walked EVERY segment for winding +
+    // distance. Binning reorders the upload as
+    //   [strip table: stripCount vec4 entries][segments, strip-major]
+    // where a segment is duplicated into every strip its y-range (± pad)
+    // overlaps. A fragment then walks only its own strip:
+    //   - winding stays EXACT — a segment whose y-range straddles frag.y
+    //     necessarily overlaps frag's strip;
+    //   - distance stays exact within `pad` — a segment farther than pad
+    //     in y can't be nearer than pad, and pad covers the full reach
+    //     (1px AA for fills, the blur band for path blurs).
+    // A 2000-segment path over a 400px quad drops from 2000 to ~2000/25
+    // segment evaluations per fragment. Table entries are vec4s in the
+    // SAME SSBO (entry.x = offset after the table, entry.y = count), so
+    // no descriptor/layout changes anywhere.
+    //
+    // Fills scratchBinned_ from scratchSegments_ and uploads it. Returns
+    // the absolute SSBO index of the strip table, and the binning params
+    // for the push constants. Returns stripCount 0 (flat upload) when the
+    // path is too small to benefit.
+    uint32_t binAndUploadSegments(PathPipeline* pp,
+                                  float minYf, float maxYf, float pad,
+                                  uint32_t& outStripCount,
+                                  float& outStripMinY, float& outInvStripH)
+    {
+        const auto segCount = static_cast<uint32_t>(scratchSegments_.size());
+
+        // Small paths: the per-fragment strip indirection costs more than
+        // it saves. Upload flat.
+        constexpr uint32_t kMinSegsToBin = 24;
+        const float height = maxYf - minYf;
+        if (segCount < kMinSegsToBin || height <= 1.0f) {
+            outStripCount = 0;
+            outStripMinY  = 0.0f;
+            outInvStripH  = 0.0f;
+            return pp->uploadSegments(scratchSegments_.data(), segCount);
+        }
+
+        // Strip height ≥ pad keeps duplication bounded (~≤3 strips/segment);
+        // 16px floor keeps the table small for tall thin paths.
+        const float stripH = std::max(16.0f, pad + 1.0f);
+        const uint32_t stripCount = static_cast<uint32_t>(
+            juce::jlimit(1, 512, (int) std::ceil(height / stripH)));
+
+        auto stripFor = [&](float y) -> int {
+            return juce::jlimit(0, (int) stripCount - 1,
+                                (int) std::floor((y - minYf) / stripH));
+        };
+
+        scratchStripCounts_.assign(stripCount, 0u);
+        for (auto& s : scratchSegments_) {
+            const int s0 = stripFor(std::min(s.y, s.w) - pad);
+            const int s1 = stripFor(std::max(s.y, s.w) + pad);
+            for (int i = s0; i <= s1; i++) scratchStripCounts_[(size_t) i]++;
+        }
+
+        uint32_t total = 0;
+        scratchBinned_.resize(stripCount);   // table first
+        for (uint32_t i = 0; i < stripCount; i++) {
+            scratchBinned_[i] = { (float) total, (float) scratchStripCounts_[i], 0.0f, 0.0f };
+            total += scratchStripCounts_[i];
+        }
+        scratchBinned_.resize(stripCount + total);
+
+        // Second pass: place segments strip-major, reusing the counts
+        // vector as per-strip write cursors.
+        for (uint32_t i = 0; i < stripCount; i++)
+            scratchStripCounts_[i] = static_cast<uint32_t>(scratchBinned_[i].x);
+        for (auto& s : scratchSegments_) {
+            const int s0 = stripFor(std::min(s.y, s.w) - pad);
+            const int s1 = stripFor(std::max(s.y, s.w) + pad);
+            for (int i = s0; i <= s1; i++)
+                scratchBinned_[stripCount + scratchStripCounts_[(size_t) i]++] = s;
+        }
+
+        outStripCount = stripCount;
+        outStripMinY  = minYf;
+        outInvStripH  = 1.0f / stripH;
+        return pp->uploadSegments(scratchBinned_.data(),
+                                  static_cast<uint32_t>(scratchBinned_.size()));
+    }
 };
 
 } // namespace jvk

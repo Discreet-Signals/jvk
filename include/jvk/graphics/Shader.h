@@ -193,7 +193,11 @@ public:
         if (!layoutBindings.empty()) {
             layoutId_ = device.bindings().registerLayout(layoutBindings.data(),
                 static_cast<uint32_t>(layoutBindings.size()));
+            if (layoutId_ == Memory::M::kInvalidLayout)
+                return; // created_ stays false — dispatch keeps gating on isReady()
             descriptorSet_ = device.bindings().alloc(layoutId_);
+            if (descriptorSet_ == VK_NULL_HANDLE)
+                return;
             setLayout = device.bindings().getLayout(layoutId_);
 
             // Bind defaults (1x1 black pixel) for unset image bindings so the
@@ -293,15 +297,21 @@ public:
         vci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         vci.codeSize = fullscreenVert.size() * 4;
         vci.pCode = fullscreenVert.data();
-        VkShaderModule vertMod;
+        VkShaderModule vertMod = VK_NULL_HANDLE;
         vkCreateShaderModule(d, &vci, nullptr, &vertMod);
 
         VkShaderModuleCreateInfo fci {};
         fci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         fci.codeSize = spirv_.size() * 4;
         fci.pCode = spirv_.data();
-        VkShaderModule fragMod;
+        VkShaderModule fragMod = VK_NULL_HANDLE;
         vkCreateShaderModule(d, &fci, nullptr, &fragMod);
+
+        if (vertMod == VK_NULL_HANDLE || fragMod == VK_NULL_HANDLE) {
+            if (vertMod != VK_NULL_HANDLE) vkDestroyShaderModule(d, vertMod, nullptr);
+            if (fragMod != VK_NULL_HANDLE) vkDestroyShaderModule(d, fragMod, nullptr);
+            return; // created_ stays false; isReady() keeps gating dispatch
+        }
 
         // Push constant layout mirrors shader_region.vert:
         //   bytes  0..11 — resolution (vec2) + time (float) — vertex + fragment
@@ -417,7 +427,7 @@ public:
             pci.renderPass = renderPass;
 
             VkPipeline result = VK_NULL_HANDLE;
-            vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &result);
+            vkCreateGraphicsPipelines(d, device.pipelineCache(), 1, &pci, nullptr, &result);
             return result;
         };
 
@@ -427,7 +437,11 @@ public:
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);
 
-        created_ = true;
+        // Only a fully-built shader is ready. The old code set created_
+        // unconditionally, so a failed vkCreateGraphicsPipelines still
+        // reported isReady() and dispatch bound VK_NULL_HANDLE.
+        created_ = (layout_ != VK_NULL_HANDLE && pipeline_ != VK_NULL_HANDLE
+                    && clipPipeline_ != VK_NULL_HANDLE);
     }
 
     bool isReady() const { return created_; }
@@ -465,6 +479,14 @@ public:
                 b.pinnedTexture->unpin();
                 b.pinnedTexture = nullptr;
             }
+            // A queued dynamic-feed upload must not outlive its destination:
+            // pending entries survive skipped frames by design, so without
+            // this the next successful flushUploads records
+            // vkCmdCopyBufferToImage into the VkImage the unique_ptr below
+            // is about to destroy. ~Shader has no Renderer back-pointer —
+            // cancel across every live Renderer via the registry.
+            if (b.ownedImage != nullptr)
+                Renderer::cancelUploadsAllRenderers(b.ownedImage->image());
         }
 
         if (!device_) return;
@@ -476,6 +498,8 @@ public:
         if (clipPipeline_   != VK_NULL_HANDLE) vkDestroyPipeline(d, clipPipeline_, nullptr);
         if (layout_         != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
         if (descriptorSet_  != VK_NULL_HANDLE) device_->bindings().free(descriptorSet_);
+        if (layoutId_ != Memory::M::kInvalidLayout)
+            device_->bindings().unregisterLayout(layoutId_);
     }
 
 private:
@@ -506,6 +530,15 @@ private:
 
     void reflectShader()
     {
+        // Idempotent: a second load() must not APPEND to the previous
+        // reflection — stale entries duplicated binding numbers into the
+        // descriptor-set layout (invalid) and their offsets pointed into a
+        // resized uniformData_. (Re-load after ensureCreated still keeps the
+        // old pipeline — created_ short-circuits — but at least the metadata
+        // stays coherent.)
+        bindings_.clear();
+        uniformData_.clear();
+
         // Use SPIRV-Reflect to discover bindings
         SpvReflectShaderModule module;
         SpvReflectResult result = spvReflectCreateShaderModule(
@@ -563,7 +596,10 @@ private:
     VkPipeline       clipPipeline_  = VK_NULL_HANDLE;
     VkPipelineLayout layout_        = VK_NULL_HANDLE;
     VkDescriptorSet  descriptorSet_ = VK_NULL_HANDLE;
-    Memory::M::LayoutID layoutId_   = 0;
+    // kInvalidLayout = "never registered" — the old default of 0 aliased
+    // IMAGE_SAMPLER, so an unregister from a binding-less shader would have
+    // decremented the shared built-in layout's refcount.
+    Memory::M::LayoutID layoutId_   = Memory::M::kInvalidLayout;
 
     // Single host-visible coherent buffer backing every reflected UBO/SSBO
     // block. NOTE: not double-buffered — fine for shaders drawn once per

@@ -75,15 +75,22 @@ public:
             vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilDepth);
         }
 
-        // Scissor — clip bounds clamped to the framebuffer. Matches the
-        // convention used by State::draw so subsequent scene draws don't
-        // inherit an unexpected scissor.
-        VkRect2D sc {};
-        sc.offset = { std::max(0, clipBoundsPixels.getX()),
-                      std::max(0, clipBoundsPixels.getY()) };
-        sc.extent = { static_cast<uint32_t>(std::max(0, clipBoundsPixels.getWidth())),
-                      static_cast<uint32_t>(std::max(0, clipBoundsPixels.getHeight())) };
-        vkCmdSetScissor(cmd, 0, 1, &sc);
+        // Scissor — clip bounds clamped to the framebuffer, EDGE-clamped the
+        // same way State::draw does it: clamp each edge, then derive the
+        // extent from the clamped edges. The old form clamped offset but kept
+        // the un-clipped width, so a clip starting at x = -40 produced
+        // offset 0 + full width — leaking 40 px past the clip's right edge.
+        {
+            const int x0 = std::max(0, clipBoundsPixels.getX());
+            const int y0 = std::max(0, clipBoundsPixels.getY());
+            const int x1 = std::max(x0, clipBoundsPixels.getRight());
+            const int y1 = std::max(y0, clipBoundsPixels.getBottom());
+            VkRect2D sc {};
+            sc.offset = { x0, y0 };
+            sc.extent = { static_cast<uint32_t>(x1 - x0),
+                          static_cast<uint32_t>(y1 - y0) };
+            vkCmdSetScissor(cmd, 0, 1, &sc);
+        }
 
         // Viewport covers the whole framebuffer — the shader_region vertex
         // shader places the triangle at `regionX/Y` in pixel space.
@@ -126,6 +133,12 @@ public:
         }
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
+
+        // We wrote scissor + stencil ref behind State's back — invalidate so
+        // the next scene draw re-establishes its own state instead of
+        // inheriting ours. ClipPipeline and PathPipeline both do this; this
+        // dispatcher was the one of the three that forgot.
+        state.invalidate();
     }
 
 private:

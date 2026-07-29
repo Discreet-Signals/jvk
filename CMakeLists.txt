@@ -248,5 +248,6 @@ endfunction()
 # ==============================================================================
 
 add_subdirectory(examples/benchmark          EXCLUDE_FROM_ALL)
+add_subdirectory(examples/compliance        EXCLUDE_FROM_ALL)
 add_subdirectory(examples/compressor        EXCLUDE_FROM_ALL)
 add_subdirectory(examples/shader_background EXCLUDE_FROM_ALL)

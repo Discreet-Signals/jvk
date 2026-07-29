@@ -27,9 +27,8 @@ class ResourceCaches;  // forward — defined in Cache.h
 //
 //   (c) Message-thread only — caller must not invoke from a render worker.
 //       Safe across editors because JUCE's message thread is single-threaded:
-//         staging() (retained for the one-shot createBlackPixel bootstrap;
-//         per-frame staging lives on each Renderer), submitImmediate(),
-//         caches(), initCaches().
+//         submitImmediate(), caches(), initCaches(). (Per-frame staging
+//         lives on each Renderer; Device owns no staging allocator.)
 //
 // Everything that used to be mutable per-frame state on Device has been
 // moved to Renderer: upload queues, deletion queues, gradient atlas, the
@@ -48,15 +47,40 @@ public:
     VkCommandPool    commandPool()    const { return commandPool_; }
 
     Memory::L1& pool()     { return pool_; }
-    Memory::L2& staging()  { return staging_; }
     Memory::M&  bindings() { return bindings_; }
 
+    // Process-wide VMA allocator (backs Memory::L1; internally thread-safe).
+    VmaAllocator allocator() const { return allocator_; }
+
     void submitImmediate(std::function<void(VkCommandBuffer)> fn);
+
+    // Process-wide pipeline cache, serialized to per-user app data
+    // (<userAppData>/jvk/pipeline.cache). Every vkCreateGraphicsPipelines in
+    // jvk feeds through it, so editor opens after the first launch reuse
+    // compiled pipelines — on MoltenVK the cache also stores the converted
+    // MSL, skipping the SPIR-V→MSL translation entirely. Saved at Device
+    // teardown via write-to-temp + atomic rename; the file carries a
+    // vendor/device/driver/UUID header and falls back to an empty cache on
+    // any mismatch.
+    VkPipelineCache pipelineCache() const { return pipelineCache_; }
 
     ResourceCaches& caches();
     void initCaches();
 
-    VkSampleCountFlagBits maxMSAA() const { return maxMSAA_; }
+    // ---- Device-lost latch -------------------------------------------------
+    // Set when any submit / wait / acquire reports VK_ERROR_DEVICE_LOST (or a
+    // fence wait times out — a wedged driver is indistinguishable from a lost
+    // one for our purposes). Once set, every RenderTarget::beginFrame returns
+    // a null frame, so the render loop degrades to a no-op instead of a
+    // permanent failing-submit spin, an infinite fence wait, or a force-
+    // killed worker thread. Sticky for the Device's lifetime — recovery from
+    // device loss means recreating the Device.
+    bool isLost() const noexcept { return lost_.load(std::memory_order_acquire); }
+    void markLost() noexcept
+    {
+        if (!lost_.exchange(true, std::memory_order_acq_rel))
+            DBG("jvk: VK_ERROR_DEVICE_LOST (or fence timeout) — rendering disabled for this Device");
+    }
 
     // Process-wide monotonic clock in seconds, anchored when this Device was
     // constructed. Single source of truth for the `time` push-constant slot
@@ -78,6 +102,9 @@ private:
     bool selectPhysicalDevice();
     bool createLogicalDevice();
     bool createCommandPool();
+    void loadPipelineCache();
+    void savePipelineCache();
+    static juce::File pipelineCacheFile();
 
     VkInstance       instance_       = VK_NULL_HANDLE;
     VkPhysicalDevice physDevice_     = VK_NULL_HANDLE;
@@ -87,15 +114,17 @@ private:
     uint32_t         graphicsFamily_ = UINT32_MAX;
     uint32_t         presentFamily_  = UINT32_MAX;
     VkCommandPool    commandPool_    = VK_NULL_HANDLE;
-    VkSampleCountFlagBits maxMSAA_   = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineCache  pipelineCache_  = VK_NULL_HANDLE;
+    VmaAllocator     allocator_      = nullptr;
 
 #if JUCE_DEBUG
     VkDebugUtilsMessengerEXT debugMessenger_ = VK_NULL_HANDLE;
 #endif
 
     Memory::L1 pool_;
-    Memory::L2 staging_;
     Memory::M  bindings_;
+
+    std::atomic<bool> lost_ { false };
 
     std::unique_ptr<ResourceCaches> caches_;
 

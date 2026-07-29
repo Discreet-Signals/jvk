@@ -35,7 +35,9 @@ layout(push_constant) uniform PC {
 
     int   kernelType;       // 0 = 1D separable; 1 = 2D Poisson disc;
                             // 2 = 2D grid with LST. See shape_blur.frag.
-    float _pad0, _pad1, _pad2;  // pad to 64 bytes (multiple of 16)
+    uint  stripCount;       // Y-strip binning; 0 = flat list (path_sdf.frag)
+    float stripMinY;
+    float invStripH;        // (pad kept the block at 64 bytes)
 } pc;
 
 layout(set = 0, binding = 0) uniform sampler2D srcTexture;
@@ -68,11 +70,28 @@ int crossing(vec2 p, vec2 a, vec2 b) {
 }
 
 float pathSDF(vec2 fragCoord) {
-    if (pc.segmentCount == 0u) return 1e20;
+    // Y-strip binned walk (see path_sdf.frag). The CPU pads each segment's
+    // strip range by the blur's full reach (maxRadius + falloff +
+    // strokeHalfWidth), so any segment whose true distance could influence
+    // this coordinate is guaranteed to be in its strip — segments farther
+    // away in y than the pad are beyond the falloff band regardless.
+    uint segsBase;
+    uint count;
+    if (pc.stripCount > 0u) {
+        int strip = clamp(int((fragCoord.y - pc.stripMinY) * pc.invStripH),
+                          0, int(pc.stripCount) - 1);
+        vec4 entry = segments.data[pc.segmentStart + uint(strip)];
+        segsBase = pc.segmentStart + pc.stripCount + uint(entry.x);
+        count    = uint(entry.y);
+    } else {
+        segsBase = pc.segmentStart;
+        count    = pc.segmentCount;
+    }
+    if (count == 0u) return 1e20;
     float minDist = 1e20;
     int   winding = 0;
-    for (uint i = 0u; i < pc.segmentCount; ++i) {
-        vec4 seg = segments.data[pc.segmentStart + i];
+    for (uint i = 0u; i < count; ++i) {
+        vec4 seg = segments.data[segsBase + i];
         vec2 a = seg.xy;
         vec2 b = seg.zw;
         minDist = min(minDist, sdSegment(fragCoord, a, b));
@@ -139,7 +158,11 @@ void main() {
     float totalWeight = 1.0;
 
     if (pc.kernelType == 0) {
-        // 1D separable LST. See shape_blur.frag.
+        // 1D separable LST. See shape_blur.frag — including the second
+        // (vertical) pass's per-tap gate: taps are weighted out unless the
+        // TAP's own radius reaches back to this fragment, so barely-blurred
+        // falloff-band rows can't streak sharp content into the interior.
+        bool gated = pc.direction.y != 0.0;
         for (int p = 0; p < MAX_PAIRS; ++p) {
             int i1 = 2 * p + 1;
             if (i1 > N) break;
@@ -151,9 +174,15 @@ void main() {
             float o  = (float(i1) * w1 + float(i2) * w2) / w;
 
             vec2 off = pc.direction * o * texelSize;
-            color += sampleSrc(fragUV + off) * w;
-            color += sampleSrc(fragUV - off) * w;
-            totalWeight += 2.0 * w;
+            float gP = 1.0, gM = 1.0;
+            if (gated) {
+                vec2 tapOff = pc.direction * o;   // physical px
+                gP = clamp((computeRadius(fragCoord + tapOff) - o) * 0.5 + 1.0, 0.0, 1.0);
+                gM = clamp((computeRadius(fragCoord - tapOff) - o) * 0.5 + 1.0, 0.0, 1.0);
+            }
+            color += sampleSrc(fragUV + off) * (w * gP);
+            color += sampleSrc(fragUV - off) * (w * gM);
+            totalWeight += w * (gP + gM);
         }
     } else if (pc.kernelType == 1) {
         // Radius-scaled Vogel / phi-spiral disc. See shape_blur.frag.

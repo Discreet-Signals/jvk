@@ -36,12 +36,21 @@ public:
 
     struct GlyphKey
     {
-        juce::Typeface* typeface;
-        uint16_t glyphId;
+        // Typeface::Ptr, not a raw pointer: entries never evict, so a raw
+        // key outliving its Typeface meant a recycled allocation address
+        // silently served the WRONG glyph outlines forever. Holding the ref
+        // also pins the address, keeping pointer-identity hashing valid.
+        juce::Typeface::Ptr typeface;
+        uint16_t glyphId = 0;
+        // Part of the outline identity: rasterization passes it to
+        // getOutlineForGlyph, so two Fonts differing only in metrics kind
+        // must not collide on one atlas entry.
+        int metricsKind = 0;
 
         bool operator==(const GlyphKey& o) const
         {
-            return typeface == o.typeface && glyphId == o.glyphId;
+            return typeface == o.typeface && glyphId == o.glyphId
+                && metricsKind == o.metricsKind;
         }
     };
 
@@ -49,8 +58,9 @@ public:
     {
         size_t operator()(const GlyphKey& k) const
         {
-            size_t h = reinterpret_cast<size_t>(k.typeface);
+            size_t h = reinterpret_cast<size_t>(k.typeface.get());
             h ^= std::hash<uint16_t>{}(k.glyphId) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            h ^= std::hash<int>{}(k.metricsKind) + 0x9e3779b9 + (h << 6) + (h >> 2);
             return h;
         }
     };
@@ -69,12 +79,41 @@ public:
         device = &dev;
     }
 
+    // Without this, every editor open/close leaked one descriptor set per
+    // atlas page (clear() existed but had no caller), and Memory::M's pool
+    // `used` counts climbed monotonically — after ~256 leaked sets every
+    // alloc grew a fresh 256-set pool. The owner (ColorPipeline) is
+    // destroyed after the editor's vkDeviceWaitIdle, so the GPU is done
+    // with the pages.
+    ~GlyphAtlas() { clear(); }
+
+    // Lookup + rasterize-on-miss. Called at RECORD time (message thread,
+    // Graphics::drawGlyphs) so pages dirty here get staged by the worker's
+    // prepare pass BEFORE the frame that samples them.
     const AtlasEntry* getGlyph(const GlyphKey& key, const juce::Font& font)
     {
         auto it = entries.find(key);
         if (it != entries.end())
             return &it->second;
-        return rasterizeGlyph(key, font);
+        // Budget the expensive MSDF generation per frame so the first paint
+        // of a big new font can't hitch the message thread unboundedly —
+        // over-budget glyphs rasterize next frame (invisible for one frame,
+        // which replay handles by skipping the missing entry).
+        if (rasterizedThisFrame_ >= kRasterBudgetPerFrame)
+            return nullptr;
+        auto* e = rasterizeGlyph(key, font);
+        if (e != nullptr) rasterizedThisFrame_++;
+        return e;
+    }
+
+    // Find-only lookup for REPLAY (worker thread): never rasterizes — a miss
+    // means the glyph was over budget this frame and simply isn't drawn.
+    // Rasterizing here would recreate the sampled-in-UNDEFINED-layout bug
+    // (the upload flush has already run by replay time).
+    const AtlasEntry* peekGlyph(const GlyphKey& key) const
+    {
+        auto it = entries.find(key);
+        return it != entries.end() ? &it->second : nullptr;
     }
 
     VkDescriptorSet getDescriptorSet(int atlasIndex) const
@@ -91,28 +130,60 @@ public:
     // command buffer before the scene render pass.
     void stageDirtyPages(Renderer& r)
     {
+        // New frame — refill the record-side rasterization budget. Runs on
+        // the worker, but never concurrently with record (isBusy gate).
+        rasterizedThisFrame_ = 0;
+
         for (auto& page : atlasPages)
         {
-            if (page.needsUpload)
+            if (!page.needsUpload)
+                continue;
+
+            if (!page.uploadedOnce)
             {
+                // First upload of a page: full image (transitions the texture
+                // out of UNDEFINED and lands the black border everywhere).
                 auto byteSize = static_cast<VkDeviceSize>(ATLAS_SIZE * ATLAS_SIZE * 4);
                 auto staging = r.staging().alloc(byteSize);
+                if (staging.mappedPtr == nullptr) return;   // OOM — retry next frame
                 memcpy(staging.mappedPtr, page.pixels.data(), static_cast<size_t>(byteSize));
                 r.upload(staging, page.texture.image(),
                     static_cast<uint32_t>(ATLAS_SIZE), static_cast<uint32_t>(ATLAS_SIZE));
-                page.needsUpload = false;
+                page.uploadedOnce = true;
             }
+            else if (page.dirtyX1 > page.dirtyX0 && page.dirtyY1 > page.dirtyY0)
+            {
+                // Incremental: stage only the dirty rect. The old full-page
+                // path cost a 16 MB alloc + memcpy + copy for ONE new glyph.
+                const int dw = page.dirtyX1 - page.dirtyX0;
+                const int dh = page.dirtyY1 - page.dirtyY0;
+                auto byteSize = static_cast<VkDeviceSize>(dw) * dh * 4;
+                auto staging = r.staging().alloc(byteSize);
+                if (staging.mappedPtr == nullptr) return;
+                auto* dst = static_cast<uint8_t*>(staging.mappedPtr);
+                for (int y = 0; y < dh; y++)
+                    memcpy(dst + static_cast<size_t>(y) * dw * 4,
+                           page.pixels.data() + static_cast<size_t>(page.dirtyY0 + y) * ATLAS_SIZE
+                                              + page.dirtyX0,
+                           static_cast<size_t>(dw) * 4);
+                r.uploadRect(staging, page.texture.image(),
+                             page.dirtyX0, page.dirtyY0,
+                             static_cast<uint32_t>(dw), static_cast<uint32_t>(dh));
+            }
+
+            page.needsUpload = false;
+            page.dirtyX0 = page.dirtyY0 = ATLAS_SIZE;
+            page.dirtyX1 = page.dirtyY1 = 0;
         }
     }
 
     void clear()
     {
         entries.clear();
-        for (auto& page : atlasPages)
-        {
-            if (page.descriptorSet != VK_NULL_HANDLE)
-                device->bindings().free(page.descriptorSet);
-        }
+        if (device != nullptr)
+            for (auto& page : atlasPages)
+                if (page.descriptorSet != VK_NULL_HANDLE)
+                    device->bindings().free(page.descriptorSet);
         atlasPages.clear();
     }
 
@@ -126,18 +197,25 @@ private:
         int cursorY = 0;
         int shelfHeight = 0;
         bool needsUpload = false;
+        bool uploadedOnce = false;
+        // Dirty rect accumulated by rasterizeGlyph, consumed (and reset) by
+        // stageDirtyPages. Empty when x1 <= x0.
+        int dirtyX0 = ATLAS_SIZE, dirtyY0 = ATLAS_SIZE, dirtyX1 = 0, dirtyY1 = 0;
     };
 
     const AtlasEntry* rasterizeGlyph(const GlyphKey& key, const juce::Font& font)
     {
-        auto* typeface = key.typeface;
-        if (!typeface) return nullptr;
+        auto typeface = key.typeface;
+        if (typeface == nullptr) return nullptr;
+        juce::ignoreUnused(font);
 
         // Get glyph outline (normalized to height=1.0 by JUCE). JUCE applies
         // scale(s, -s) internally → Y is down, matching Vulkan's V-down
         // texture storage convention so we leave inverseYAxis=false.
         juce::Path glyphPath;
-        typeface->getOutlineForGlyph(font.getMetricsKind(), key.glyphId, glyphPath);
+        typeface->getOutlineForGlyph(
+            static_cast<juce::TypefaceMetricsKind>(key.metricsKind),
+            key.glyphId, glyphPath);
         if (glyphPath.isEmpty()) return nullptr;
 
         // Delegate the entire MSDF pipeline (path → shape → normalise →
@@ -173,6 +251,12 @@ private:
         int px = page->cursorX;
         int py = page->cursorY;
 
+        // Belt-and-braces bounds guard: the pixel loop below writes
+        // [px, px+msdfW) × [py, py+msdfH) with unchecked indices — a
+        // packing-logic slip must fail a lookup, not scribble the heap.
+        if (px + msdfW > ATLAS_SIZE || py + msdfH > ATLAS_SIZE)
+            return nullptr;
+
         // Copy MSDF to atlas pixels (RGB = distance channels, A = 255)
         for (int y = 0; y < msdfH; y++)
         {
@@ -194,6 +278,10 @@ private:
             }
         }
         page->needsUpload = true;
+        page->dirtyX0 = std::min(page->dirtyX0, px);
+        page->dirtyY0 = std::min(page->dirtyY0, py);
+        page->dirtyX1 = std::max(page->dirtyX1, px + msdfW);
+        page->dirtyY1 = std::max(page->dirtyY1, py + msdfH);
 
         // Advance shelf cursor
         page->cursorX = px + msdfW + 1;
@@ -225,13 +313,20 @@ private:
         {
             if (page.cursorX + w <= ATLAS_SIZE && page.cursorY + h <= ATLAS_SIZE)
                 return &page;
+            // Try wrapping to a new shelf — but commit the wrap ONLY if the
+            // glyph then fits. The old code mutated cursorY/shelfHeight on
+            // pages it went on to reject, so a full page kept being pushed
+            // further past its end on every subsequent lookup.
             if (page.cursorX + w > ATLAS_SIZE)
             {
-                page.cursorY += page.shelfHeight;
-                page.cursorX = 0;
-                page.shelfHeight = 0;
-                if (page.cursorY + h <= ATLAS_SIZE)
+                const int wrappedY = page.cursorY + page.shelfHeight;
+                if (wrappedY + h <= ATLAS_SIZE)
+                {
+                    page.cursorY = wrappedY;
+                    page.cursorX = 0;
+                    page.shelfHeight = 0;
                     return &page;
+                }
             }
         }
         return createPage();
@@ -278,6 +373,9 @@ private:
 
     std::unordered_map<GlyphKey, AtlasEntry, GlyphKeyHash> entries;
     std::vector<AtlasPage> atlasPages;
+
+    static constexpr int kRasterBudgetPerFrame = 64;
+    int rasterizedThisFrame_ = 0;
 
     Device* device = nullptr;
 };

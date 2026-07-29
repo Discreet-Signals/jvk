@@ -39,7 +39,9 @@ public:
 
         int32_t  kernelType;              // 4  0 = 1D separable pass, 1 = 2D kernel
 
-        float    _pad0, _pad1, _pad2;   // 12  pad block to 64 bytes
+        uint32_t stripCount = 0;        // 4  Y-strip binning; 0 = flat list
+        float    stripMinY  = 0.0f;     // 4
+        float    invStripH  = 0.0f;     // 4  (block stays 64 bytes)
     };                                  // total: 64 bytes
 
     PathBlurPipeline() = default;
@@ -171,7 +173,7 @@ public:
         pci.layout = layout_;
         pci.renderPass = compatibleRenderPass;
 
-        vkCreateGraphicsPipelines(d, VK_NULL_HANDLE, 1, &pci, nullptr, &pipeline_);
+        vkCreateGraphicsPipelines(d, device_->pipelineCache(), 1, &pci, nullptr, &pipeline_);
 
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);
@@ -191,11 +193,13 @@ public:
                    const PushConstants& params,
                    uint32_t        stencilRef = 0)
     {
+        if (scissor.extent.width == 0 || scissor.extent.height == 0) return;
         VkRenderPassBeginInfo rpbi {};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpbi.renderPass = dstRenderPass;
         rpbi.framebuffer = dstFramebuffer;
-        rpbi.renderArea.extent = extent;
+        // Render area = scissor: tiles outside are skipped entirely.
+        rpbi.renderArea = scissor;
         rpbi.clearValueCount = 0;
         rpbi.pClearValues = nullptr;
         vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);

@@ -1,36 +1,46 @@
 #version 450
 
-// Analytical path-SDF fragment shader — vger / Slug style.
+// Analytical path-SDF fragment shader — TILE mode (piet-gpu-class).
 //
-// Instead of pre-baking a distance field texture, the path is represented
-// as a list of line segments (pre-flattened from beziers on the CPU) in a
-// storage buffer. For each fragment we scan all segments, keeping the
-// minimum unsigned distance and accumulating a winding-number crossing
-// count. A pixel is "inside" the path iff:
-//   non-zero winding: winding != 0
-//   even-odd:         (winding & 1) != 0
+// The CPU (Graphics::fillPath) decomposes the path into 16px tiles:
+//   - tiles the path never touches are NOT DRAWN at all;
+//   - interior tiles arrive with localCount == 0 and a nonzero backdrop —
+//     constant fill, zero per-fragment segment work;
+//   - edge tiles carry a small local segment list (segments whose padded
+//     bbox intersects the tile) plus the tile's backdrop winding.
 //
-// The signed distance is then `inside ? -minDist : minDist`, and alpha
-// is a single-pixel anti-aliased smoothstep around zero. Since the path
-// is evaluated *analytically* (no rasterisation), corners stay crisp at
-// any zoom level and the output is resolution-independent with zero
-// preprocessing cost — path can change every frame for free.
+// EXACT WINDING DERIVATION (why walking only local segments is not an
+// approximation): define W(q) as the signed crossing count of a +x ray
+// from q, half-open on top (a segment counts iff (a.y > q.y) != (b.y >
+// q.y) and its x at q.y is > q.x; sign = (b.y > q.y) ? +1 : -1). Then for
+// a fragment p in a tile with top edge y = T and right edge x = R:
+//
+//   W(p) = W((R, T))                                   … per-tile backdrop
+//        + [crossings of y = T with x in (p.x, R]]     … "top" term
+//        + [crossings of x = p.x with y in (T, p.y]]   … "descent" term
+//
+// The backdrop is the ray at the tile's top-RIGHT corner — every segment
+// it counts crosses y = T strictly right of R, i.e. outside the tile, and
+// is summed on the CPU. The top term's crossings happen at y = T with
+// x ∈ (p.x, R] — inside the tile, so those segments are in the local
+// list. The descent term's crossings happen at x = p.x ∈ tile — local
+// again. Nothing non-local can contribute, so the sum is exact.
+//
+// AA is derivative-free: fragPos is in physical pixels and a distance
+// field is 1-Lipschitz, so the edge band is exactly 1px wide — no
+// fwidth(). (fwidth across tile/strip boundaries mixes distances from
+// different segment lists and produced horizontal streak artifacts.)
 
 layout(push_constant) uniform PC {
     vec2  viewportSize;
     uint  segmentStart;
-    uint  segmentCount;
-    uint  fillRule;      // 0 = non-zero, 1 = even-odd
-    float _pad;
+    uint  segmentCount;   // unused in tile mode
+    uint  fillRule;       // 0 = non-zero, 1 = even-odd
+    uint  _r0;
+    float tileW;     // tile width in physical px (16, coarsened for huge paths)
+    float _r2;
 } pc;
 
-// Descriptor sets mirror the 2D color pipeline's layout so the existing
-// ResourceCaches descriptors (`gradientDescriptor()` / `defaultDescriptor()`)
-// can be bound directly at set 0 without extra plumbing. Set 1 owns this
-// pipeline's per-frame line-segment SSBO — PathPipeline binds it manually.
-//
-//   set 0 = color LUT (1x1 default for solid, or 256x1 gradient atlas row)
-//   set 1 = segments  (std430, 16 bytes per line segment as vec4)
 layout(set = 0, binding = 0) uniform sampler2D colorLUT;
 
 layout(std430, set = 1, binding = 0) readonly buffer Segments {
@@ -40,10 +50,11 @@ layout(std430, set = 1, binding = 0) readonly buffer Segments {
 layout(location = 0) in vec2 fragPos;
 layout(location = 1) in vec4 fragColor;
 layout(location = 2) in vec4 fragGradientInfo;
+layout(location = 3) flat in vec4 fragTile;        // x=localStart y=count z=backdrop
+layout(location = 4) flat in vec2 fragTileOrigin;  // tile top-left (px)
 
 layout(location = 0) out vec4 outColor;
 
-// Unsigned distance from point p to the line segment a→b.
 float sdSegment(vec2 p, vec2 a, vec2 b)
 {
     vec2 pa = p - a;
@@ -53,35 +64,10 @@ float sdSegment(vec2 p, vec2 a, vec2 b)
     return length(pa - ba * h);
 }
 
-// Crossing count contribution of segment (a→b) w.r.t. a horizontal ray
-// going to +x from p. Returns +1, -1 or 0.
-// Uses the standard "half-open on top" convention to handle vertices
-// exactly on the ray without double-counting.
-int crossing(vec2 p, vec2 a, vec2 b)
-{
-    bool aAbove = a.y >  p.y;
-    bool bAbove = b.y >  p.y;
-    if (aAbove == bAbove) return 0;
-
-    // y-range straddles p.y — find x at the crossing.
-    float t = (p.y - a.y) / (b.y - a.y);
-    float xCross = a.x + t * (b.x - a.x);
-    if (xCross <= p.x) return 0;
-
-    return bAbove ? 1 : -1;
-}
-
-// Unified color source — identical contract to ui2d.frag::sampleColor().
-// mode 0 = solid: vertex color carries RGB + opacity.
-// mode 1 = linear: gradientInfo.x is the gradient parameter t, row at .w.
-// mode 2 = radial: length(gradientInfo.xy) is t.
-// Opacity always comes from fragColor.a (fillColorAttr folds it in for
-// solid; fillColorAttr leaves .a = opacity for gradient).
 vec4 sampleColor() {
     int mode = int(fragGradientInfo.z + 0.5);
     if (mode == 0)
         return fragColor;
-
     float t = (mode == 2) ? length(fragGradientInfo.xy) : fragGradientInfo.x;
     t = clamp(t, 0.0, 1.0);
     vec4 col = texture(colorLUT, vec2(t, fragGradientInfo.w));
@@ -90,31 +76,70 @@ vec4 sampleColor() {
 
 void main()
 {
-    if (pc.segmentCount == 0u) { outColor = vec4(0.0); return; }
+    uint  base    = pc.segmentStart + uint(fragTile.x);
+    uint  count   = uint(fragTile.y);
+    int   winding = int(fragTile.z);      // backdrop at (tileRight, tileTop)
+    float tileTop   = fragTileOrigin.y;
+    float tileRight = fragTileOrigin.x + pc.tileW;
 
-    float minDist = 1e20;
-    int   winding = 0;
-
-    for (uint i = 0u; i < pc.segmentCount; ++i)
+    float alpha;
+    if (count == 0u)
     {
-        vec4 seg = segments.data[pc.segmentStart + i];
-        vec2 a = seg.xy;
-        vec2 b = seg.zw;
-        minDist = min(minDist, sdSegment(fragPos, a, b));
-        winding += crossing(fragPos, a, b);
+        // Interior (or CPU-kept exterior) tile: constant coverage.
+        bool inside = (pc.fillRule == 0u) ? (winding != 0)
+                                          : ((winding & 1) != 0);
+        alpha = inside ? 1.0 : 0.0;
     }
+    else
+    {
+        float minDist = 1e20;
+        for (uint i = 0u; i < count; ++i)
+        {
+            vec4 seg = segments.data[base + i];
+            vec2 a = seg.xy;
+            vec2 b = seg.zw;
 
-    bool inside = (pc.fillRule == 0u)
-        ? (winding != 0)
-        : ((winding & 1) != 0);
+            minDist = min(minDist, sdSegment(fragPos, a, b));
 
-    float signedDist = inside ? -minDist : minDist;
+            // Top term — crossing of y = tileTop at x in (p.x, tileRight].
+            // Same half-open-on-top convention as the ray definition.
+            // `precise` (no FMA contraction) keeps xc BIT-IDENTICAL to the
+            // CPU tiler's statement-split evaluation: tile boundaries are
+            // exact integer floats (power-of-2 tileW), so matching xc makes
+            // the B-vs-local split exact — no double count / drop when a
+            // crossing lands on a tile edge.
+            bool aAboveT = a.y > tileTop;
+            bool bAboveT = b.y > tileTop;
+            if (aAboveT != bAboveT)
+            {
+                precise float t  = (tileTop - a.y) / (b.y - a.y);
+                precise float dx = t * (b.x - a.x);
+                precise float xc = a.x + dx;
+                if (xc > fragPos.x && xc <= tileRight)
+                    winding += bAboveT ? 1 : -1;
+            }
 
-    // 1-pixel-wide AA kernel centred on the edge. fwidth gives the rate
-    // of change of signedDist w.r.t. screen pixels, which is ~1 here
-    // because fragPos *is* the physical-pixel position.
-    float aa = max(fwidth(signedDist), 1e-6);
-    float alpha = clamp(0.5 - signedDist / aa, 0.0, 1.0);
+            // Descent term — crossing of x = p.x at y in (tileTop, p.y].
+            // Sign from continuity of W along the downward walk: passing
+            // below a left-to-right segment adds +1 (its crossing point
+            // moves onto the ray), right-to-left subtracts.
+            bool aRight = a.x > fragPos.x;
+            bool bRight = b.x > fragPos.x;
+            if (aRight != bRight)
+            {
+                float t  = (fragPos.x - a.x) / (b.x - a.x);
+                float yc = a.y + t * (b.y - a.y);
+                if (yc > tileTop && yc <= fragPos.y)
+                    winding += bRight ? 1 : -1;
+            }
+        }
+
+        bool inside = (pc.fillRule == 0u) ? (winding != 0)
+                                          : ((winding & 1) != 0);
+        float signedDist = inside ? -minDist : minDist;
+        // 1px AA band, derivative-free (distance is in physical pixels).
+        alpha = clamp(0.5 - signedDist, 0.0, 1.0);
+    }
 
     vec4 col = sampleColor();
     outColor = vec4(col.rgb, col.a * alpha);

@@ -608,7 +608,7 @@ void ShaderImage::createPipeline()
     gpci.layout = pipelineLayout;
     gpci.renderPass = renderPass;
 
-    vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &graphicsPipeline);
+    vkCreateGraphicsPipelines(dev, device_->pipelineCache(), 1, &gpci, nullptr, &graphicsPipeline);
 
     vkDestroyShaderModule(dev, vertMod, nullptr);
     vkDestroyShaderModule(dev, fragMod, nullptr);

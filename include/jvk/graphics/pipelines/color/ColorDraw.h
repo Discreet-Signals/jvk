@@ -222,6 +222,63 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             break;
         }
 
+        case DrawOp::FillRectList: {
+            // One command for a whole RectangleList: shared fill/descriptors,
+            // vertices batched into as few draws as possible (the record side
+            // used to explode the list into one command + draw per rect).
+            auto& p    = arena.read<FillRectListParams>(cmd.dataOffset);
+            uint32_t rectsOffset =
+                (cmd.dataOffset + static_cast<uint32_t>(sizeof(FillRectListParams)) + 3u) & ~3u;
+            auto rects = arena.readSpan<juce::Rectangle<float>>(rectsOffset, p.rectCount);
+
+            auto& fill = r.getFill(p.fillIndex);
+            auto  tx   = toPhysical(p.transform, p.scale);
+            GradientCtx grad = makeGradientCtx(r, fill, tx);
+            state.setResources(colorDescFor(grad, r), def);
+            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            glm::vec4 shape(0.0f); // flat fill — no SDF
+
+            auto gi = [&](float px, float py) {
+                return grad.active() ? gradientAt(grad, px, py) : glm::vec4(0.0f);
+            };
+
+            constexpr uint32_t kMaxBatchRects = 32;
+            UIVertex batch[kMaxBatchRects * 6];
+            uint32_t batched = 0;
+            auto flush = [&] {
+                if (batched == 0) return;
+                state.draw(cmd, batch, batched * 6);
+                batched = 0;
+            };
+
+            for (auto& rect : rects) {
+                juce::Point<float> p00, p10, p11, p01;
+                if (tx.isOnlyTranslation()) {
+                    auto phys = toPixels(rect, p.transform, p.scale);
+                    p00 = { phys.getX(),      phys.getY() };
+                    p10 = { phys.getRight(),  phys.getY() };
+                    p11 = { phys.getRight(),  phys.getBottom() };
+                    p01 = { phys.getX(),      phys.getBottom() };
+                } else {
+                    p00 = juce::Point<float>(rect.getX(),     rect.getY()     ).transformedBy(tx);
+                    p10 = juce::Point<float>(rect.getRight(), rect.getY()     ).transformedBy(tx);
+                    p11 = juce::Point<float>(rect.getRight(), rect.getBottom()).transformedBy(tx);
+                    p01 = juce::Point<float>(rect.getX(),     rect.getBottom()).transformedBy(tx);
+                }
+                if (batched == kMaxBatchRects) flush();
+                UIVertex* v = batch + batched * 6;
+                v[0] = { {p00.x, p00.y}, color, {0, 0}, shape, gi(p00.x, p00.y) };
+                v[1] = { {p10.x, p10.y}, color, {1, 0}, shape, gi(p10.x, p10.y) };
+                v[2] = { {p11.x, p11.y}, color, {1, 1}, shape, gi(p11.x, p11.y) };
+                v[3] = { {p00.x, p00.y}, color, {0, 0}, shape, gi(p00.x, p00.y) };
+                v[4] = { {p11.x, p11.y}, color, {1, 1}, shape, gi(p11.x, p11.y) };
+                v[5] = { {p01.x, p01.y}, color, {0, 1}, shape, gi(p01.x, p01.y) };
+                batched++;
+            }
+            flush();
+            break;
+        }
+
         case DrawOp::FillRoundedRect: {
             auto& p    = arena.read<FillRoundedRectParams>(cmd.dataOffset);
             auto& fill = r.getFill(p.fillIndex);
@@ -403,15 +460,44 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             float hScale = font.getHorizontalScale();
             constexpr int PAD = GlyphAtlas::GLYPH_PADDING;
 
+            // Hoisted out of the loop: getTypefacePtr() is an atomic
+            // refcount bump — the old code paid it PER GLYPH. The key is
+            // likewise built ONCE and its glyphId mutated per iteration, so
+            // the loop does zero refcount traffic.
+            GlyphAtlas::GlyphKey key { font.getTypefacePtr(), 0,
+                                       static_cast<int>(font.getMetricsKind()) };
+
+            // Batch glyphs into as few draws as possible: every glyph of a
+            // run shares the pipeline, color descriptor, and (usually) the
+            // atlas page — the ONLY thing that forces a flush is a page
+            // switch. The old code issued one vkCmdDraw + scissor check per
+            // glyph (600 glyphs = 600 draws).
+            constexpr uint32_t kMaxBatchGlyphs = 32;
+            UIVertex batch[kMaxBatchGlyphs * 6];
+            uint32_t batched = 0;
+            VkDescriptorSet batchDesc = VK_NULL_HANDLE;
+            auto flushBatch = [&] {
+                if (batched == 0) return;
+                state.setShapeResource(batchDesc);
+                state.draw(cmd, batch, batched * 6);
+                batched = 0;
+            };
+
             for (uint32_t i = 0; i < p.glyphCount; i++) {
-                auto* typeface = font.getTypefacePtr().get();
-                GlyphAtlas::GlyphKey key { typeface, glyphIds[i] };
-                auto* entry = atlas.getGlyph(key, font);
+                key.glyphId = glyphIds[i];
+                // Find-only: rasterization happened at record time
+                // (Graphics::drawGlyphs), so the page upload was staged
+                // before this render pass. Rasterizing here would sample an
+                // UNDEFINED-layout page.
+                auto* entry = atlas.peekGlyph(key);
                 if (!entry) continue;
 
                 VkDescriptorSet glyphDesc = atlas.getDescriptorSet(entry->atlasIndex);
                 if (glyphDesc == VK_NULL_HANDLE) continue;
-                state.setShapeResource(glyphDesc);
+                if (glyphDesc != batchDesc || batched == kMaxBatchGlyphs) {
+                    flushBatch();
+                    batchDesc = glyphDesc;
+                }
 
                 auto glyphPos = positions[i].transformedBy(tx);
                 float innerW = entry->boundsW * physFontH * hScale;
@@ -433,16 +519,16 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
                 auto gi = [&](float px, float py) {
                     return grad.active() ? gradientAt(grad, px, py) : glm::vec4(0.0f);
                 };
-                UIVertex verts[6] = {
-                    { {gx,      gy     }, color, {entry->u0, entry->v0}, shape, gi(gx,      gy     ) },
-                    { {gx + gw, gy     }, color, {entry->u1, entry->v0}, shape, gi(gx + gw, gy     ) },
-                    { {gx + gw, gy + gh}, color, {entry->u1, entry->v1}, shape, gi(gx + gw, gy + gh) },
-                    { {gx,      gy     }, color, {entry->u0, entry->v0}, shape, gi(gx,      gy     ) },
-                    { {gx + gw, gy + gh}, color, {entry->u1, entry->v1}, shape, gi(gx + gw, gy + gh) },
-                    { {gx,      gy + gh}, color, {entry->u0, entry->v1}, shape, gi(gx,      gy + gh) },
-                };
-                state.draw(cmd, verts, 6);
+                UIVertex* v = batch + batched * 6;
+                v[0] = { {gx,      gy     }, color, {entry->u0, entry->v0}, shape, gi(gx,      gy     ) };
+                v[1] = { {gx + gw, gy     }, color, {entry->u1, entry->v0}, shape, gi(gx + gw, gy     ) };
+                v[2] = { {gx + gw, gy + gh}, color, {entry->u1, entry->v1}, shape, gi(gx + gw, gy + gh) };
+                v[3] = { {gx,      gy     }, color, {entry->u0, entry->v0}, shape, gi(gx,      gy     ) };
+                v[4] = { {gx + gw, gy + gh}, color, {entry->u1, entry->v1}, shape, gi(gx + gw, gy + gh) };
+                v[5] = { {gx,      gy + gh}, color, {entry->u0, entry->v1}, shape, gi(gx,      gy + gh) };
+                batched++;
             }
+            flushBatch();
             break;
         }
 

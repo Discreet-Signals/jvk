@@ -37,7 +37,10 @@ public:
     void* create(int width, int height);
     void release();
 private:
-    void* ptr;
+    // Null-init is load-bearing: ~NSViewGenerator → release() reads this,
+    // and create() may never run (zero-size window, Windows branch bail) —
+    // uninitialized, the dtor sent removeFromSuperview to a garbage pointer.
+    void* ptr = nullptr;
 };
 
 } // jvk::core::macos
