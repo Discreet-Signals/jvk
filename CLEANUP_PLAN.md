@@ -700,3 +700,39 @@ artifacts). Fills now use an exact tile+backdrop decomposition (piet-gpu class):
 
 Follow-ups if the benchmark still falls short: cross-frame caching of the tiling
 keyed on (path, transform), scale-aware flatten tolerance.
+
+## Addendum: Phase 6 landed — jvk::ImageType (2026-07-29)
+
+`include/jvk/graphics/ImageType.h`: `jvk::PixelData`/`jvk::ImageType`, a
+Vulkan-resident juce::Image backend, MIRROR-FIRST: a software image is the
+source of truth for every CPU surface (BitmapData, juce::Graphics painting,
+clone, convert — all fully juce-compliant by construction), and the VkImage
+is a lazily-built accelerator refreshed only when content changed (dirty
+tracking). Costs: pixels exist twice; paint-INTO runs on the CPU renderer.
+Wins: zero-copy draws (no hash, no shared-cache lookup, upload only on real
+change), headless/device-loss correctness for free, works under both
+renderers (the settings toggle just changes which backing finec::Images
+hands out — GPU mode now returns jvk::ImageType).
+
+- drawImage fast path: jvk-backed images bypass the address-keyed texture
+  cache entirely (also dodging its repaint-in-place staleness hazard);
+  anything else falls back to the existing cache.
+- Lifetime: PixelData holds the shared Device and uses FrameRetained; the
+  static-image DllMain rule applies verbatim (hold via finec::ImageResources,
+  never statics, never juce::ImageCache).
+- getPreferredImageTypeForTemporaryImages deliberately stays SOFTWARE:
+  DropShadowEffect / LookAndFeel_V2/V4 create-draw-destroy scratch images
+  inside single paints, and a jvk image destroyed with its draw in flight
+  blocks in ~PixelData. Flips after non-blocking texture retirement lands.
+- clipToImageAlpha is no longer a no-op: the dominant juce idiom
+  (drawImage*(..., fillAlphaChannelWithCurrentBrush=true) = clip + fillAll)
+  renders EXACTLY as one brush-tinted quad gated by the mask's alpha
+  (ui2d.frag shape type 5); other ops under the mask are conservatively
+  rect-clipped. Harness sceneImages now covers the idiom.
+
+Scope decisions closing the phase plan: timeline semaphores (+1.2 bump) and
+the FullscreenPass/blur-GLSL dedup merges are DROPPED deliberately — fences
+and binary semaphores are correct and sufficient, the merges are perf-neutral
+refactors with regression risk. Remaining compliance tail (true transparency
+layers, excludeClipRectangle, setTiledImageFill, non-solid mask fills,
+temporaries-hook flip) tracked as follow-up work.

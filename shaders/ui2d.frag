@@ -53,6 +53,8 @@ vec4 sampleColor() {
 //   2 = ellipse SDF          (shapeInfo.yz = halfSize)
 //   3 = sampled image        (shapeTex = image)
 //   4 = MSDF text            (shapeTex = atlas page, shapeInfo.y = screenPxRange)
+//   5 = image ALPHA as coverage — clipToImageAlpha fills: the quad colour
+//       carries the brush, the mask image's alpha gates it per pixel
 vec4 sampleShape() {
     int type = int(fragShapeInfo.x + 0.5);
 
@@ -61,6 +63,9 @@ vec4 sampleShape() {
 
     if (type == 3)
         return texture(shapeTex, fragUV);
+
+    if (type == 5)
+        return vec4(1.0, 1.0, 1.0, texture(shapeTex, fragUV).a);
 
     if (type == 4) {
         vec3 msd = texture(shapeTex, fragUV).rgb;

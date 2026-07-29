@@ -305,6 +305,13 @@ public:
     // from firing.
     static void forceDrainAll();
 
+    // Number of live Renderer instances in the process. A cheap probe for
+    // "is anything rendering through jvk right now" — finec::Images uses it
+    // to auto-select image backing (GPU-resident vs software) with zero
+    // per-app wiring. Message-thread callers only need a moment-in-time
+    // answer; the registry lock makes the read safe from anywhere.
+    static int liveCount();
+
     // The synchronous body of a frame's GPU work. Called internally by the
     // worker thread. Kept public because some non-windowed consumers (e.g.
     // benchmark harnesses, offscreen probes) may want a direct synchronous

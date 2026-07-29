@@ -65,6 +65,7 @@
 #include "include/jvk/core/Pipeline.h"
 #include "include/jvk/core/RenderTarget.h"
 #include "include/jvk/core/Cache.h"
+#include "include/jvk/graphics/ImageType.h"
 
 // Shaders (embedded SPIR-V)
 #include "include/jvk/graphics/UI2DShaders.h"

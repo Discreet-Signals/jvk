@@ -368,6 +368,13 @@ void ComplianceEditor::sceneImages(juce::Graphics& g, juce::Rectangle<float> are
     g.drawImageAt(test, 16, (int) (area.getHeight() * 0.55f));
     g.setColour(juce::Colours::black);
 
+    // Alpha-brush draw (fillAlphaChannelWithCurrentBrush): juce turns this
+    // into clipToImageAlpha + fillAll — must render the image's alpha
+    // channel in hot pink, NOT a solid rectangle and NOT nothing.
+    g.setColour(juce::Colours::hotpink);
+    g.drawImageAt(test, (int) (area.getWidth() * 0.45f), 16, true);
+    g.setColour(juce::Colours::black);
+
     // Tiled image fill.
     g.setTiledImageFill(test, 0, 0, 1.0f);
     g.fillRoundedRectangle(area.getWidth() * 0.45f, area.getHeight() * 0.55f,
@@ -504,7 +511,7 @@ const std::vector<ComplianceEditor::Scene>& ComplianceEditor::scenes()
         { "Gradients (linear / radial)",        &sceneGradients,         nullptr },
         { "Rect lists / shapes / lines",        &sceneRectsAndLists,     nullptr },
         { "Images (draw / transform / alpha / tiled)", &sceneImages,
-          "alpha-modulated + tiled fills diverge until their compliance fixes land" },
+          "tiled image fills still diverge (setTiledImageFill unimplemented in jvk)" },
         { "Effects with regions",               &sceneEffectsRegion,
           "jvk-only ops: LIVE pane only; regions take effect once ROI scissoring lands" },
         { "Transparency layer",                 &sceneTransparencyLayer,

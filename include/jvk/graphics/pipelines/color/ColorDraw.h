@@ -401,9 +401,14 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             auto p10 = juce::Point<float>(w, 0).transformedBy(tx);
             auto p11 = juce::Point<float>(w, h).transformedBy(tx);
             auto p01 = juce::Point<float>(0, h).transformedBy(tx);
+            // Mask fills (clipToImageAlpha + fill) tint by the brush and use
+            // the image's alpha as coverage (shape type 5); plain draws
+            // sample the image (type 3) modulated by opacity.
+            const bool maskFill = p.alphaMaskFill != 0;
             emitTransformedQuad(state, cmd, p00, p10, p11, p01,
-                                glm::vec4(1, 1, 1, p.opacity),
-                                glm::vec4(3.0f, 0, 0, 0));
+                                maskFill ? p.tint
+                                         : glm::vec4(1, 1, 1, p.opacity),
+                                glm::vec4(maskFill ? 5.0f : 3.0f, 0, 0, 0));
             break;
         }
 

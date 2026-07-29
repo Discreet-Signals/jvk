@@ -20,6 +20,12 @@ std::vector<Renderer*>& Renderer::registry()
     return r;
 }
 
+int Renderer::liveCount()
+{
+    const juce::ScopedLock lk(registryLock());
+    return static_cast<int>(registry().size());
+}
+
 Renderer::Renderer(Device& device, RenderTarget& target)
     : device_(device), target_(target),
       vertices_(device.physicalDevice(), device.device()),

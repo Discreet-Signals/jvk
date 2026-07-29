@@ -224,7 +224,28 @@ public:
         s.scopeDepth++;
     }
 
-    void clipToImageAlpha(const juce::Image&, const juce::AffineTransform&) override {}
+    // Alpha-mask clip. Full per-pixel masking of ARBITRARY subsequent draws
+    // would need a mask channel in every pipeline; what juce actually funnels
+    // through here is overwhelmingly one idiom — drawImage*(img, ..., true)
+    // = save / clipToImageAlpha / fillAll / restore — and THAT renders
+    // exactly: the fill is emitted as a single quad tinted with the brush
+    // and gated per-pixel by the mask image's alpha (shader shape type 5).
+    // Everything else under the mask is conservatively rect-clipped to the
+    // mask's bounds (alpha ignored — documented divergence). The mask lives
+    // in RecordState, so save/restore scopes it exactly like juce does.
+    void clipToImageAlpha(const juce::Image& img, const juce::AffineTransform& t) override
+    {
+        if (!img.isValid()) return;
+        auto& s = state();
+        s.alphaMask          = img;
+        s.alphaMaskTransform = t.followedBy(s.transform);
+        // Nothing outside the image can pass an alpha clip: fold its
+        // transformed bounds into the rect clip.
+        auto phys = img.getBounds().toFloat()
+                        .transformedBy(s.alphaMaskTransform.scaled(displayScale_))
+                        .getSmallestIntegerContainer();
+        s.clipBounds = s.clipBounds.getIntersection(phys);
+    }
 
     bool clipRegionIntersects(const juce::Rectangle<int>& r) override
     {
@@ -312,6 +333,14 @@ public:
     {
         if (isClipEmpty()) return;
         auto& s = state();
+        // Solid fill under an active clipToImageAlpha mask → the juce
+        // fillAlphaChannelWithCurrentBrush idiom. Render it exactly as one
+        // brush-tinted, alpha-gated image quad.
+        if (s.alphaMask.isValid() && s.fill.isColour())
+        {
+            fillThroughAlphaMask(r);
+            return;
+        }
         auto fi = renderer_.captureFill(s.fill);
         // Stage gradient LUT upload if this is a gradient fill
         if (s.fill.isGradient() && s.fill.gradient)
@@ -606,18 +635,56 @@ public:
             scratchTileVerts_.data(), scratchTileVerts_.size()));
     }
 
+    // Emit a solid fill gated by the active clipToImageAlpha mask: one quad
+    // over the mask's placement, colour = brush (straight alpha, layer
+    // opacity folded in), coverage = mask image alpha (shape type 5). The
+    // fill rect restricts via the command's clip; the mask bounds were
+    // already folded into clipBounds by clipToImageAlpha.
+    void fillThroughAlphaMask(const juce::Rectangle<float>& r)
+    {
+        auto& s = state();
+        VkDescriptorSet desc = tryImageFastPath(s.alphaMask, renderer_);
+        if (desc == VK_NULL_HANDLE)
+            desc = renderer_.caches().getTexture(
+                ResourceCaches::hashImage(s.alphaMask), s.alphaMask, renderer_);
+        if (desc == VK_NULL_HANDLE) return;   // staging/descriptor OOM
+
+        auto phys = r.transformedBy(s.transform.scaled(displayScale_))
+                        .getSmallestIntegerContainer();
+        auto clipRect = s.clipBounds.getIntersection(phys);
+        if (clipRect.isEmpty()) return;
+
+        DrawImageParams p { desc, s.alphaMaskTransform, 1.0f, displayScale_,
+                            s.alphaMask.getWidth(), s.alphaMask.getHeight() };
+        p.tint = { s.fill.colour.getFloatRed(), s.fill.colour.getFloatGreen(),
+                   s.fill.colour.getFloatBlue(),
+                   s.fill.colour.getFloatAlpha() * s.opacity };
+        p.alphaMaskFill = 1;
+        renderer_.push(DrawOp::DrawImage, clipRect, s.stencilDepth, p);
+    }
+
     void drawImage(const juce::Image& img, const juce::AffineTransform& t) override
     {
         if (isClipEmpty() || !img.isValid()) return;
         auto& s = state();
-        uint64_t hash = ResourceCaches::hashImage(img);
 
-        // Resolve the texture now (message thread — safe around the shared
-        // cache's inserts/evictions), pin the entry on this Renderer so it
-        // survives sibling eviction, and capture the descriptor directly
-        // into the draw command. The worker thread never touches the cache
-        // map for this draw.
-        auto desc = renderer_.caches().getTexture(hash, img, renderer_);
+        // jvk-backed images (jvk::ImageType) draw zero-copy: the PixelData
+        // owns a resident texture with its own dirty tracking, so there is
+        // no hash, no shared-cache lookup, and no re-upload unless the
+        // pixels actually changed. Null (foreign image, or GPU failure)
+        // falls through to the shared cache, which reads pixels via
+        // BitmapData — jvk images answer that from their CPU mirror, so
+        // the draw still happens either way.
+        VkDescriptorSet desc = tryImageFastPath(img, renderer_);
+        if (desc == VK_NULL_HANDLE) {
+            // Resolve the texture now (message thread — safe around the
+            // shared cache's inserts/evictions), pin the entry on this
+            // Renderer so it survives sibling eviction, and capture the
+            // descriptor directly into the draw command. The worker thread
+            // never touches the cache map for this draw.
+            uint64_t hash = ResourceCaches::hashImage(img);
+            desc = renderer_.caches().getTexture(hash, img, renderer_);
+        }
         if (desc == VK_NULL_HANDLE) return;   // staging/descriptor OOM
 
         // juce semantics: the current fill colour's ALPHA modulates image
@@ -750,6 +817,18 @@ public:
             StrokeEllipseParams { area, lineThickness, fi, s.transform, s.opacity, displayScale_ });
     }
 
+    // Deliberately SOFTWARE, not jvk::ImageType, despite the backend now
+    // existing: juce consults this hook not just for setBufferedToImage
+    // caches (long-lived — ideal for jvk backing) but also for per-paint
+    // scratch images that are created, drawn once, and destroyed inside a
+    // single paint (DropShadowEffect::applyEffect, LookAndFeel_V2/V4 tick
+    // and shadow temps). A jvk-backed image destroyed while its draw is
+    // in flight blocks in ~PixelData (FrameRetained → forceDrainAll), so
+    // flipping this wholesale would turn those call sites into a full
+    // pipeline stall per paint. Long-lived app art opts into jvk::ImageType
+    // explicitly via finec::Images; this hook can follow once PixelData
+    // gains non-blocking texture retirement (slot-keyed graveyard instead
+    // of the blocking dtor).
     std::unique_ptr<juce::ImageType> getPreferredImageTypeForTemporaryImages() const override
     {
         return std::make_unique<juce::SoftwareImageType>();
@@ -1051,6 +1130,10 @@ private:
         float                 opacity = 1.0f;
         juce::Font            font { juce::FontOptions {} };
         juce::Rectangle<int>  clipBounds;
+        // clipToImageAlpha state (refcounted handle — cheap to copy on
+        // saveState; restore pops it like any other clip). Invalid = none.
+        juce::Image           alphaMask;
+        juce::AffineTransform alphaMaskTransform;
         uint32_t              scopeDepth = 0;
         uint8_t               stencilDepth = 0;
         // Cached inverse of transform.scaled(displayScale) for getClipBounds

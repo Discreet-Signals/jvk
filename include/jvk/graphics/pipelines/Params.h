@@ -117,6 +117,11 @@ struct DrawImageParams {
     float                  scale;
     int                    imageWidth;
     int                    imageHeight;
+    // clipToImageAlpha fill (Graphics::fillThroughAlphaMask): the quad is
+    // tinted with the brush colour and the image contributes ALPHA ONLY
+    // (shader shape type 5). Zero for plain image draws.
+    glm::vec4              tint {};
+    uint32_t               alphaMaskFill = 0;
 };
 
 struct DrawGlyphsParams {
