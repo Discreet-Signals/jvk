@@ -55,6 +55,9 @@ vec4 sampleColor() {
 //   4 = MSDF text            (shapeTex = atlas page, shapeInfo.y = screenPxRange)
 //   5 = image ALPHA as coverage — clipToImageAlpha fills: the quad colour
 //       carries the brush, the mask image's alpha gates it per pixel
+//   6 = TILED image — UVs are unbounded, fract() wraps them (the sampler is
+//       CLAMP so a repeat mode isn't available; the 1px seam blend this
+//       costs vs true REPEAT is invisible on UI patterns)
 vec4 sampleShape() {
     int type = int(fragShapeInfo.x + 0.5);
 
@@ -66,6 +69,9 @@ vec4 sampleShape() {
 
     if (type == 5)
         return vec4(1.0, 1.0, 1.0, texture(shapeTex, fragUV).a);
+
+    if (type == 6)
+        return texture(shapeTex, fract(fragUV));
 
     if (type == 4) {
         vec3 msd = texture(shapeTex, fragUV).rgb;

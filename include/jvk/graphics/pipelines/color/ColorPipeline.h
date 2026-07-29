@@ -43,6 +43,7 @@ public:
             DrawOp::FillRect, DrawOp::FillRectList, DrawOp::FillRoundedRect,
             DrawOp::FillEllipse, DrawOp::StrokeRoundedRect, DrawOp::StrokeEllipse,
             DrawOp::DrawImage, DrawOp::DrawGlyphs, DrawOp::DrawLine,
+            DrawOp::FillTiledImage,
         };
         return ops;
     }

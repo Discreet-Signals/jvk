@@ -734,6 +734,34 @@ void Renderer::execute()
             state_.popStencilDepth();
             continue;
         }
+        if (cmd.op == DrawOp::ExcludeClipRect
+            || cmd.op == DrawOp::RestoreClipExclude) {
+            // excludeClipRectangle: stencil-park the rect's drawable pixels
+            // out of the current depth (see ClipPipeline's exclusion
+            // variant). Park ref = 192 + depth, un-park ref = depth; the
+            // CPU-side stencilDepth is untouched — draws keep testing
+            // EQUAL(depth) and simply fail inside the parked rect.
+            if (clipPipeline_ && pathPipeline_) {
+                auto& p = arena_.read<ExcludeRectParams>(cmd.dataOffset);
+                ClipPipeline::PushConstants pc {};
+                pc.shapeType    = 1;   // rect = rrect with radius 0
+                pc.centerX      = p.rect.getCentreX();
+                pc.centerY      = p.rect.getCentreY();
+                pc.halfW        = p.rect.getWidth()  * 0.5f;
+                pc.halfH        = p.rect.getHeight() * 0.5f;
+                pc.cornerRadius = 0.0f;
+                const uint32_t depth = static_cast<uint32_t>(cmd.stencilDepth);
+                const uint32_t ref   = cmd.op == DrawOp::ExcludeClipRect
+                                           ? 192u + depth : depth;
+                clipPipeline_->excludeRect(state_, frame.cmd, *this, cmd,
+                    pc, p.rect,
+                    pathPipeline_->ssboDescriptorSet(),
+                    ref,
+                    static_cast<float>(frame.extent.width),
+                    static_cast<float>(frame.extent.height));
+            }
+            continue;
+        }
         if (cmd.op == DrawOp::FillPath) {
             // Analytical SDF path fill — dispatched via PathPipeline which
             // owns the segment storage buffer + the SDF fragment shader.

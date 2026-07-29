@@ -83,7 +83,12 @@ public:
     // blocks in waitUntilUnretained forever — forceDrainAll only drops
     // frame-scoped pins, not durable ones).
     void pin()   noexcept { inFlight_.fetch_add(1, std::memory_order_acq_rel); }
-    void unpin() noexcept { inFlight_.fetch_sub(1, std::memory_order_acq_rel); }
+    // Virtual so self-managing subclasses can piggyback lifetime on the
+    // drain (jvk::PixelData's TextureKeeper releases a refcount per unpin,
+    // deleting itself after the last in-flight frame completes — the
+    // non-blocking alternative to waitUntilUnretained for objects whose
+    // owner may die while a draw is still in flight).
+    virtual void unpin() noexcept { inFlight_.fetch_sub(1, std::memory_order_acq_rel); }
 
 private:
     friend class Renderer;

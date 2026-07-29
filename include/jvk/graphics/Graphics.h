@@ -88,7 +88,30 @@ public:
         return clipToRectangle(list.getBounds());
     }
 
-    void excludeClipRectangle(const juce::Rectangle<int>&) override {}
+    // Excluded rects are stencil-PARKED: their drawable pixels (== current
+    // depth) are rewritten to 192+depth, so every draw's EQUAL(depth) test
+    // fails inside them, and restoreState un-parks (see ClipPipeline's
+    // exclusion variant for the exact protocol and why it survives nested
+    // clip push/pop in any order). Rect is taken through the current
+    // transform's bounding box — same axis-aligned treatment as rect clips.
+    // Known edge: two overlapping exclusions at the SAME clip depth in
+    // nested scopes un-park each other's overlap early (192+d collides);
+    // juce call sites (viewport repaint carving, melatonin) never do this.
+    void excludeClipRectangle(const juce::Rectangle<int>& r) override
+    {
+        auto& s = state();
+        if (isClipEmpty()) return;
+        auto phys = r.toFloat().transformedBy(s.transform.scaled(displayScale_));
+        auto clip = s.clipBounds.getIntersection(phys.getSmallestIntegerContainer());
+        if (clip.isEmpty()) return;      // outside the clip — nothing to exclude
+        jassert(s.stencilDepth < 64);    // park encoding limit (ref = 192+d)
+        exclusionShared_.push_back({ phys, s.stencilDepth });
+        s.exclusions++;
+        renderer_.push(DrawOp::ExcludeClipRect, clip, s.stencilDepth,
+                       ExcludeRectParams { phys });
+        // clipBounds stays the (conservative) enclosing rect — juce allows
+        // getClipBounds to over-report; draws are culled by the stencil.
+    }
 
     // Axis-aligned rectangle detection — SVG clip-path paths are almost
     // always a <rect>, which shows up here as a 4-or-5 vertex path of
@@ -286,6 +309,18 @@ public:
         }
         auto& old = stateStack_.back();
         auto& prev = stateStack_[stateStack_.size() - 2];
+        // Un-park this scope's exclusions FIRST (LIFO): each ref is the
+        // depth recorded at exclusion time, so ordering vs the clip pops
+        // below is actually immaterial (the park protocol is depth-tagged),
+        // but LIFO keeps the stencil timeline easy to reason about.
+        while (old.exclusions > prev.exclusions && !exclusionShared_.empty()) {
+            auto e = exclusionShared_.back();
+            exclusionShared_.pop_back();
+            renderer_.push(DrawOp::RestoreClipExclude,
+                           e.rect.getSmallestIntegerContainer(),
+                           e.depth, ExcludeRectParams { e.rect });
+            old.exclusions--;
+        }
         while (old.scopeDepth > prev.scopeDepth) {
             bool isPathClip = old.stencilDepth > prev.stencilDepth;
             if (isPathClip) {
@@ -336,9 +371,17 @@ public:
         // Solid fill under an active clipToImageAlpha mask → the juce
         // fillAlphaChannelWithCurrentBrush idiom. Render it exactly as one
         // brush-tinted, alpha-gated image quad.
-        if (s.alphaMask.isValid() && s.fill.isColour())
+        if (s.alphaMask.isValid() && (s.fill.isColour() || s.fill.isGradient()))
         {
             fillThroughAlphaMask(r);
+            return;
+        }
+        // juce setTiledImageFill: render as a wrapped-UV image quad (shape
+        // type 6). Without this the colour pipelines fell back to the fill's
+        // colour member — solid black.
+        if (s.fill.isTiledImage() && s.fill.image.isValid())
+        {
+            fillWithTiledImage(r);
             return;
         }
         auto fi = renderer_.captureFill(s.fill);
@@ -656,11 +699,70 @@ public:
 
         DrawImageParams p { desc, s.alphaMaskTransform, 1.0f, displayScale_,
                             s.alphaMask.getWidth(), s.alphaMask.getHeight() };
-        p.tint = { s.fill.colour.getFloatRed(), s.fill.colour.getFloatGreen(),
-                   s.fill.colour.getFloatBlue(),
-                   s.fill.colour.getFloatAlpha() * s.opacity };
-        p.alphaMaskFill = 1;
+        if (s.fill.isGradient() && s.fill.gradient != nullptr)
+        {
+            // Gradient through the mask: replay rebuilds the gradient ctx
+            // (sampleColor shades the quad, the mask alpha gates it).
+            renderer_.registerGradient(*s.fill.gradient);
+            p.tint              = { 1.0f, 1.0f, 1.0f, s.opacity };
+            p.alphaMaskFill     = 2;
+            p.fillIndex         = renderer_.captureFill(s.fill);
+            p.gradientTransform = s.transform;
+        }
+        else
+        {
+            p.tint = { s.fill.colour.getFloatRed(), s.fill.colour.getFloatGreen(),
+                       s.fill.colour.getFloatBlue(),
+                       s.fill.colour.getFloatAlpha() * s.opacity };
+            p.alphaMaskFill = 1;
+        }
         renderer_.push(DrawOp::DrawImage, clipRect, s.stencilDepth, p);
+    }
+
+    // Tiled image fill: one quad over the fill rect, UVs mapped through the
+    // inverse of the fill's image-placement transform, wrapped by fract()
+    // in the shader (shape type 6). Exact for affine placements (UVs
+    // interpolate linearly). Known divergence vs true REPEAT sampling: a
+    // one-texel seam blend at tile edges (the cached sampler is CLAMP).
+    void fillWithTiledImage(const juce::Rectangle<float>& r)
+    {
+        auto& s = state();
+        if (s.fill.transform.isSingularity())
+            return;
+        VkDescriptorSet desc = tryImageFastPath(s.fill.image, renderer_);
+        if (desc == VK_NULL_HANDLE)
+            desc = renderer_.caches().getTexture(
+                ResourceCaches::hashImage(s.fill.image), s.fill.image, renderer_);
+        if (desc == VK_NULL_HANDLE) return;
+
+        auto physRect = r.transformedBy(s.transform.scaled(displayScale_))
+                            .getSmallestIntegerContainer();
+        auto clipRect = s.clipBounds.getIntersection(physRect);
+        if (clipRect.isEmpty()) return;
+
+        const auto inv = s.fill.transform.inverted();   // user → image px
+        const float iw = static_cast<float>(s.fill.image.getWidth());
+        const float ih = static_cast<float>(s.fill.image.getHeight());
+        const auto  tx = s.transform.scaled(displayScale_);
+
+        FillTiledImageParams p {};
+        p.desc = desc;
+        const juce::Point<float> corners[4] = {
+            { r.getX(),     r.getY()      }, { r.getRight(), r.getY()      },
+            { r.getRight(), r.getBottom() }, { r.getX(),     r.getBottom() },
+        };
+        for (int i = 0; i < 4; i++)
+        {
+            const auto pp = corners[i].transformedBy(tx);
+            const auto ip = corners[i].transformedBy(inv);
+            p.pos[i] = { pp.x, pp.y };
+            p.uv[i]  = { ip.x / iw, ip.y / ih };
+        }
+        // juce contract: image fills are modulated by the fill colour's
+        // alpha (FillType::setOpacity writes it), layer opacity on top.
+        p.tint = { 1.0f, 1.0f, 1.0f,
+                   s.fill.colour.getFloatAlpha() * s.opacity };
+        renderer_.push(DrawOp::FillTiledImage, clipRect, s.stencilDepth, p);
     }
 
     void drawImage(const juce::Image& img, const juce::AffineTransform& t) override
@@ -817,21 +919,16 @@ public:
             StrokeEllipseParams { area, lineThickness, fi, s.transform, s.opacity, displayScale_ });
     }
 
-    // Deliberately SOFTWARE, not jvk::ImageType, despite the backend now
-    // existing: juce consults this hook not just for setBufferedToImage
-    // caches (long-lived — ideal for jvk backing) but also for per-paint
-    // scratch images that are created, drawn once, and destroyed inside a
-    // single paint (DropShadowEffect::applyEffect, LookAndFeel_V2/V4 tick
-    // and shadow temps). A jvk-backed image destroyed while its draw is
-    // in flight blocks in ~PixelData (FrameRetained → forceDrainAll), so
-    // flipping this wholesale would turn those call sites into a full
-    // pipeline stall per paint. Long-lived app art opts into jvk::ImageType
-    // explicitly via finec::Images; this hook can follow once PixelData
-    // gains non-blocking texture retirement (slot-keyed graveyard instead
-    // of the blocking dtor).
+    // jvk backing for temporaries: setBufferedToImage caches paint on the
+    // CPU mirror and composite zero-copy with dirty tracking (which also
+    // retires the address-keyed-hash staleness hazard of repaint-in-place
+    // images). Per-paint create-draw-destroy scratch (DropShadowEffect,
+    // LookAndFeel_V2/V4 temps) is safe since PixelData's TextureKeeper made
+    // destruction non-blocking — a mid-flight destroy just orphans the
+    // texture until its frame's fence, no stall.
     std::unique_ptr<juce::ImageType> getPreferredImageTypeForTemporaryImages() const override
     {
-        return std::make_unique<juce::SoftwareImageType>();
+        return std::make_unique<jvk::ImageType>();
     }
 
     // Monotonic across frames (incremented by beginFrame): JUCE keys
@@ -1134,6 +1231,10 @@ private:
         // saveState; restore pops it like any other clip). Invalid = none.
         juce::Image           alphaMask;
         juce::AffineTransform alphaMaskTransform;
+        // Count of excludeClipRectangle parks taken in scopes at or below
+        // this state; restoreState un-parks the difference (rects live in
+        // exclusionShared_, stack-shaped like the path-clip params).
+        uint32_t              exclusions = 0;
         uint32_t              scopeDepth = 0;
         uint8_t               stencilDepth = 0;
         // Cached inverse of transform.scaled(displayScale) for getClipBounds
@@ -1451,6 +1552,11 @@ private:
     // stack-shaped: pushes in clipToPath, pops in recordPopClip; saveState
     // copies nothing).
     std::vector<ClipShapeParams> pathClipShared_;
+
+    // Active exclusion parks (excludeClipRectangle), strictly stack-shaped
+    // across the state stack like pathClipShared_.
+    struct Exclusion { juce::Rectangle<float> rect; uint8_t depth; };
+    std::vector<Exclusion> exclusionShared_;
 
     // Flatten scratch buffers — cleared-but-not-freed between paths AND
     // between frames (the editor reuses one Graphics via beginFrame), so

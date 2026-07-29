@@ -49,17 +49,17 @@ namespace jvk {
 //     other image asset. Do not park jvk images in juce::ImageCache (a
 //     process-global static holder).
 //
-//   - Draw-time safety uses the FrameRetained contract: drawImage pins the
-//     PixelData for the frame, and ~PixelData blocks until every in-flight
-//     frame that sampled the texture has completed before destroying the
-//     VkImage/descriptor.
+//   - Draw-time safety uses the FrameRetained contract on the KEEPER, not
+//     the PixelData: drawImage pins the refcounted TextureKeeper for the
+//     frame, and ~PixelData just drops its owner ref — never blocks. A
+//     texture whose image died mid-flight is orphaned until its frame's
+//     fence, then freed by the last unpin (on whichever thread that is).
 //
 // Threading: prepareForDraw / createLowLevelContext / BitmapData access are
 // message-thread only, like all jvk::Graphics record-time surfaces.
 // =============================================================================
 
-class PixelData final : public juce::ImagePixelData,
-                        public FrameRetained
+class PixelData final : public juce::ImagePixelData
 {
 public:
     PixelData(juce::Image::PixelFormat fmt, int w, int h, bool clear)
@@ -71,13 +71,14 @@ public:
 
     ~PixelData() override
     {
-        // Block until no in-flight frame references the texture, BEFORE any
-        // GPU handle is torn down (FrameRetained contract).
-        waitUntilUnretained();
-        if (bindings_ && descriptorSet_ != VK_NULL_HANDLE)
-            bindings_->free(descriptorSet_);
-        // texture_ destructs next; device_ (declared first) releases last,
-        // so the VkDevice outlives the VkImage it allocated.
+        // NON-BLOCKING: the GPU bundle lives in a refcounted TextureKeeper.
+        // Dropping the owner ref here never waits — if a draw is still in
+        // flight, the keeper's per-frame pins each hold a ref and the last
+        // unpin (after that frame's fence) deletes it. This is what makes
+        // per-paint create-draw-destroy temporaries (DropShadowEffect,
+        // LookAndFeel scratch, buffered-image resizes) stall-free.
+        if (keeper_ != nullptr)
+            keeper_->release();
     }
 
     // ---- juce::ImagePixelData ------------------------------------------
@@ -129,24 +130,31 @@ public:
         if (w == 0 || h == 0)
             return VK_NULL_HANDLE;
 
-        if (!texture_.valid()) {
-            // First draw: acquire the shared device (kept until this image
-            // dies) and build texture + descriptor.
-            device_ = Device::acquire();
-            texture_ = Image(dev.pool(), dev.device(), w, h,
-                             VK_FORMAT_R8G8B8A8_UNORM,
-                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-            if (!texture_.valid())
-                return VK_NULL_HANDLE;
-            descriptorSet_ = dev.bindings().alloc();
-            if (descriptorSet_ == VK_NULL_HANDLE) {
-                texture_ = Image();
+        if (keeper_ == nullptr || !keeper_->texture.valid()) {
+            auto* k = new TextureKeeper();
+            // The keeper holds the shared device until IT dies, so the
+            // VkDevice outlives the VkImage even if this PixelData (and
+            // every editor) is gone while the last frame drains.
+            k->device  = Device::acquire();
+            k->texture = Image(dev.pool(), dev.device(), w, h,
+                               VK_FORMAT_R8G8B8A8_UNORM,
+                               VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            if (!k->texture.valid()) {
+                k->release();
                 return VK_NULL_HANDLE;
             }
-            bindings_ = &dev.bindings();
-            Memory::M::writeImage(dev.device(), descriptorSet_, 0,
-                                  texture_.view(), texture_.sampler());
-            dirty_ = true;
+            k->descriptorSet = dev.bindings().alloc();
+            if (k->descriptorSet == VK_NULL_HANDLE) {
+                k->release();
+                return VK_NULL_HANDLE;
+            }
+            k->bindings = &dev.bindings();
+            Memory::M::writeImage(dev.device(), k->descriptorSet, 0,
+                                  k->texture.view(), k->texture.sampler());
+            if (keeper_ != nullptr)
+                keeper_->release();
+            keeper_ = k;
+            dirty_  = true;
         }
 
         if (dirty_) {
@@ -155,8 +163,12 @@ public:
             dirty_ = false;
         }
 
-        r.retain(this);
-        return descriptorSet_;
+        // Pin-and-ref move together: Renderer::retain guarantees exactly one
+        // unpin (after this frame's slot fence), and the keeper's unpin
+        // override drops the matching ref.
+        keeper_->addRef();
+        r.retain(keeper_);
+        return keeper_->descriptorSet;
     }
 
 private:
@@ -203,19 +215,46 @@ private:
             }
         }
 
-        r.upload(staging, texture_.image(), w, h);
+        r.upload(staging, keeper_->texture.image(), w, h);
         return true;
     }
 
-    juce::Image mirror_;                 // CPU source of truth (software)
+    // The GPU bundle, lifetime-decoupled from the PixelData. refs starts at
+    // 1 (the owning PixelData); every Renderer::retain adds one, dropped by
+    // the drain's unpin after that frame's fence. Deletion happens on
+    // whichever thread drops the last ref — safe: vkDestroyImage/VMA are
+    // externally-synchronized per object and nothing else touches this
+    // bundle by then; Memory::M::free takes its own lock. Never blocks.
+    struct TextureKeeper final : FrameRetained {
+        std::shared_ptr<Device> device;     // declared first → dies last
+        Image                   texture;
+        Memory::M*              bindings      = nullptr;
+        VkDescriptorSet         descriptorSet = VK_NULL_HANDLE;
+        std::atomic<int>        refs { 1 };
 
-    // GPU members: device_ FIRST so it is destroyed LAST (the VkImage and
-    // descriptor free need the VkDevice alive).
-    std::shared_ptr<Device> device_;
-    Image                   texture_;
-    Memory::M*              bindings_      = nullptr;
-    VkDescriptorSet         descriptorSet_ = VK_NULL_HANDLE;
-    bool                    dirty_         = true;
+        void addRef() noexcept { refs.fetch_add(1, std::memory_order_relaxed); }
+        void release() noexcept
+        {
+            if (refs.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                delete this;
+        }
+        void unpin() noexcept override
+        {
+            FrameRetained::unpin();
+            release();
+        }
+        ~TextureKeeper() override
+        {
+            // refs hit zero → every pin's unpin already ran, so the base
+            // dtor's waitUntilUnretained is a no-op single load.
+            if (bindings && descriptorSet != VK_NULL_HANDLE)
+                bindings->free(descriptorSet);
+        }
+    };
+
+    juce::Image    mirror_;              // CPU source of truth (software)
+    TextureKeeper* keeper_ = nullptr;    // owner ref; released non-blocking
+    bool           dirty_  = true;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PixelData)
 };

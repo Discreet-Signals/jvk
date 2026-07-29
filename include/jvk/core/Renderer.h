@@ -44,6 +44,9 @@ enum class DrawOp : uint8_t {
     BlurPath,          // analytical path SDF blur (fill or stroke ring)
     PushClipRect, PopClipRect,      // scissor-only clips (State-side stack)
     PushClipPath, PopClipPath,      // stencil INCR/DECR via ClipPipeline
+    FillTiledImage,                 // tiled image fill (setTiledImageFill)
+    ExcludeClipRect,                // stencil-park the rect out of the clip
+    RestoreClipExclude,             // un-park it on restoreState
     COUNT
 };
 

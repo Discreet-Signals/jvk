@@ -511,14 +511,13 @@ const std::vector<ComplianceEditor::Scene>& ComplianceEditor::scenes()
         { "Gradients (linear / radial)",        &sceneGradients,         nullptr },
         { "Rect lists / shapes / lines",        &sceneRectsAndLists,     nullptr },
         { "Images (draw / transform / alpha / tiled)", &sceneImages,
-          "tiled image fills still diverge (setTiledImageFill unimplemented in jvk)" },
+          "tiled fills may show a 1-texel seam blend at tile edges (CLAMP sampler + fract)" },
         { "Effects with regions",               &sceneEffectsRegion,
           "jvk-only ops: LIVE pane only; regions take effect once ROI scissoring lands" },
         { "Transparency layer",                 &sceneTransparencyLayer,
           "overlap darkens until true layers land (Phase 6)" },
         { "Opacity contract (setOpacity/fill alpha)", &sceneOpacityContract, nullptr },
-        { "Exclude clip region",                &sceneExcludeClip,
-          "centre not excluded until excludeClipRectangle lands" },
+        { "Exclude clip region",                &sceneExcludeClip, nullptr },
     };
     return s;
 }

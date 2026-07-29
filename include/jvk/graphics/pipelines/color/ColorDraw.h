@@ -402,13 +402,43 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             auto p11 = juce::Point<float>(w, h).transformedBy(tx);
             auto p01 = juce::Point<float>(0, h).transformedBy(tx);
             // Mask fills (clipToImageAlpha + fill) tint by the brush and use
-            // the image's alpha as coverage (shape type 5); plain draws
-            // sample the image (type 3) modulated by opacity.
+            // the image's alpha as coverage (shape type 5): solid brushes
+            // ride `tint`; gradient brushes (alphaMaskFill == 2) rebuild the
+            // gradient ctx so sampleColor() shades the quad and the mask
+            // alpha gates it. Plain draws sample the image (type 3)
+            // modulated by opacity.
+            if (p.alphaMaskFill == 2) {
+                auto& mfill = r.getFill(p.fillIndex);
+                GradientCtx mg = makeGradientCtx(r, mfill,
+                                     toPhysical(p.gradientTransform, p.scale));
+                state.setResources(colorDescFor(mg, r), shapeDesc);
+                emitTransformedQuad(state, cmd, p00, p10, p11, p01,
+                                    p.tint, glm::vec4(5.0f, 0, 0, 0), &mg);
+                break;
+            }
             const bool maskFill = p.alphaMaskFill != 0;
             emitTransformedQuad(state, cmd, p00, p10, p11, p01,
                                 maskFill ? p.tint
                                          : glm::vec4(1, 1, 1, p.opacity),
                                 glm::vec4(maskFill ? 5.0f : 3.0f, 0, 0, 0));
+            break;
+        }
+
+        case DrawOp::FillTiledImage: {
+            auto& p = arena.read<FillTiledImageParams>(cmd.dataOffset);
+            auto shapeDesc = p.desc ? p.desc : def;
+            state.setResources(def, shapeDesc);
+            // Corners + UVs precomputed at record time (shape type 6 wraps
+            // the unbounded UVs with fract()).
+            auto mkv = [&](int i) {
+                return UIVertex {
+                    { p.pos[i].x, p.pos[i].y }, p.tint,
+                    { p.uv[i].x, p.uv[i].y },
+                    glm::vec4(6.0f, 0, 0, 0), glm::vec4(0.0f)
+                };
+            };
+            UIVertex verts[6] = { mkv(0), mkv(1), mkv(2), mkv(0), mkv(2), mkv(3) };
+            state.draw(cmd, verts, 6);
             break;
         }
 

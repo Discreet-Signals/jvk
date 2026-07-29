@@ -103,6 +103,19 @@ public:
                                      VK_STENCIL_OP_INCREMENT_AND_WRAP);
         popPipeline_  = buildVariant(sceneRenderPass, vertSpv, fragSpv,
                                      VK_STENCIL_OP_DECREMENT_AND_WRAP);
+        // Exclusion variant (excludeClipRectangle): REPLACE with the low six
+        // bits masked out of the COMPARE. Park pass: reference = 192+d
+        // matches pixels whose (value & 0x3F) == d — i.e. exactly the
+        // pixels drawable at depth d — and REPLACE writes the full 192+d,
+        // making them fail the draws' EQUAL(d) test. Un-park: reference = d
+        // matches the same low bits (both d and 192+d), REPLACE writes d —
+        // parked pixels return, already-d pixels rewrite to d (no-op).
+        // Nested clips can't touch parked pixels (their EQUAL(d) and
+        // EQUAL(d+1) refs never match 192+d), so exclusions survive any
+        // clip push/pop ordering. Requires clip depth < 64 — depths that
+        // deep are already pathological.
+        excludePipeline_ = buildVariant(sceneRenderPass, vertSpv, fragSpv,
+                                        VK_STENCIL_OP_REPLACE, 0x3Fu);
     }
 
     bool ready() const { return pushPipeline_ != VK_NULL_HANDLE; }
@@ -121,6 +134,21 @@ public:
     {
         dispatch(state, cmd, r, drawCmd, pushPipeline_, pcData, coverRect,
                  ssboDesc, parentDepth, viewportW, viewportH);
+    }
+
+    // Exclusion park/un-park (see the variant comment above). `reference`
+    // is 192 + depth to park, depth to un-park; `coverRect` is the excluded
+    // rect (shapeType rect in `pcData` gives full coverage inside it).
+    void excludeRect(State& state, VkCommandBuffer cmd, Renderer& r,
+                     const DrawCommand& drawCmd,
+                     const PushConstants& pcData,
+                     const juce::Rectangle<float>& coverRect,
+                     VkDescriptorSet ssboDesc,
+                     uint32_t reference,
+                     float viewportW, float viewportH)
+    {
+        dispatch(state, cmd, r, drawCmd, excludePipeline_, pcData, coverRect,
+                 ssboDesc, reference, viewportW, viewportH);
     }
 
     // PopClip — DECR the stencil at the same fragments PushClip incremented.
@@ -217,7 +245,8 @@ private:
     VkPipeline buildVariant(VkRenderPass renderPass,
                             std::span<const uint32_t> vertSpv,
                             std::span<const uint32_t> fragSpv,
-                            VkStencilOp stencilPassOp)
+                            VkStencilOp stencilPassOp,
+                            uint32_t compareMask = 0xFFu)
     {
         VkDevice d = device_->device();
 
@@ -291,7 +320,7 @@ private:
         so.passOp      = stencilPassOp;
         so.depthFailOp = VK_STENCIL_OP_KEEP;
         so.compareOp   = VK_COMPARE_OP_EQUAL;
-        so.compareMask = 0xFF;
+        so.compareMask = compareMask;
         so.writeMask   = 0xFF;
         so.reference   = 0; // dynamic state — set per dispatch
 
@@ -348,17 +377,22 @@ private:
     {
         if (!device_) return;
         VkDevice d = device_->device();
-        if (pushPipeline_   != VK_NULL_HANDLE) vkDestroyPipeline(d, pushPipeline_, nullptr);
-        if (popPipeline_    != VK_NULL_HANDLE) vkDestroyPipeline(d, popPipeline_, nullptr);
+        if (pushPipeline_    != VK_NULL_HANDLE) vkDestroyPipeline(d, pushPipeline_, nullptr);
+        if (popPipeline_     != VK_NULL_HANDLE) vkDestroyPipeline(d, popPipeline_, nullptr);
+        if (excludePipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(d, excludePipeline_, nullptr);
         if (layout_         != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
         if (ssboSetLayout_  != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(d, ssboSetLayout_, nullptr);
+        pushPipeline_ = popPipeline_ = excludePipeline_ = VK_NULL_HANDLE;
+        layout_ = VK_NULL_HANDLE;
+        ssboSetLayout_ = VK_NULL_HANDLE;
         device_ = nullptr;
     }
 
     Device*               device_        = nullptr;
     VkPipelineLayout      layout_        = VK_NULL_HANDLE;
-    VkPipeline            pushPipeline_  = VK_NULL_HANDLE;
-    VkPipeline            popPipeline_   = VK_NULL_HANDLE;
+    VkPipeline            pushPipeline_    = VK_NULL_HANDLE;
+    VkPipeline            popPipeline_     = VK_NULL_HANDLE;
+    VkPipeline            excludePipeline_ = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssboSetLayout_ = VK_NULL_HANDLE;
 };
 

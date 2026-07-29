@@ -118,10 +118,31 @@ struct DrawImageParams {
     int                    imageWidth;
     int                    imageHeight;
     // clipToImageAlpha fill (Graphics::fillThroughAlphaMask): the quad is
-    // tinted with the brush colour and the image contributes ALPHA ONLY
-    // (shader shape type 5). Zero for plain image draws.
+    // tinted with the brush (1 = solid: `tint` carries the colour) or the
+    // brush GRADIENT (2: `fillIndex`+`gradientTransform` rebuild the ctx at
+    // replay; tint = white x layer opacity), and the image contributes
+    // ALPHA ONLY (shader shape type 5). Zero for plain image draws.
     glm::vec4              tint {};
     uint32_t               alphaMaskFill = 0;
+    uint32_t               fillIndex = 0;
+    juce::AffineTransform  gradientTransform;
+};
+
+// Tiled image fill (juce setTiledImageFill via Graphics::fillRect). Corners
+// and UVs are precomputed at record time — UVs are image-normalized and
+// unbounded; the shader wraps with fract() (shape type 6). Rendered by
+// ColorPipeline like any other quad.
+struct FillTiledImageParams {
+    VkDescriptorSet desc;
+    glm::vec2       pos[4];   // physical-px corners: p00 p10 p11 p01
+    glm::vec2       uv[4];    // matching UVs (pre-fract)
+    glm::vec4       tint;     // white x fill-colour alpha x layer opacity
+};
+
+// excludeClipRectangle: the rect (physical px) whose pixels get stencil-
+// parked out of the current clip depth, and un-parked on restoreState.
+struct ExcludeRectParams {
+    juce::Rectangle<float> rect;
 };
 
 struct DrawGlyphsParams {
