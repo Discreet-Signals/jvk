@@ -15,7 +15,12 @@ public:
     PipelineConfig config() const override
     {
         PipelineConfig cfg;
-        cfg.blendMode = BlendMode::AlphaBlend;
+        // ui2d.frag emits PREMULTIPLIED alpha — it has to, because image
+        // textures arrive premultiplied from juce and the sampler must
+        // interpolate them that way. Blending them with SRC_ALPHA applies
+        // alpha a second time and traces a dark rim around every antialiased
+        // image edge. See the alpha-convention note at the top of ui2d.frag.
+        cfg.blendMode = BlendMode::Premultiplied;
         cfg.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         cfg.cullMode = VK_CULL_MODE_NONE;
         cfg.frontFace = VK_FRONT_FACE_CLOCKWISE;

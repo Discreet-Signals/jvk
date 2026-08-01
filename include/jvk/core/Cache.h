@@ -424,6 +424,15 @@ public:
         // row copy + in-register swizzle to the texture's R,G,B,A. The old
         // per-pixel getPixelColour was ~1M virtual format-dispatch calls for
         // a 1024² image, on the message thread, inside paint.
+        //
+        // ALPHA CONVENTION: textures stay PREMULTIPLIED, exactly as juce
+        // stores them — do not un-premultiply here. The sampler has to
+        // interpolate premultiplied values or edge texels bleed the
+        // undefined colour of their fully-transparent neighbours. ui2d.frag
+        // and ColorPipeline (BlendMode::Premultiplied) are premultiplied
+        // end-to-end to match. The slow path below agrees: juce's
+        // getPixelColour yields (0,0,0,a) for SingleChannel and a=255 for
+        // RGB, both already valid premultiplied values.
         if (img.getFormat() == juce::Image::ARGB) {
             for (uint32_t y = 0; y < h; y++) {
                 const auto* src = bmp.getLinePointer(static_cast<int>(y));

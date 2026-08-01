@@ -43,10 +43,33 @@ vec4 sampleColor() {
     return vec4(col.rgb, col.a * fragColor.a);
 }
 
+// ---- Alpha convention ----------------------------------------------------
+// THIS SHADER OUTPUTS PREMULTIPLIED ALPHA, and ColorPipeline blends it with
+// BlendMode::Premultiplied (ONE / ONE_MINUS_SRC_ALPHA). That is the only
+// convention that works here, because image textures are ALREADY
+// premultiplied and cannot be anything else: Cache.h / ImageType.h upload
+// juce::PixelARGB verbatim, and the sampler MUST interpolate premultiplied
+// values or edge texels blend in the undefined colour of their fully
+// transparent neighbours.
+//
+// The two sources therefore meet in the middle:
+//   - images  — passed through untouched (already premultiplied)
+//   - shapes  — coverage returned as vec4(a), not vec4(1,1,1,a), so that
+//               multiplying by a premultiplied colour stays premultiplied
+//   - colors  — sampleColor() returns STRAIGHT alpha (vertex attribute or
+//               gradient LUT texel); main() premultiplies once, at the end
+//
+// Getting this wrong is visible, not subtle: blending premultiplied source
+// with SRC_ALPHA applies alpha twice —
+//     out = (a*C)*a + (1-a)*dst = a^2*C + (1-a)*dst
+// instead of a*C + (1-a)*dst — darkening every partially transparent pixel
+// by up to a(1-a)*C, worst at a = 0.5. On a filmstrip knob that reads as a
+// dark rim traced around the antialiased silhouette.
+
 // ---- Shape source --------------------------------------------------------
-// Returns an RGBA mask multiplied against sampled color. RGB is usually (1,1,1)
-// except for images, which supply their own color; the "fill color" then acts
-// as a tint.
+// Returns a PREMULTIPLIED RGBA mask multiplied against the sampled color.
+// RGB is the coverage value replicated for SDF/text/mask types; images
+// supply their own premultiplied color and the "fill color" acts as a tint.
 // Types:
 //   0 = flat quad            (full coverage)
 //   1 = rounded rect SDF     (shapeInfo.yz = halfSize, .w = cornerRadius)
@@ -64,11 +87,12 @@ vec4 sampleShape() {
     if (type == 0)
         return vec4(1.0);
 
+    // Images are already premultiplied — pass straight through.
     if (type == 3)
         return texture(shapeTex, fragUV);
 
     if (type == 5)
-        return vec4(1.0, 1.0, 1.0, texture(shapeTex, fragUV).a);
+        return vec4(texture(shapeTex, fragUV).a);
 
     if (type == 6)
         return texture(shapeTex, fract(fragUV));
@@ -98,7 +122,7 @@ vec4 sampleShape() {
               ? 12.92 * alpha
               : 1.055 * pow(alpha, 1.0 / 2.4) - 0.055;
 
-        return vec4(1.0, 1.0, 1.0, alpha);
+        return vec4(alpha);
     }
 
     // Stroked rounded rect (type 8), stroked ellipse (type 9):
@@ -123,7 +147,7 @@ vec4 sampleShape() {
         float dist = abs(filled) - strokeW * 0.5;
         float aa = fwidth(dist);
         float alpha = 1.0 - smoothstep(-aa, aa, dist);
-        return vec4(1.0, 1.0, 1.0, alpha);
+        return vec4(alpha);
     }
 
     // Capsule line (type 10) — quad is oriented along the line direction on CPU.
@@ -137,7 +161,7 @@ vec4 sampleShape() {
         float dist = length(q) - halfSize.y;
         float aa = fwidth(dist);
         float alpha = 1.0 - smoothstep(-aa, aa, dist);
-        return vec4(1.0, 1.0, 1.0, alpha);
+        return vec4(alpha);
     }
 
     // Analytical SDF shapes (rounded rect, ellipse)
@@ -155,11 +179,15 @@ vec4 sampleShape() {
 
     float aa = fwidth(dist);
     float alpha = 1.0 - smoothstep(-aa, aa, dist);
-    return vec4(1.0, 1.0, 1.0, alpha);
+    return vec4(alpha);
 }
 
 void main() {
     vec4 color = sampleColor();
     vec4 shape = sampleShape();
-    outColor = color * shape;
+    // Premultiply the (straight-alpha) color once, here, then modulate by the
+    // already-premultiplied shape. Both operands are premultiplied at this
+    // point, so their product is too — which is what BlendMode::Premultiplied
+    // expects. See the alpha-convention note above.
+    outColor = vec4(color.rgb * color.a, color.a) * shape;
 }
