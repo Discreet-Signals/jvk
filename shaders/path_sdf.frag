@@ -19,6 +19,14 @@
 //        + [crossings of y = T with x in (p.x, R]]     … "top" term
 //        + [crossings of x = p.x with y in (T, p.y]]   … "descent" term
 //
+// The two intervals meet at the corner (p.x, T), and a crossing landing on
+// it must be claimed EXACTLY once. Both terms therefore decide their shared
+// boundary from ONE quantity — `cornerSide`, the corner's signed area against
+// the segment — with the through-the-corner case (cornerSide == 0) settled by
+// the segment's own direction. Two independent divisions instead answered
+// "no" twice and punched a 1px hole from the crossing to the tile's bottom
+// edge, once per tile column any shallow edge spans (see the loop).
+//
 // The backdrop is the ray at the tile's top-RIGHT corner — every segment
 // it counts crosses y = T strictly right of R, i.e. outside the tile, and
 // is summed on the CPU. The top term's crossings happen at y = T with
@@ -101,8 +109,29 @@ void main()
 
             minDist = min(minDist, sdSegment(fragPos, a, b));
 
+            // The top and descent terms meet at the CORNER (p.x, tileTop).
+            // Decide both sides of that junction from ONE quantity — the
+            // corner's signed area against the segment — so a crossing that
+            // lands exactly on it is claimed exactly once. Asking each term
+            // its own division instead (xc > p.x  /  yc > tileTop) lets
+            // rounding answer "no" twice: the crossing is dropped, winding
+            // goes to 0, and the fill shows a 1px hole running from the
+            // crossing down to the tile's bottom edge. It is not a corner
+            // case — every shallow edge crosses a tile top once per tile
+            // column it spans.
+            //
+            //   cornerSide = (b-a) × (corner-a)
+            //              = (b.y-a.y)·(xc - p.x)  =  (b.x-a.x)·(tileTop - yc)
+            //
+            // so its sign answers BOTH questions consistently, and the zero
+            // (segment through the corner) is settled once, below. `precise`
+            // is load-bearing twice over: it keeps xc bit-identical to the
+            // CPU tiler AND keeps that zero exact (an FMA would round it off
+            // the corner and the tie-break would never fire).
+            precise float cornerSide = (b.x - a.x) * (tileTop    - a.y)
+                                     - (b.y - a.y) * (fragPos.x  - a.x);
+
             // Top term — crossing of y = tileTop at x in (p.x, tileRight].
-            // Same half-open-on-top convention as the ray definition.
             // `precise` (no FMA contraction) keeps xc BIT-IDENTICAL to the
             // CPU tiler's statement-split evaluation: tile boundaries are
             // exact integer floats (power-of-2 tileW), so matching xc makes
@@ -115,7 +144,8 @@ void main()
                 precise float t  = (tileTop - a.y) / (b.y - a.y);
                 precise float dx = t * (b.x - a.x);
                 precise float xc = a.x + dx;
-                if (xc > fragPos.x && xc <= tileRight)
+                // xc > p.x, strict (sign(b.y-a.y) = bAboveT ? + : -).
+                if ((bAboveT ? cornerSide : -cornerSide) > 0.0 && xc <= tileRight)
                     winding += bAboveT ? 1 : -1;
             }
 
@@ -129,7 +159,16 @@ void main()
             {
                 float t  = (fragPos.x - a.x) / (b.x - a.x);
                 float yc = a.y + t * (b.y - a.y);
-                if (yc > tileTop && yc <= fragPos.y)
+                // yc > tileTop, from the same quantity as the top term. When
+                // the segment passes exactly THROUGH the corner (cornerSide
+                // == 0 — routine, not exotic: integer-ish art on a 16px grid
+                // makes both products exact) neither half-open test claims
+                // it, so decide it the way the fragment's own ray would: the
+                // fragment is below the corner, so the crossing counts iff it
+                // moves RIGHT as y grows, i.e. the segment descends rightward.
+                float below = bRight ? -cornerSide : cornerSide;
+                bool  onCorner = cornerSide == 0.0 && ((b.x > a.x) == (b.y > a.y));
+                if ((below > 0.0 || onCorner) && yc <= fragPos.y)
                     winding += bRight ? 1 : -1;
             }
         }

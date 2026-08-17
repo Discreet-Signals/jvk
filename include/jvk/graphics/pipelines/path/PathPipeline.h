@@ -132,8 +132,14 @@ public:
             writeDescriptor(i);
         }
 
-        // --- Build the VkPipeline ----------------------------------------
-        pipeline_ = buildPipeline(sceneRenderPass, vertSpv, fragSpv);
+        // --- Build both VkPipelines --------------------------------------
+        // Same shaders and layout, two depth/stencil states — the clip
+        // variant tests EQUAL against the clip depth, exactly like
+        // Pipeline's built-in clipHandle() variant. Without it a path fill
+        // is scissor-clipped only, so it spills out of every non-rectangular
+        // clip (a rounded-rect reduceClipRegion leaves square corners).
+        pipeline_     = buildPipeline(sceneRenderPass, vertSpv, fragSpv, false);
+        clipPipeline_ = buildPipeline(sceneRenderPass, vertSpv, fragSpv, true);
     }
 
     bool ready() const { return device_ != nullptr && pipeline_ != VK_NULL_HANDLE; }
@@ -208,7 +214,11 @@ public:
     {
         if (!ready() || vertexCount == 0) return;
 
-        state.setCustomPipeline(pipeline_, layout_);
+        // Inside a stencil clip (clipToPath / rrect), bind the variant that
+        // tests it. Keyed off State's depth, not the command's: State is what
+        // pushes the matching stencil reference, so the two cannot disagree.
+        const bool clipped = state.stencilDepth() > 0 && clipPipeline_ != VK_NULL_HANDLE;
+        state.setCustomPipeline(clipped ? clipPipeline_ : pipeline_, layout_);
 
         // Scissor and viewport — use the command's clipBounds for scissor.
         auto clip = drawCmd.clipBounds;
@@ -360,7 +370,8 @@ private:
 
     VkPipeline buildPipeline(VkRenderPass renderPass,
                              std::span<const uint32_t> vertSpv,
-                             std::span<const uint32_t> fragSpv)
+                             std::span<const uint32_t> fragSpv,
+                             bool clipVariant)
     {
         VkDevice d = device_->device();
 
@@ -425,9 +436,21 @@ private:
         ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
+        // Clip variant: pass only where stencil == the clip depth (the
+        // reference is pushed per draw by State). Ops KEEP — a path fill
+        // reads the clip stencil, it never writes it.
         VkPipelineDepthStencilStateCreateInfo ds {};
         ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-        ds.stencilTestEnable = VK_FALSE;
+        ds.stencilTestEnable = clipVariant ? VK_TRUE : VK_FALSE;
+        VkStencilOpState stencilOp {};
+        stencilOp.failOp      = VK_STENCIL_OP_KEEP;
+        stencilOp.passOp      = VK_STENCIL_OP_KEEP;
+        stencilOp.depthFailOp = VK_STENCIL_OP_KEEP;
+        stencilOp.compareOp   = VK_COMPARE_OP_EQUAL;
+        stencilOp.compareMask = 0xFF;
+        stencilOp.writeMask   = 0xFF;
+        stencilOp.reference   = 0;   // dynamic — vkCmdSetStencilReference
+        ds.front = ds.back = stencilOp;
 
         VkPipelineColorBlendAttachmentState blend {};
         blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
@@ -445,10 +468,16 @@ private:
         cb.attachmentCount = 1;
         cb.pAttachments = &blend;
 
-        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+        // The clip variant's reference is dynamic (State pushes the clip depth
+        // per draw) — WITHOUT this the baked reference 0 stands and
+        // vkCmdSetStencilReference is silently ignored, so EQUAL(0) passes
+        // only where nothing was clipped: the fill lands exactly OUTSIDE its
+        // clip. The plain variant doesn't declare it (never set = undefined).
+        VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                 VK_DYNAMIC_STATE_STENCIL_REFERENCE };
         VkPipelineDynamicStateCreateInfo dynState {};
         dynState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynState.dynamicStateCount = 2;
+        dynState.dynamicStateCount = clipVariant ? 3 : 2;
         dynState.pDynamicStates = dyn;
 
         VkGraphicsPipelineCreateInfo pci {};
@@ -479,6 +508,7 @@ private:
         if (!device_) return;
         VkDevice d = device_->device();
         if (pipeline_       != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_, nullptr);
+        if (clipPipeline_   != VK_NULL_HANDLE) vkDestroyPipeline(d, clipPipeline_, nullptr);
         if (layout_         != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
         if (ssboSetLayout_  != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(d, ssboSetLayout_, nullptr);
         if (descPool_       != VK_NULL_HANDLE) vkDestroyDescriptorPool(d, descPool_, nullptr);
@@ -498,6 +528,7 @@ private:
     Device*               device_            = nullptr;
     VkPipelineLayout      layout_            = VK_NULL_HANDLE;
     VkPipeline            pipeline_          = VK_NULL_HANDLE;
+    VkPipeline            clipPipeline_      = VK_NULL_HANDLE;   // stencil-tested variant
     VkDescriptorSetLayout ssboSetLayout_     = VK_NULL_HANDLE;
     VkDescriptorPool      descPool_          = VK_NULL_HANDLE;
     VkDescriptorSet       ssboDescSets_[MAX_FRAMES]  {};
