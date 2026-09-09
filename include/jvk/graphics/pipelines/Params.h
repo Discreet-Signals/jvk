@@ -117,6 +117,9 @@ struct DrawImageParams {
     float                  scale;
     int                    imageWidth;
     int                    imageHeight;
+    // juce lowResamplingQuality: the shader snaps UVs to texel centres
+    // (see ui2d.frag sampleImage) instead of carrying a second sampler.
+    uint32_t               nearest = 0;
     // clipToImageAlpha fill (Graphics::fillThroughAlphaMask): the quad is
     // tinted with the brush (1 = solid: `tint` carries the colour) or the
     // brush GRADIENT (2: `fillIndex`+`gradientTransform` rebuild the ctx at
@@ -137,6 +140,7 @@ struct FillTiledImageParams {
     glm::vec2       pos[4];   // physical-px corners: p00 p10 p11 p01
     glm::vec2       uv[4];    // matching UVs (pre-fract)
     glm::vec4       tint;     // white x fill-colour alpha x layer opacity
+    uint32_t        nearest;  // point-sample flag (see DrawImageParams)
 };
 
 // excludeClipRectangle: the rect (physical px) whose pixels get stencil-

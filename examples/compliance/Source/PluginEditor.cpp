@@ -379,6 +379,17 @@ void ComplianceEditor::sceneImages(juce::Graphics& g, juce::Rectangle<float> are
     g.setTiledImageFill(test, 0, 0, 1.0f);
     g.fillRoundedRectangle(area.getWidth() * 0.45f, area.getHeight() * 0.55f,
                            area.getWidth() * 0.5f, area.getHeight() * 0.4f, 16.0f);
+
+    // Resampling quality — the same 16x16 source region (a checker junction)
+    // magnified 4x, point-sampled then bilinear. LOW must be four hard-edged
+    // blocks, MEDIUM a smooth blend. jvk carries one linear sampler per
+    // texture, so low is rendered by snapping UVs to the texel centre; if
+    // that flag stops reaching the shader both boxes look identical.
+    const int qy = (int) area.getHeight() - 72;
+    g.setImageResamplingQuality(juce::Graphics::lowResamplingQuality);
+    g.drawImage(test, 16, qy, 64, 64, 8, 8, 16, 16);
+    g.setImageResamplingQuality(juce::Graphics::mediumResamplingQuality);
+    g.drawImage(test, 88, qy, 64, 64, 8, 8, 16, 16);
 }
 
 // The setOpacity / fill-alpha contract (juce_RenderingHelpers.h):

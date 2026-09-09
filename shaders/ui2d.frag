@@ -66,6 +66,24 @@ vec4 sampleColor() {
 // by up to a(1-a)*C, worst at a = 0.5. On a filmstrip knob that reads as a
 // dark rim traced around the antialiased silhouette.
 
+// ---- Image sampling ------------------------------------------------------
+// juce's setInterpolationQuality(lowResamplingQuality) means POINT sampling.
+// Every cached texture bakes ONE VkSampler into its descriptor set, so a
+// nearest sampler would mean a second sampler and a second descriptor per
+// image; instead the UV is snapped to the texel CENTRE. A linear sampler
+// evaluated exactly at a texel centre returns that texel, and the textures
+// have a single mip level, so no LOD path can reintroduce a blend — this IS
+// nearest sampling, just carried per draw instead of per descriptor.
+// Medium and high quality both stay bilinear (there is no mip chain for
+// high to refine).
+vec4 sampleImage(vec2 uv) {
+    if (fragShapeInfo.y > 0.5) {
+        vec2 sz = vec2(textureSize(shapeTex, 0));
+        uv = (floor(uv * sz) + 0.5) / sz;
+    }
+    return texture(shapeTex, uv);
+}
+
 // ---- Shape source --------------------------------------------------------
 // Returns a PREMULTIPLIED RGBA mask multiplied against the sampled color.
 // RGB is the coverage value replicated for SDF/text/mask types; images
@@ -81,6 +99,7 @@ vec4 sampleColor() {
 //   6 = TILED image — UVs are unbounded, fract() wraps them (the sampler is
 //       CLAMP so a repeat mode isn't available; the 1px seam blend this
 //       costs vs true REPEAT is invisible on UI patterns)
+// Image types (3/5/6) carry the point-sampling flag in shapeInfo.y.
 vec4 sampleShape() {
     int type = int(fragShapeInfo.x + 0.5);
 
@@ -89,13 +108,13 @@ vec4 sampleShape() {
 
     // Images are already premultiplied — pass straight through.
     if (type == 3)
-        return texture(shapeTex, fragUV);
+        return sampleImage(fragUV);
 
     if (type == 5)
-        return vec4(texture(shapeTex, fragUV).a);
+        return vec4(sampleImage(fragUV).a);
 
     if (type == 6)
-        return texture(shapeTex, fract(fragUV));
+        return sampleImage(fract(fragUV));
 
     if (type == 4) {
         vec3 msd = texture(shapeTex, fragUV).rgb;

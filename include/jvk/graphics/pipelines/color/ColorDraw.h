@@ -395,6 +395,8 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             // Images are self-colored; color LUT is ignored (solid white tint).
             state.setResources(def, shapeDesc);
             auto  tx = toPhysical(p.transform, p.scale);
+            // shapeInfo.y on image shape types = the point-sampling flag.
+            const float nearest = static_cast<float>(p.nearest);
             float w = static_cast<float>(p.imageWidth);
             float h = static_cast<float>(p.imageHeight);
             auto p00 = juce::Point<float>(0, 0).transformedBy(tx);
@@ -413,14 +415,14 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
                                      toPhysical(p.gradientTransform, p.scale));
                 state.setResources(colorDescFor(mg, r), shapeDesc);
                 emitTransformedQuad(state, cmd, p00, p10, p11, p01,
-                                    p.tint, glm::vec4(5.0f, 0, 0, 0), &mg);
+                                    p.tint, glm::vec4(5.0f, nearest, 0, 0), &mg);
                 break;
             }
             const bool maskFill = p.alphaMaskFill != 0;
             emitTransformedQuad(state, cmd, p00, p10, p11, p01,
                                 maskFill ? p.tint
                                          : glm::vec4(1, 1, 1, p.opacity),
-                                glm::vec4(maskFill ? 5.0f : 3.0f, 0, 0, 0));
+                                glm::vec4(maskFill ? 5.0f : 3.0f, nearest, 0, 0));
             break;
         }
 
@@ -434,7 +436,8 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
                 return UIVertex {
                     { p.pos[i].x, p.pos[i].y }, p.tint,
                     { p.uv[i].x, p.uv[i].y },
-                    glm::vec4(6.0f, 0, 0, 0), glm::vec4(0.0f)
+                    glm::vec4(6.0f, static_cast<float>(p.nearest), 0, 0),
+                    glm::vec4(0.0f)
                 };
             };
             UIVertex verts[6] = { mkv(0), mkv(1), mkv(2), mkv(0), mkv(2), mkv(3) };

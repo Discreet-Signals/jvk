@@ -360,7 +360,16 @@ public:
     // any glass-panel paint). state().opacity is the transparency-LAYER
     // multiplier only; plain setOpacity must never touch it.
     void setOpacity(float opacity) override { state().fill.setOpacity(opacity); }
-    void setInterpolationQuality(juce::Graphics::ResamplingQuality) override {}
+    // juce's LOW quality is point sampling; medium and high are both smooth.
+    // Every cached texture bakes one LINEAR VkSampler into its descriptor
+    // set, so nearest is carried per DRAW instead: the flag rides the image
+    // quad and ui2d.frag snaps the UV to the texel centre, which a linear
+    // sampler resolves to that exact texel (single mip level, no LOD blend).
+    // High renders as bilinear — there is no mip chain for it to refine.
+    void setInterpolationQuality(juce::Graphics::ResamplingQuality q) override
+    {
+        state().nearest = (q == juce::Graphics::lowResamplingQuality);
+    }
 
     void fillRect(const juce::Rectangle<int>& r, bool) override { fillRect(r.toFloat()); }
 
@@ -698,7 +707,8 @@ public:
         if (clipRect.isEmpty()) return;
 
         DrawImageParams p { desc, s.alphaMaskTransform, 1.0f, displayScale_,
-                            s.alphaMask.getWidth(), s.alphaMask.getHeight() };
+                            s.alphaMask.getWidth(), s.alphaMask.getHeight(),
+                            s.nearest };
         if (s.fill.isGradient() && s.fill.gradient != nullptr)
         {
             // Gradient through the mask: replay rebuilds the gradient ctx
@@ -762,6 +772,7 @@ public:
         // alpha (FillType::setOpacity writes it), layer opacity on top.
         p.tint = { 1.0f, 1.0f, 1.0f,
                    s.fill.colour.getFloatAlpha() * s.opacity };
+        p.nearest = s.nearest;
         renderer_.push(DrawOp::FillTiledImage, clipRect, s.stencilDepth, p);
     }
 
@@ -798,7 +809,7 @@ public:
         const float alpha = s.opacity * s.fill.colour.getFloatAlpha();
         renderer_.push(DrawOp::DrawImage, s.clipBounds, s.stencilDepth,
             DrawImageParams { desc, t.followedBy(s.transform), alpha, displayScale_,
-                              img.getWidth(), img.getHeight() });
+                              img.getWidth(), img.getHeight(), s.nearest });
     }
 
     void drawLine(const juce::Line<float>& line) override
@@ -1231,6 +1242,8 @@ private:
         // saveState; restore pops it like any other clip). Invalid = none.
         juce::Image           alphaMask;
         juce::AffineTransform alphaMaskTransform;
+        // setInterpolationQuality(low) — point-sample every image draw.
+        bool                  nearest = false;
         // Count of excludeClipRectangle parks taken in scopes at or below
         // this state; restoreState un-parks the difference (rects live in
         // exclusionShared_, stack-shaped like the path-clip params).

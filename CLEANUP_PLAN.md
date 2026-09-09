@@ -522,7 +522,9 @@ Per Gavin: full compliance is a goal, not a triage list. Split by dependency:
   correct math already exists at `:308-311`).
 - `drawImage` honors fill alpha (`:361-377`; shape path `ColorDraw.h:90-91` shows the rule).
 - `fillRect(replaceExistingContents=true)` → no-blend pipeline variant (one PipelineConfig).
-- `setInterpolationQuality` → nearest/linear sampler variant per image descriptor.
+- `setInterpolationQuality` — DONE, but NOT as a second sampler per image descriptor:
+  the point-sample flag rides the image quad and `ui2d.frag` snaps the UV to the texel
+  centre, which one linear sampler resolves to that exact texel.
 - `getFrameId()` monotonic — falls out of hoisting Graphics to a member (4.1).
 - Rotated/sheared text: emit transformed glyph quads (`ColorDraw.h:416-443` already
   transforms positions; transform the corners too).
