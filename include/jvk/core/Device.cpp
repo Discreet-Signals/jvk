@@ -1,12 +1,13 @@
 namespace jvk {
 
 // =============================================================================
-// ICD discovery (MoltenVK on macOS)
+// ICD discovery (MoltenVK on macOS) — Debug only: Release binds to the bundled
+// MoltenVK directly and ships no loader or manifest (see CMakeLists.txt).
 // =============================================================================
 
 static inline void ensureICDDiscoverable()
 {
-#if JUCE_MAC
+#if JUCE_MAC && JUCE_DEBUG
     if (getenv("VK_ICD_FILENAMES") != nullptr) return;
     Dl_info info;
     if (dladdr((void*)ensureICDDiscoverable, &info) && info.dli_fname) {
@@ -241,6 +242,17 @@ Device::~Device()
 // Instance creation
 // =============================================================================
 
+static bool hasInstanceExtension(const char* name)
+{
+    uint32_t count = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> exts(count);
+    vkEnumerateInstanceExtensionProperties(nullptr, &count, exts.data());
+    for (auto& e : exts)
+        if (strcmp(e.extensionName, name) == 0) return true;
+    return false;
+}
+
 bool Device::createInstance()
 {
     ensureICDDiscoverable();
@@ -254,10 +266,16 @@ bool Device::createInstance()
     appInfo.apiVersion = VK_API_VERSION_1_0;
 
     std::vector<const char*> extensions = { VK_KHR_SURFACE_EXTENSION_NAME };
+    VkInstanceCreateFlags flags = 0;
 #if JUCE_MAC
     extensions.push_back("VK_MVK_macos_surface");
-    extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
     extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    // Portability enumeration is the LOADER's extension; bound directly to
+    // MoltenVK (Release) it is absent and MoltenVK enumerates itself regardless.
+    if (hasInstanceExtension(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+        extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
 #elif JUCE_WINDOWS
     extensions.push_back("VK_KHR_win32_surface");
 #elif JUCE_LINUX
@@ -271,9 +289,7 @@ bool Device::createInstance()
     VkInstanceCreateInfo ci {};
     ci.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ci.pApplicationInfo = &appInfo;
-#if JUCE_MAC
-    ci.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
-#endif
+    ci.flags = flags;
     ci.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     ci.ppEnabledExtensionNames = extensions.data();
 

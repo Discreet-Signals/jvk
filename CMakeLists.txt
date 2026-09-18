@@ -108,7 +108,9 @@ if (WIN32 AND DEFINED ENV{VULKAN_SDK}
 endif()
 
 find_package(Vulkan REQUIRED)
-target_link_libraries(jvk INTERFACE Vulkan::Vulkan)
+if (NOT APPLE)
+    target_link_libraries(jvk INTERFACE Vulkan::Vulkan)
+endif()
 
 # ==============================================================================
 # Shader compilation — auto-regenerate UI2DShaders.h whenever any .vert/.frag
@@ -171,19 +173,30 @@ if (APPLE)
     target_link_libraries(jvk INTERFACE "-framework QuartzCore")
     target_link_options(jvk INTERFACE "LINKER:-rpath,@loader_path/../Frameworks")
 
-    if (DEFINED ENV{VULKAN_SDK})
-        set(_DS_VK_MVK_LIB "$ENV{VULKAN_SDK}/lib/libMoltenVK.dylib")
-        set(_DS_VK_LOADER  "$ENV{VULKAN_SDK}/lib/libvulkan.1.dylib")
-    endif()
+    # The SHIPPED driver is pinned here, never read from whichever SDK is installed:
+    # MoltenVK 1.4.0 is the last build that runs on macOS 10.15 (1.4.1 raised the
+    # floor to 11.0 and deleted the runtime guards, so it cannot be rebuilt lower).
+    # Release binds straight to it — MoltenVK's documented no-loader mode: one dylib,
+    # no ICD manifest, no system ICD/layer can intervene. Debug binds to the SDK
+    # loader so the validation layers can dispatch; jvk_bundle adds the loader and
+    # manifest for that config only.
+    FetchContent_Declare(
+        moltenvk
+        URL      https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.0/MoltenVK-macos.tar
+        URL_HASH SHA256=f4feaf6a4988352de8e6d49874ccc1cd6a45021e3cb476e8531bef7ecc73e93a
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_MakeAvailable(moltenvk)
+    set(DS_VULKAN_MVK_LIB "${moltenvk_SOURCE_DIR}/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib"
+        CACHE INTERNAL "Shipped MoltenVK dylib")
+    get_filename_component(_DS_VK_LIB_DIR "${Vulkan_LIBRARY}" DIRECTORY)
+    set(DS_VULKAN_LOADER "${_DS_VK_LIB_DIR}/libvulkan.1.dylib" CACHE INTERNAL "SDK loader (Debug only)")
 
-    if (_DS_VK_MVK_LIB AND EXISTS "${_DS_VK_MVK_LIB}")
-        target_link_libraries(jvk INTERFACE "${_DS_VK_MVK_LIB}")
+    target_link_libraries(jvk INTERFACE Vulkan::Headers
+        "$<IF:$<CONFIG:Debug>,Vulkan::Vulkan,${DS_VULKAN_MVK_LIB}>")
 
-        set(DS_VULKAN_MVK_LIB "${_DS_VK_MVK_LIB}" CACHE INTERNAL "Path to libMoltenVK.dylib")
-        set(DS_VULKAN_LOADER  "${_DS_VK_LOADER}"  CACHE INTERNAL "Path to libvulkan.1.dylib")
-
-        set(_DS_VK_ICD_JSON "${CMAKE_CURRENT_BINARY_DIR}/MoltenVK_icd.json")
-        file(WRITE "${_DS_VK_ICD_JSON}" [=[{
+    set(DS_VULKAN_ICD_JSON "${CMAKE_CURRENT_BINARY_DIR}/MoltenVK_icd.json" CACHE INTERNAL "ICD manifest (Debug only)")
+    file(WRITE "${DS_VULKAN_ICD_JSON}" [=[{
     "file_format_version": "1.0.0",
     "ICD": {
         "library_path": "../../../Frameworks/libMoltenVK.dylib",
@@ -191,8 +204,6 @@ if (APPLE)
         "is_portability_driver": true
     }
 }]=])
-        set(DS_VULKAN_ICD_JSON "${_DS_VK_ICD_JSON}" CACHE INTERNAL "Path to bundled ICD manifest")
-    endif()
 
 elseif (WIN32)
     target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_WIN32_KHR)
@@ -207,7 +218,7 @@ endif()
 # ==============================================================================
 # jvk_bundle — per plugin-format target runtime setup. Call from the consuming
 # project after juce_add_plugin (or any target that produces a bundle/exe).
-#   macOS:   copy libMoltenVK + loader + ICD manifest into the bundle.
+#   macOS:   copy libMoltenVK into the bundle; Debug adds the loader + ICD manifest.
 #   Windows: explicit PRIVATE link to Vulkan::Vulkan. JUCE's per-format
 #            _SharedCode static libs don't reliably propagate the INTERFACE
 #            Vulkan dep through to the final .exe / .vst3 under MSVC.
@@ -215,27 +226,21 @@ endif()
 # ==============================================================================
 function(jvk_bundle TARGET)
     if (APPLE AND DS_VULKAN_MVK_LIB)
+        set(_fw  "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks")
+        set(_icd "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Resources/vulkan/icd.d")
+        # Outside Debug, `-E true` swallows the loader/manifest steps; the rm first
+        # keeps an incremental Release bundle from carrying a stale loader.
+        set(_dbg_mkdir "$<IF:$<CONFIG:Debug>,make_directory,true>")
+        set(_dbg_copy  "$<IF:$<CONFIG:Debug>,copy_if_different,true>")
         add_custom_command(TARGET ${TARGET} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory
-                "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${DS_VULKAN_MVK_LIB}"
-                "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks/libMoltenVK.dylib"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_fw}"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DS_VULKAN_MVK_LIB}" "${_fw}/libMoltenVK.dylib"
+            COMMAND ${CMAKE_COMMAND} -E rm -rf "${_fw}/libvulkan.1.dylib"
+                "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Resources/vulkan"
+            COMMAND ${CMAKE_COMMAND} -E ${_dbg_copy} "${DS_VULKAN_LOADER}" "${_fw}/libvulkan.1.dylib"
+            COMMAND ${CMAKE_COMMAND} -E ${_dbg_mkdir} "${_icd}"
+            COMMAND ${CMAKE_COMMAND} -E ${_dbg_copy} "${DS_VULKAN_ICD_JSON}" "${_icd}/MoltenVK_icd.json"
             COMMENT "jvk: Bundling MoltenVK into ${TARGET}"
-        )
-        if (EXISTS "${DS_VULKAN_LOADER}")
-            add_custom_command(TARGET ${TARGET} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                    "${DS_VULKAN_LOADER}"
-                    "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks/libvulkan.1.dylib"
-            )
-        endif()
-        add_custom_command(TARGET ${TARGET} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E make_directory
-                "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Resources/vulkan/icd.d"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${DS_VULKAN_ICD_JSON}"
-                "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Resources/vulkan/icd.d/MoltenVK_icd.json"
         )
     elseif (WIN32 AND TARGET Vulkan::Vulkan)
         target_link_libraries(${TARGET} PRIVATE Vulkan::Vulkan)
