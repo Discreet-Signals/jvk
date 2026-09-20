@@ -208,6 +208,42 @@ if (APPLE)
 elseif (WIN32)
     target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_WIN32_KHR)
 
+    # The Vulkan LOADER (vulkan-1.dll) is not part of Windows: GPU drivers put
+    # it in System32. A machine with no Vulkan-capable driver (Microsoft Basic
+    # Display Adapter, many VMs, remote-desktop hosts) has no copy, and a
+    # plugin that imports it the ordinary way fails to load at all — the DAW
+    # reports a broken plugin before any of our code runs. So the plugin ships
+    # LunarG's redistributable runtime (the same loader the SDK installer puts
+    # in System32; Apache-2.0 / MIT, licence copied beside it) and the import
+    # is delay-loaded: jvk::Device resolves the system copy first and this one
+    # second, and if neither exists no vk* call is ever made and the editor
+    # falls back to the JUCE renderer. With a loader but no driver ICD,
+    # vkCreateInstance reports VK_ERROR_INCOMPATIBLE_DRIVER and the same
+    # fallback applies — a driver cannot be shipped, only the loader can.
+    # Pinned like MoltenVK below; the hash is the one LunarG publishes for the
+    # file (vulkan.lunarg.com/sdk/files.json).
+    if (CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+        set(_DS_VK_RT_ARCH "x64")
+    elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "^(X86|x86|i[3-6]86)$")
+        set(_DS_VK_RT_ARCH "x86")
+    endif()
+    if (_DS_VK_RT_ARCH)
+        FetchContent_Declare(
+            vulkanrt
+            URL      https://sdk.lunarg.com/sdk/download/1.4.357.0/windows/VulkanRT-X64-1.4.357.0-Components.zip
+            URL_HASH SHA256=a14672efed15aafc7f5a16572d35cd3a3416eadf670aeee3cdf50ee32d5fbf83
+            DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        )
+        FetchContent_MakeAvailable(vulkanrt)
+        set(DS_VULKAN_WIN_LOADER  "${vulkanrt_SOURCE_DIR}/${_DS_VK_RT_ARCH}/vulkan-1.dll"
+            CACHE INTERNAL "Shipped Vulkan loader")
+        set(DS_VULKAN_WIN_LICENSE "${vulkanrt_SOURCE_DIR}/VulkanRT-License.txt"
+            CACHE INTERNAL "Licence of the shipped Vulkan loader")
+    else()
+        message(STATUS "jvk: no redistributable Vulkan loader for ${CMAKE_SYSTEM_PROCESSOR}; the system runtime alone will be used")
+        set(DS_VULKAN_WIN_LOADER "" CACHE INTERNAL "Shipped Vulkan loader")
+    endif()
+
 elseif (UNIX)
     find_package(X11 QUIET)
     if (X11_FOUND)
@@ -219,9 +255,12 @@ endif()
 # jvk_bundle — per plugin-format target runtime setup. Call from the consuming
 # project after juce_add_plugin (or any target that produces a bundle/exe).
 #   macOS:   copy libMoltenVK into the bundle; Debug adds the loader + ICD manifest.
-#   Windows: explicit PRIVATE link to Vulkan::Vulkan. JUCE's per-format
+#   Windows: explicit PRIVATE link to Vulkan::Vulkan (JUCE's per-format
 #            _SharedCode static libs don't reliably propagate the INTERFACE
-#            Vulkan dep through to the final .exe / .vst3 under MSVC.
+#            Vulkan dep through to the final .exe / .vst3 under MSVC), the
+#            import DELAY-LOADED so the binary loads on a machine with no
+#            vulkan-1.dll, and LunarG's loader copied beside the binary (see
+#            the Windows block above and ensureVulkanLoader in Device.cpp).
 #   Linux:   no-op (system loader handles Vulkan at runtime).
 # ==============================================================================
 function(jvk_bundle TARGET)
@@ -244,6 +283,19 @@ function(jvk_bundle TARGET)
         )
     elseif (WIN32 AND TARGET Vulkan::Vulkan)
         target_link_libraries(${TARGET} PRIVATE Vulkan::Vulkan)
+        if (MSVC)
+            # Resolved on the first vk* call, which jvk::Device makes only
+            # after it has loaded a loader itself.
+            target_link_libraries(${TARGET} PRIVATE delayimp)
+            target_link_options(${TARGET} PRIVATE "/DELAYLOAD:vulkan-1.dll")
+        endif()
+        if (DS_VULKAN_WIN_LOADER)
+            add_custom_command(TARGET ${TARGET} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DS_VULKAN_WIN_LOADER}"  "$<TARGET_FILE_DIR:${TARGET}>/vulkan-1.dll"
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DS_VULKAN_WIN_LICENSE}" "$<TARGET_FILE_DIR:${TARGET}>/vulkan-1-LICENSE.txt"
+                COMMENT "jvk: Bundling the Vulkan loader beside ${TARGET}"
+            )
+        endif()
     endif()
 endfunction()
 

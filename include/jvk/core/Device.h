@@ -79,7 +79,10 @@ public:
     void markLost() noexcept
     {
         if (!lost_.exchange(true, std::memory_order_acq_rel))
+        {
             DBG("jvk: VK_ERROR_DEVICE_LOST (or fence timeout) — rendering disabled for this Device");
+            try { diag::log("VK_ERROR_DEVICE_LOST or fence timeout: rendering disabled for this Device"); } catch (...) {}
+        }
     }
 
     // Process-wide monotonic clock in seconds, anchored when this Device was

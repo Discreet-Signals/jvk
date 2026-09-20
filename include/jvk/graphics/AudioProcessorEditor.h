@@ -172,6 +172,7 @@ private:
         // to start disabled can call setVulkanEnabled(false) immediately.
         acquireVulkan();
         vulkanAvailable_ = (device_ && device_->device() != VK_NULL_HANDLE);
+        diag::log(vulkanAvailable_ ? "editor: Vulkan available" : "editor: Vulkan unavailable, JUCE renderer");
     }
 
     void acquireVulkan()
@@ -437,6 +438,12 @@ private:
         // handles prepare pipelines, flush uploads, render pass, replay,
         // submit, present.
         renderer_->submit();
+
+        // Bring-up milestones for the GPU log: the first frame exercises the
+        // whole path (uploads, every pipeline, present); the 120th says it
+        // held. A machine that dies between the two lines died rendering.
+        if (++framesSubmitted_ == 1)        diag::log("first frame submitted");
+        else if (framesSubmitted_ == 120)   diag::log("120 frames submitted: GPU path stable");
     }
 
     void initVulkan(uint32_t w, uint32_t h)
@@ -458,7 +465,10 @@ private:
         ci.sType = VK_STRUCTURE_TYPE_MACOS_SURFACE_CREATE_INFO_MVK;
         ci.pView = nsView;
         if (vkCreateMacOSSurfaceMVK(device_->instance(), &ci, nullptr, &surface) != VK_SUCCESS)
+        {
+            diag::log("vkCreateMacOSSurfaceMVK failed");
             return;
+        }
 #elif JUCE_WINDOWS
         // The child HWND must be created in the SAME DPI-awareness context
         // as the host window tree it is about to join: Windows does not
@@ -496,6 +506,8 @@ private:
         target_ = std::make_unique<SwapchainTarget>(*device_, surface, w, h, nativeWindow);
         renderer_ = std::make_unique<Renderer>(*device_, *target_);
         registerPipelines();
+        diag::log("swapchain " + juce::String((int) target_->width()) + "x" + juce::String((int) target_->height())
+                  + " and pipelines built");
     }
 
     static std::span<const uint32_t> spv(const char* data, int byteSize)
@@ -638,6 +650,7 @@ private:
     // the objects the paint stack is executing through.
     bool                inRenderTick_ = false;
     std::optional<bool> pendingVulkanToggle_;
+    uint64_t            framesSubmitted_ = 0;
 
 #if JUCE_MAC
     std::unique_ptr<jvk::core::macos::NSViewGenerator> nsViewGen_;

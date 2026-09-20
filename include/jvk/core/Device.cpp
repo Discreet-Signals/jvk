@@ -1,6 +1,157 @@
 namespace jvk {
 
 // =============================================================================
+// Platform probe — read once, before the first Vulkan call.
+// =============================================================================
+
+namespace {
+
+struct PlatformProbe
+{
+    // macOS: running on 10.15, or a Mac-GPU-family-1 device is present (see
+    // MetalCapabilities.h). Everything below that keys on "legacy" exists for
+    // the 2012-2014 Intel Macs whose Metal drivers were frozen years before
+    // the MoltenVK we ship was written.
+    bool legacyMetal = false;
+    juce::String summary;
+};
+
+const PlatformProbe& platformProbe()
+{
+    static const PlatformProbe probe = []
+    {
+        PlatformProbe p;
+#if JUCE_MAC
+        const auto m = core::macos::probeMetal();
+        p.legacyMetal = m.legacy();
+        p.summary = "macOS " + juce::String(m.osMajor) + "." + juce::String(m.osMinor) + "." + juce::String(m.osPatch)
+                  + (p.legacyMetal ? " (legacy Metal machine)" : "")
+                  + " | GPUs: " + (m.devices.isEmpty() ? juce::String("none") : m.devices.joinIntoString("; "));
+#else
+        p.summary = juce::SystemStats::getOperatingSystemName() + " | " + juce::SystemStats::getCpuModel();
+#endif
+        return p;
+    }();
+    return probe;
+}
+
+#if JUCE_MAC
+// MoltenVK configuration for legacy Metal machines.
+//
+// MoltenVK reads its configuration from MVK_CONFIG_* environment variables the
+// first time any Vulkan entry point is called, so this runs before
+// vkEnumerateInstanceExtensionProperties in createInstance(). It only acts on
+// legacy machines (10.15, or any Mac-GPU-family-1 GPU on any OS); everything
+// else keeps MoltenVK's defaults.
+//
+// Why: the MoltenVK we ship (1.4.0, the last release that loads on 10.15)
+// changed two defaults after 10.15-era GPUs stopped being tested, and its own
+// maintainers have since found both paths broken on exactly that hardware:
+//
+//  * MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS defaulted to 1 in 1.2.10 (2024-07),
+//    and MVKDevice.mm switches descriptor-set argument buffers on for "older
+//    versions of macOS using an Intel GPU" specifically — with Tier-1 argument
+//    encoders. MoltenVK PR #2758 (1.4.2, 2026-06) found that path unstable on
+//    Intel Iris / Iris Pro and NVIDIA GT 750M — Metal compiler internal errors,
+//    "IOAF code 9 / Invalid Resource" GPU faults — and moved combined image
+//    samplers, sampled images, storage buffers and storage images back to the
+//    discrete-resource path on Mac-family-1 GPUs. Every texture jvk binds is a
+//    combined image sampler. 1.4.2 itself requires macOS 12, so on 10.15 the
+//    equivalent is to keep every descriptor on the discrete path: the way
+//    MoltenVK 1.2.9 — the release upstream used as its known-good reference in
+//    that PR — bound resources by default.
+//  * MVK_CONFIG_USE_MTLHEAP defaulted to 1 in 1.3.0. MoltenVK gives placement
+//    heaps only to Mac2 GPUs, so on family-1 hardware this is already off; it
+//    is pinned so a 10.15 machine with a newer GPU allocates the same way
+//    1.2.9 did.
+//  * MVK_CONFIG_SWITCH_SYSTEM_GPU: on a dual-GPU 2012-2014 MacBook Pro the
+//    discrete chip is NVIDIA Kepler. A plugin UI has no business forcing the
+//    graphics mux onto it; selectPhysicalDevice prefers the integrated GPU on
+//    these machines and this keeps MoltenVK from switching the display to
+//    the discrete one should that be the only choice.
+//
+// A value already present in the environment is respected, so a MoltenVK
+// variable set by hand for diagnosis still wins.
+void configureMoltenVK(const PlatformProbe& p)
+{
+    if (! p.legacyMetal)
+        return;
+
+    auto pin = [](const char* key, const char* value)
+    {
+        if (const char* existing = std::getenv(key))
+            diag::log(juce::String(key) + " already set to " + existing + " in the environment; left alone");
+        else
+        {
+            setenv(key, value, 0);
+            diag::log(juce::String(key) + "=" + value);
+        }
+    };
+    diag::log("legacy Metal machine: pinning MoltenVK to its 1.2.9-era resource binding");
+    pin("MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS", "0");
+    pin("MVK_CONFIG_USE_MTLHEAP", "0");
+    pin("MVK_CONFIG_SWITCH_SYSTEM_GPU", "0");
+}
+#endif
+
+#if JUCE_WINDOWS
+// The Vulkan loader on Windows.
+//
+// vulkan-1.dll is not part of Windows; GPU drivers install it into System32.
+// Every vk* import in this module is delay-loaded (/DELAYLOAD:vulkan-1.dll,
+// see CMakeLists.txt), so the plugin itself always loads, and nothing touches
+// the loader until this has found one:
+//   1. the system runtime in System32 — installed and updated by the driver,
+//      the copy every other Vulkan application on the machine uses;
+//   2. the copy jvk_bundle ships beside this module (LunarG's redistributable
+//      runtime), for machines whose driver never installed one.
+// Once a module named vulkan-1.dll is in the process, the delay-load helper's
+// own LoadLibrary("vulkan-1.dll") resolves to it (Windows returns an already
+// loaded module of that name without searching). If neither exists there is
+// no Vulkan on this machine at all; Device stays half-dead, no vk* call is
+// ever made, and the editor uses the JUCE renderer.
+HMODULE ensureVulkanLoader()
+{
+    static const HMODULE loader = []() -> HMODULE
+    {
+        if (HMODULE h = LoadLibraryExW(L"vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
+        {
+            diag::log("Vulkan loader: system (System32\\vulkan-1.dll)");
+            return h;
+        }
+
+        HMODULE self = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&ensureVulkanLoader), &self))
+        {
+            wchar_t path[MAX_PATH] = {};
+            const DWORD n = GetModuleFileNameW(self, path, MAX_PATH);
+            if (n > 0 && n < MAX_PATH)
+            {
+                const juce::File beside = juce::File(juce::String(path)).getSiblingFile("vulkan-1.dll");
+                if (beside.existsAsFile())
+                {
+                    if (HMODULE h = LoadLibraryExW(beside.getFullPathName().toWideCharPointer(), nullptr,
+                                                   LOAD_WITH_ALTERED_SEARCH_PATH))
+                    {
+                        diag::log("Vulkan loader: bundled (" + beside.getFullPathName() + ")");
+                        return h;
+                    }
+                    diag::log("Vulkan loader: bundled copy present but failed to load (error "
+                              + juce::String((int) GetLastError()) + ")");
+                }
+            }
+        }
+        diag::log("Vulkan loader: none (no System32\\vulkan-1.dll, no bundled copy): JUCE renderer");
+        return nullptr;
+    }();
+    return loader;
+}
+#endif
+
+} // namespace
+
+// =============================================================================
 // ICD discovery (MoltenVK on macOS) — Debug only: Release binds to the bundled
 // MoltenVK directly and ships no loader or manifest (see CMakeLists.txt).
 // =============================================================================
@@ -65,11 +216,23 @@ std::shared_ptr<Device> Device::acquire()
 
 Device::Device()
 {
-    if (!createInstance()) return;
+    const auto& platform = platformProbe();
+    diag::log("---- jvk bring-up: " + platform.summary);
+
+#if JUCE_WINDOWS
+    if (ensureVulkanLoader() == nullptr) return;   // no vk* call may follow
+#endif
+#if JUCE_MAC
+    configureMoltenVK(platform);                   // before the first vk* call
+#endif
+
+    if (!createInstance()) { diag::log("vkCreateInstance failed: JUCE renderer"); return; }
+    diag::log("instance created");
     setupDebugMessenger();
-    if (!selectPhysicalDevice()) return;
-    if (!createLogicalDevice()) return;
-    if (!createCommandPool()) return;
+    if (!selectPhysicalDevice()) { diag::log("no GPU with a graphics queue and swapchain support: JUCE renderer"); return; }
+    if (!createLogicalDevice()) { diag::log("vkCreateDevice failed: JUCE renderer"); return; }
+    diag::log("logical device created");
+    if (!createCommandPool()) { diag::log("vkCreateCommandPool failed: JUCE renderer"); return; }
 
     // VMA allocator — created before the memory tiers that view it. API
     // version matches the instance (created for Vulkan 1.0 above), so VMA
@@ -90,6 +253,7 @@ Device::Device()
     bindings_ = Memory::M(device_);
 
     loadPipelineCache();
+    diag::log("device ready");
 }
 
 // =============================================================================
@@ -343,9 +507,14 @@ static int scorePhysicalDevice(VkPhysicalDevice d)
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(d, &props);
     int score = 0;
+    // A plugin UI is light work. On a legacy dual-GPU Mac (2012-2014 MacBook
+    // Pro: Intel + NVIDIA Kepler) the integrated GPU is the one whose driver
+    // survives it — the discrete chip and its 2019 driver are what the
+    // system's graphics mux would otherwise be forced onto for our sake.
+    const bool preferIntegrated = platformProbe().legacyMetal;
     switch (props.deviceType) {
-        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   score += 1000; break;
-        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: score += 100;  break;
+        case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   score += preferIntegrated ? 100  : 1000; break;
+        case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: score += preferIntegrated ? 1000 : 100;  break;
         case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    score += 10;   break;
         default: break;
     }
@@ -398,6 +567,21 @@ bool Device::selectPhysicalDevice()
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(physDevice_, &props);
     DBG("jvk::Device: " << props.deviceName);
+
+    const char* type = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   ? "discrete"
+                     : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
+                     : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU    ? "virtual" : "other";
+    auto vkVer = [](uint32_t v) { return juce::String(v >> 22) + "." + juce::String((v >> 12) & 0x3ff) + "." + juce::String(v & 0xfff); };
+#if JUCE_MAC
+    // MoltenVK puts its own version in driverVersion as decimal major*10000 + minor*100 + patch.
+    const juce::String driver = "MoltenVK " + juce::String(props.driverVersion / 10000) + "."
+                              + juce::String((props.driverVersion / 100) % 100) + "." + juce::String(props.driverVersion % 100);
+#else
+    const juce::String driver = "driver " + vkVer(props.driverVersion) + " (raw " + juce::String((juce::int64) props.driverVersion) + ")";
+#endif
+    diag::log("GPU: " + juce::String(props.deviceName) + " (" + type + ", vendor 0x" + juce::String::toHexString((int) props.vendorID)
+              + ", device 0x" + juce::String::toHexString((int) props.deviceID) + ", " + driver
+              + ", Vulkan " + vkVer(props.apiVersion) + ") of " + juce::String((int) count) + " enumerated");
     return true;
 }
 
