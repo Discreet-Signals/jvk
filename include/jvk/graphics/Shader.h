@@ -155,7 +155,7 @@ public:
     void set(const juce::String& name, float value)
     {
         for (auto& b : bindings_) {
-            if (b.name == name && b.offsetInBuffer < uniformData_.size() * sizeof(float)) {
+            if ((b.name == name || b.blockName == name) && b.offsetInBuffer < uniformData_.size() * sizeof(float)) {
                 uniformData_[b.offsetInBuffer / sizeof(float)] = value;
                 return;
             }
@@ -165,7 +165,7 @@ public:
     void set(const juce::String& name, std::span<const float> data)
     {
         for (auto& b : bindings_) {
-            if (b.name == name) {
+            if (b.name == name || b.blockName == name) {
                 if (b.offsetInBuffer + data.size_bytes() <= uniformData_.size() * sizeof(float))
                     memcpy(&uniformData_[b.offsetInBuffer / sizeof(float)], data.data(), data.size_bytes());
                 return;
@@ -505,6 +505,7 @@ public:
 private:
     struct BindingInfo {
         juce::String     name;
+        juce::String     blockName;   // a uniform block's declared name; set() takes either
         uint32_t         binding;
         VkDescriptorType type;
         uint32_t         offsetInBuffer = 0;
@@ -560,6 +561,8 @@ private:
             info.name = rb->name != nullptr
                          ? juce::String(juce::CharPointer_UTF8(rb->name))
                          : juce::String();
+            if (rb->type_description != nullptr && rb->type_description->type_name != nullptr)
+                info.blockName = juce::String(juce::CharPointer_UTF8(rb->type_description->type_name));
             info.binding = rb->binding;
             info.type = static_cast<VkDescriptorType>(rb->descriptor_type);
 
