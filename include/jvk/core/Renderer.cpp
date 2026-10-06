@@ -63,6 +63,8 @@ void Renderer::reset()
     arena_.reset();
     fonts_.clear();
     fills_.clear();
+    recordTarget_ = 0;   // every frame starts drawing into the main colour
+    std::fill(std::begin(targetReadEnd_), std::end(targetReadEnd_), 0u);   // no target read yet
     // Per-frame gradient atlas reset. Runs on the message thread (called from
     // the editor's render timer) — same thread that does registerGradient
     // during paint, so no sync needed.
@@ -239,6 +241,32 @@ void Renderer::uploadRect(Memory::L2::Allocation src, VkImage dst,
                                 /*dynamicContent*/ false, /*partial*/ true, x, y });
 }
 
+void Renderer::initializeImage(const Image& dst, VkClearColorValue clear)
+{
+    if (dst.image() == VK_NULL_HANDLE) return;
+    const juce::ScopedLock lk(uploadLock_);
+    PendingUpload u { dst.image(), dst.width(), dst.height(), VK_NULL_HANDLE, 0 };
+    u.layer = dst.layers();
+    u.mip   = dst.mips();
+    u.clear = true;
+    u.clearValue = clear;
+    pendingUploads_.push_back(u);
+}
+
+void Renderer::uploadRegion(Memory::L2::Allocation src, const Image& dst,
+                            uint32_t layer, uint32_t mip,
+                            int32_t x, int32_t y, uint32_t width, uint32_t height)
+{
+    if (dst.image() == VK_NULL_HANDLE || layer >= dst.layers() || mip >= dst.mips()) return;
+    const juce::ScopedLock lk(uploadLock_);
+    staging_.commit(src);
+    PendingUpload u { dst.image(), width, height, src.buffer, src.offset,
+                      /*dynamicContent*/ false, /*partial*/ true, x, y };
+    u.layer = layer;
+    u.mip   = mip;
+    pendingUploads_.push_back(u);
+}
+
 void Renderer::cancelUploads(VkImage dst)
 {
     const juce::ScopedLock lk(uploadLock_);
@@ -260,10 +288,45 @@ void Renderer::cancelUploadsAllRenderers(VkImage dst)
     for (auto* r : snapshot) r->cancelUploads(dst);
 }
 
+void Renderer::recordImageClear(VkCommandBuffer cmd, VkImage dst,
+                                 uint32_t layers, uint32_t mips,
+                                 VkClearColorValue clear)
+{
+    const VkImageSubresourceRange all { VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers };
+
+    // UNDEFINED discards whatever was there, which is the point of a clear.
+    // FRAGMENT_SHADER as the source stage orders the clear after any earlier
+    // frame's reads, should the image already be in use.
+    VkImageMemoryBarrier barrier {};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = dst;
+    barrier.subresourceRange = all;
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    vkCmdClearColorImage(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &all);
+
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
 void Renderer::recordImageUpload(VkCommandBuffer cmd, Memory::L2::Allocation src,
                                   VkImage dst, uint32_t width, uint32_t height,
                                   bool dynamicContent, bool partial,
-                                  int32_t dstX, int32_t dstY)
+                                  int32_t dstX, int32_t dstY,
+                                  uint32_t layer, uint32_t mip)
 {
     VkImageMemoryBarrier barrier {};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -277,7 +340,9 @@ void Renderer::recordImageUpload(VkCommandBuffer cmd, Memory::L2::Allocation src
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = dst;
-    barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+    // Only the target subresource changes layout; every other layer and mip
+    // of a user texture stays SHADER_READ_ONLY (and sampleable) throughout.
+    barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, layer, 1 };
     barrier.srcAccessMask = 0;
     barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 
@@ -296,7 +361,7 @@ void Renderer::recordImageUpload(VkCommandBuffer cmd, Memory::L2::Allocation src
 
     VkBufferImageCopy region {};
     region.bufferOffset = src.offset;      // bufferRowLength 0 = tightly packed
-    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 };
     region.imageOffset = { dstX, dstY, 0 };
     region.imageExtent = { width, height, 1 };
 
@@ -335,11 +400,16 @@ void Renderer::flushUploads(VkCommandBuffer cmd)
     }
 
     for (auto& u : uploadScratch_) {
+        if (u.clear) {
+            recordImageClear(cmd, u.dstImage, u.layer, u.mip, u.clearValue);
+            continue;
+        }
         // The pending-upload struct carries the L2 allocation broken out into
         // (srcBuffer, srcOffset); repack so we can share recordImageUpload.
         Memory::L2::Allocation src { nullptr, u.srcBuffer, u.srcOffset };
         recordImageUpload(cmd, src, u.dstImage, u.width, u.height,
-                          u.dynamicContent, u.partial, u.dstX, u.dstY);
+                          u.dynamicContent, u.partial, u.dstX, u.dstY,
+                          u.layer, u.mip);
     }
     uploadScratch_.clear();
 }
@@ -512,22 +582,31 @@ void Renderer::execute()
     };
     int cur = 0;
 
-    VkRenderPass scenePassLoad = target_.sceneRenderPassLoad();
     VkRenderPass sceneBuildRP  = target_.sceneRenderPassClear(); // compat for build
 
-    auto beginSceneRP = [&](VkRenderPass rp, bool withClears) {
+    // A scene pass, beginning at command `firstCommand`: clearing at the
+    // frame start, loading after an effect. A target with no reader from
+    // here on is neither loaded nor stored (see Renderer::liveTargets): it
+    // can only die at a reader, and a reader always ends the scene pass, so
+    // whatever is live where a pass begins stays live to its end.
+    auto beginSceneRP = [&](bool withClears, size_t firstCommand) {
         VkRenderPassBeginInfo rpbi {};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rpbi.renderPass = rp;
+        rpbi.renderPass = target_.sceneRenderPass(withClears, liveTargets(firstCommand));
         rpbi.framebuffer = pp[cur].sceneFB;
         rpbi.renderArea.extent = frame.extent;
 
-        VkClearValue clears[2] {};
-        clears[0].color = {{ 0.0f, 0.0f, 0.0f, 0.0f }};
-        clears[1].depthStencil = { 1.0f, 0 };
+        // [0] main colour, [1..N] render targets (each its own clear
+        // value), [N+1] depth/stencil.
+        const auto& targets = target_.targets();
+        clearScratch_.assign(targets.size() + 2, VkClearValue {});
+        clearScratch_[0].color = {{ 0.0f, 0.0f, 0.0f, 0.0f }};
+        for (size_t i = 0; i < targets.size(); ++i)
+            clearScratch_[1 + i].color = targets[i].clear;
+        clearScratch_.back().depthStencil = { 1.0f, 0 };
         if (withClears) {
-            rpbi.clearValueCount = 2;
-            rpbi.pClearValues = clears;
+            rpbi.clearValueCount = static_cast<uint32_t>(clearScratch_.size());
+            rpbi.pClearValues = clearScratch_.data();
         }
         vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -624,12 +703,20 @@ void Renderer::execute()
             && sc.extent.height == frame.extent.height;
     };
 
-    beginSceneRP(target_.sceneRenderPassClear(), /*withClears=*/true);
+    beginSceneRP(/*withClears=*/true, 0);
     state_.begin(frame.cmd, vertices_,
         static_cast<float>(frame.extent.width),
         static_cast<float>(frame.extent.height));
 
-    for (auto& cmd : commands_) {
+    for (size_t k = 0; k < commands_.size(); ++k) {
+        const auto& cmd = commands_[k];
+        replayLive_ = liveTargets(k);
+        // A draw INTO a target nothing reads from here on is a dead store.
+        // (Clip ops keep the stencil balanced whatever the target; a shader
+        // draw writes the locations its shader declares, judged below.)
+        if (cmd.target > 0 && (replayLive_ & (1u << (cmd.target - 1))) == 0
+            && !isClipOp(cmd.op) && cmd.op != DrawOp::DrawShader)
+            continue;
         if (cmd.op == DrawOp::EffectKernel) {
             // Separable Gaussian blur, ROI-walked: V (last) outputs the
             // final region R, so H must output R padded by V's VERTICAL
@@ -660,7 +747,7 @@ void Renderer::execute()
                         0.0f, 1.0f, bp.radius,
                         static_cast<uint32_t>(cmd.stencilDepth), &scV);
                 });
-                beginSceneRP(scenePassLoad, /*withClears=*/false);
+                beginSceneRP(/*withClears=*/false, k + 1);
             }
             continue;
         }
@@ -795,17 +882,73 @@ void Renderer::execute()
             // DrawShader is a regular scene draw — no render-pass transition.
             // Dispatch updates State's bound pipeline/layout and issues one
             // fullscreen triangle against the current scene framebuffer.
+            //
+            // Unless the shader READS targets (samplers named after them):
+            // they are attachments of the scene pass, so it runs as its own
+            // pass right here, in paint order. The scene pass ends (every
+            // target becomes sampleable, holding everything drawn so far),
+            // the shader draws onto the main colour of the current half in
+            // place — blended Over, the stencil clip still applied —
+            // and the scene pass resumes on top.
             if (shaderPipeline_) {
                 auto& sp = arena_.read<DrawShaderParams>(cmd.dataOffset);
                 auto* shader = static_cast<Shader*>(sp.shader);
-                if (shader) {
+                const float fw = static_cast<float>(frame.extent.width);
+                const float fh = static_cast<float>(frame.extent.height);
+                if (shader && shader->readsScene()) {
+                    // A SCENE READER (it may read targets too): a non-separable
+                    // effect, ROI-walked like EffectHSV. One region pass samples
+                    // the current half as its `scene` and REPLACES the region in
+                    // the other; a partial region is copied back so the chain
+                    // ends on the starting half.
+                    const auto R = roiFinal(sp.region, cmd.clipBounds);
+                    if (R.isEmpty()) continue;
+                    const VkRect2D sc = roiScissor(R, 0.0f, 0.0f);
+                    auto pass = [&](VkDescriptorSet src, VkFramebuffer dst) {
+                        VkRenderPassBeginInfo rpbi {};
+                        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+                        rpbi.renderPass = target_.effectRenderPass();
+                        rpbi.framebuffer = dst;
+                        rpbi.renderArea.extent = frame.extent;
+                        vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+                        shaderPipeline_->dispatchPass(frame.cmd, *shader, sp.region, fw, fh,
+                            cmd.clipBounds, cmd.stencilDepth, frameTime, frame.frameSlot,
+                            { sp.constants, sp.constantCount }, src);
+                        vkCmdEndRenderPass(frame.cmd);
+                    };
+                    vkCmdEndRenderPass(frame.cmd);
+                    if (coversFrame(sc)) {
+                        preCopyIfClipped(cmd.stencilDepth, &sc);
+                        effectPassAndSwap(pass);
+                    } else {
+                        effectPassAndSwap(pass);
+                        copyBackAndSwap(sc, cmd.stencilDepth);
+                    }
+                    beginSceneRP(/*withClears=*/false, k + 1);
+                }
+                else if (shader && sp.targetsRead != 0) {
+                    vkCmdEndRenderPass(frame.cmd);
+                    VkRenderPassBeginInfo rpbi {};
+                    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+                    rpbi.renderPass = target_.effectRenderPass();
+                    rpbi.framebuffer = pp[cur].effectFB;
+                    rpbi.renderArea.extent = frame.extent;
+                    vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+                    shaderPipeline_->dispatchPass(frame.cmd, *shader, sp.region, fw, fh,
+                        cmd.clipBounds, cmd.stencilDepth, frameTime, frame.frameSlot,
+                        { sp.constants, sp.constantCount });
+                    vkCmdEndRenderPass(frame.cmd);
+                    beginSceneRP(/*withClears=*/false, k + 1);
+                }
+                else if (shader && (sp.writesMain || (sp.targetsWritten & replayLive_) != 0)) {
+                    // (One that writes only targets nothing reads any more is skipped.)
                     shaderPipeline_->dispatch(state_, frame.cmd, *shader,
-                        sp.region,
-                        static_cast<float>(frame.extent.width),
-                        static_cast<float>(frame.extent.height),
+                        sp.region, fw, fh,
                         cmd.clipBounds,
                         cmd.stencilDepth,
-                        frameTime);
+                        frameTime,
+                        frame.frameSlot,
+                        { sp.constants, sp.constantCount });
                 }
             }
             continue;
@@ -847,7 +990,7 @@ void Renderer::execute()
                     });
                     copyBackAndSwap(sc, cmd.stencilDepth);
                 }
-                beginSceneRP(scenePassLoad, /*withClears=*/false);
+                beginSceneRP(/*withClears=*/false, k + 1);
             }
             continue;
         }
@@ -938,7 +1081,7 @@ void Renderer::execute()
                     });
                     copyBackAndSwap(scR, cmd.stencilDepth);
                 }
-                beginSceneRP(scenePassLoad, /*withClears=*/false);
+                beginSceneRP(/*withClears=*/false, k + 1);
             }
             continue;
         }
@@ -1007,16 +1150,16 @@ void Renderer::execute()
                     });
                     copyBackAndSwap(scR, cmd.stencilDepth);
                 }
-                beginSceneRP(scenePassLoad, /*withClears=*/false);
+                beginSceneRP(/*withClears=*/false, k + 1);
             }
             continue;
         }
         auto* pipeline = pipelineForOp_[static_cast<size_t>(cmd.op)];
         if (!pipeline) continue;
         if (!pipeline->isBuilt())
-            pipeline->build(sceneBuildRP);
+            pipeline->build(sceneBuildRP, target_.targets());
         if (!pipeline->isBuilt()) continue;   // build failed — never bind null
-        state_.setPipeline(pipeline);
+        if (!state_.setPipeline(pipeline, cmd.target, replayLive_)) continue;
         pipeline->execute(*this, arena_, cmd);
     }
 
@@ -1154,15 +1297,18 @@ void State::invalidate()
     boundVertexBuffer_ = VK_NULL_HANDLE;
 }
 
-void State::setPipeline(Pipeline* pipeline)
+bool State::setPipeline(Pipeline* pipeline, uint8_t attachment, uint8_t live)
 {
-    if (!pipeline) return;
+    if (!pipeline) return false;
 
     // Clip variant of the pipeline has stencilTest on (cmp = EQUAL, ops =
     // KEEP), reference pushed dynamically below. Non-clip variant has no
-    // stencil test at all — used whenever stencilDepth_ == 0.
-    VkPipeline handle = (stencilDepth_ > 0) ? pipeline->clipHandle()
-                                            : pipeline->handle();
+    // stencil test at all — used whenever stencilDepth_ == 0. Each variant
+    // also exists per draw target (attachment) and per set of targets its
+    // paint still clears (live).
+    VkPipeline handle = (stencilDepth_ > 0) ? pipeline->clipHandle(attachment, live)
+                                            : pipeline->handle(attachment, live);
+    if (handle == VK_NULL_HANDLE) return false;   // failed build: never bind null
 
     if (handle != boundPipeline_) {
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, handle);
@@ -1188,6 +1334,7 @@ void State::setPipeline(Pipeline* pipeline)
     }
 
     currentPipeline_ = pipeline;
+    return true;
 }
 
 void State::setCustomPipeline(VkPipeline pipeline, VkPipelineLayout layout)

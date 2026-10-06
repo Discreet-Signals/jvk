@@ -31,6 +31,9 @@ public:
         s.clipBounds = { 0, 0,
             static_cast<int>(renderer_.target().width()),
             static_cast<int>(renderer_.target().height()) };
+        syncTarget();   // the main colour
+        values_.removeAllChildren(nullptr);   // every frame starts with no values
+        values_.removeAllProperties(nullptr);
         frameId_++;
     }
 
@@ -39,6 +42,73 @@ public:
     {
         auto* ctx = dynamic_cast<Graphics*>(&g.getInternalContext());
         return ctx;
+    }
+
+    // ===== Frame values ======================================================
+    //
+    // A tree of values painters leave for the painters after them in the same
+    // frame (paint order is the only order: a reader sees what painted before
+    // it). Emptied at the start of every frame. Set a property, or append a
+    // child of plain properties, so several painters can each add one of a
+    // kind; a reader takes what is there, with its own defaults for what isn't.
+    // A position is best stored in framebuffer pixels (getPhysicalTransform),
+    // where every painter's values meet.
+    juce::ValueTree& values() { return values_; }
+
+    // The same, from a juce::Graphics: null when jvk isn't painting it.
+    static juce::ValueTree* values(juce::Graphics& g)
+    {
+        auto* ctx = create(g);
+        return ctx != nullptr ? &ctx->values_ : nullptr;
+    }
+
+    // The transform from the current paint's local coordinates to physical
+    // framebuffer pixels: every origin and AffineTransform above it, times the
+    // display scale. Where a shader that works in framebuffer pixels
+    // (gl_FragCoord) needs to know where local things land.
+    juce::AffineTransform getPhysicalTransform() const { return state().transform.scaled(displayScale_); }
+
+    // ===== Draw target (render targets) =====================================
+    //
+    // Where this context's draws land: the main colour (the default; "main" or
+    // a null Identifier) or a render target declared with
+    // AudioProcessorEditor::setTargets. Every built-in draw — fills, paths,
+    // text, images — goes to the target exactly as it would to the main
+    // colour, so an app can draw an image, then select another target and
+    // draw a matching image, shape or text into it. The
+    // target is part of the saved state: saveState/restoreState (and so
+    // juce::Graphics::ScopedSaveState and every component boundary) restore
+    // it, so a component that selects a target never affects the next one.
+    //
+    // A target the frame doesn't have (one that was never declared, or
+    // was dropped) records NO draws until the target changes, so they never
+    // land in the main colour by mistake. Effects (blur, saturate, darken,
+    // noise) work on the main colour only and are skipped while a target is
+    // the target. jvk::Shader draws write the locations their shader declares,
+    // whatever the target. Returns false if `name` isn't a target here.
+    static inline const juce::Identifier mainTarget { "main" };
+
+    bool setTarget(const juce::Identifier& name)
+    {
+        auto& s = state();
+        if (name.isNull() || name == mainTarget) {
+            s.target = 0;
+        } else {
+            const int i = renderer_.target().targetIndex(name);
+            s.target = i < 0 ? Renderer::kNoTarget : static_cast<uint8_t>(i + 1);
+        }
+        s.targetName = name;
+        syncTarget();
+        return s.target != Renderer::kNoTarget;
+    }
+    juce::Identifier getTarget() const { return state().target == 0 ? mainTarget : state().targetName; }
+
+    // The same, from a juce::Graphics: false when jvk isn't painting it (a
+    // software or OpenGL paint) or the target doesn't exist.
+    static bool setTarget(juce::Graphics& g, const juce::Identifier& name)
+    {
+        auto* ctx = create(g);
+        return ctx != nullptr && ctx->setTarget(name);
     }
 
     // ===== LowLevelGraphicsContext overrides =====
@@ -335,6 +405,7 @@ public:
             }
         }
         stateStack_.pop_back();
+        syncTarget();   // the draw target unwinds with the rest of the state
     }
 
     // Transparency layers are approximated by an alpha multiplier on every
@@ -1222,13 +1293,26 @@ public:
                          transformed.getWidth()  * displayScale_,
                          transformed.getHeight() * displayScale_ };
         }
-        renderer_.push(DrawOp::DrawShader, s.clipBounds, s.stencilDepth,
-            DrawShaderParams { &shader, regionPx, displayScale_ });
+        // A shader that reads targets (samplers named after them) gets their
+        // current images bound now, on the message thread while the render
+        // worker is idle (at replay it runs as its own pass), and the draw
+        // takes a copy of the shader's per-draw constants (Shader.h). A
+        // reader also keeps the targets it reads alive up to this draw
+        // (Renderer::noteTargetsRead).
+        DrawShaderParams params { &shader, regionPx, displayScale_ };
+        prepareShaderDraw(shader, params);
+        if (renderer_.push(DrawOp::DrawShader, s.clipBounds, s.stencilDepth, params))
+            renderer_.noteTargetsRead(params.targetsRead);
     }
 
     Renderer& getRenderer() { return renderer_; }
 
 private:
+    // drawShader's record-time step: binds the targets the shader reads and
+    // copies its per-draw constants. Defined in Shader.h: this header only
+    // forward-declares Shader.
+    void prepareShaderDraw(Shader& shader, DrawShaderParams& params);
+
     struct RecordState {
         juce::AffineTransform transform;
         juce::FillType        fill { juce::Colours::black };
@@ -1257,10 +1341,19 @@ private:
         mutable bool                  inverseValid = false;
         // Path clips live in Graphics::pathClipShared_ (stack-shaped across
         // states); no per-state vector to deep-copy on every saveState.
+
+        // Draw target (setTarget): colour attachment index (0 = main colour,
+        // i + 1 = target i, Renderer::kNoTarget = a missing target), its
+        // name.
+        uint8_t               target = 0;
+        juce::Identifier      targetName;
     };
 
     RecordState& state() { return stateStack_.back(); }
     const RecordState& state() const { return stateStack_.back(); }
+
+    // The renderer stamps every recorded command with the current target.
+    void syncTarget() { renderer_.setRecordTarget(state().target); }
 
     // Record a PopClip — same ClipShapeParams as the paired PushClipPath so
     // the DECR_WRAP at the GPU matches the INCR_WRAP exactly. Stencil
@@ -1560,6 +1653,7 @@ private:
     float     displayScale_;
     std::vector<RecordState> stateStack_;
     uint64_t frameId_ = 0;
+    juce::ValueTree values_ { "Frame" };   // values(): emptied every frame
 
     // Active path-clip params, shared across the state stack (strictly
     // stack-shaped: pushes in clipToPath, pops in recordPopClip; saveState

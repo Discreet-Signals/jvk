@@ -12,6 +12,11 @@ layout(location = 2) in vec4 fragShapeInfo;
 layout(location = 3) in vec4 fragGradientInfo;
 
 layout(location = 0) out vec4 outColor;
+// Render targets (jvk::Target): the same colour at every other location. A
+// pipeline variant enables writes on the ONE attachment its draw targets
+// (Graphics::setTarget) and masks the rest; locations with no attachment in
+// the pass are discarded.
+layout(location = 1) out vec4 outChannels[7];
 
 // Signed distance to a rounded rectangle centered at origin
 float roundedRectSDF(vec2 p, vec2 b, float r) {
@@ -201,6 +206,36 @@ vec4 sampleShape() {
     return vec4(alpha);
 }
 
+// PAINT INTO THE MAIN COLOUR also sets the render targets declared
+// Target::clearedByMain to their clear values, by the paint's alpha. The
+// main-colour pipeline specializes kPaintsMain = 1 and the values
+// (PaintSpecialization); a pipeline drawing INTO a target writes the colour
+// at every location, and the target's own attachment takes it.
+layout(constant_id = 0) const int kPaintsMain = 0;
+layout(constant_id = 1)  const float kClear0r = 0.0; layout(constant_id = 2)  const float kClear0g = 0.0; layout(constant_id = 3)  const float kClear0b = 0.0;
+layout(constant_id = 4)  const float kClear1r = 0.0; layout(constant_id = 5)  const float kClear1g = 0.0; layout(constant_id = 6)  const float kClear1b = 0.0;
+layout(constant_id = 7)  const float kClear2r = 0.0; layout(constant_id = 8)  const float kClear2g = 0.0; layout(constant_id = 9)  const float kClear2b = 0.0;
+layout(constant_id = 10) const float kClear3r = 0.0; layout(constant_id = 11) const float kClear3g = 0.0; layout(constant_id = 12) const float kClear3b = 0.0;
+layout(constant_id = 13) const float kClear4r = 0.0; layout(constant_id = 14) const float kClear4g = 0.0; layout(constant_id = 15) const float kClear4b = 0.0;
+layout(constant_id = 16) const float kClear5r = 0.0; layout(constant_id = 17) const float kClear5g = 0.0; layout(constant_id = 18) const float kClear5b = 0.0;
+layout(constant_id = 19) const float kClear6r = 0.0; layout(constant_id = 20) const float kClear6g = 0.0; layout(constant_id = 21) const float kClear6b = 0.0;
+
+void writeTargets(vec4 colour)
+{
+    if (kPaintsMain == 0) {
+        for (int i = 0; i < 7; ++i) outChannels[i] = colour;
+        return;
+    }
+    float a = colour.a;
+    outChannels[0] = vec4(kClear0r, kClear0g, kClear0b, a);
+    outChannels[1] = vec4(kClear1r, kClear1g, kClear1b, a);
+    outChannels[2] = vec4(kClear2r, kClear2g, kClear2b, a);
+    outChannels[3] = vec4(kClear3r, kClear3g, kClear3b, a);
+    outChannels[4] = vec4(kClear4r, kClear4g, kClear4b, a);
+    outChannels[5] = vec4(kClear5r, kClear5g, kClear5b, a);
+    outChannels[6] = vec4(kClear6r, kClear6g, kClear6b, a);
+}
+
 void main() {
     vec4 color = sampleColor();
     vec4 shape = sampleShape();
@@ -209,4 +244,5 @@ void main() {
     // point, so their product is too — which is what BlendMode::Premultiplied
     // expects. See the alpha-convention note above.
     outColor = vec4(color.rgb * color.a, color.a) * shape;
+    writeTargets(outColor);
 }

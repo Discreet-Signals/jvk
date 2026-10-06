@@ -10,6 +10,7 @@ public:
         loadVertexShader(vertSpv);
         loadFragmentShader(fragSpv);
         atlas_.init(device);
+        paintClearsTargets_ = true;   // ui2d.frag is paint (PaintSpecialization)
     }
 
     PipelineConfig config() const override

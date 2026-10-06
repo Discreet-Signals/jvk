@@ -56,6 +56,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 // Core — no JUCE dependency
+#include "include/jvk/core/PixelFormat.h"
 #include "include/jvk/core/PipelineConfig.h"
 #include "include/jvk/core/Memory.h"
 #include "include/jvk/core/Resource.h"

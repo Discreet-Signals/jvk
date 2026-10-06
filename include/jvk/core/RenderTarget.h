@@ -59,10 +59,44 @@ public:
     // pipeline build works with both.
     virtual VkRenderPass sceneRenderPassClear() const = 0;
     virtual VkRenderPass sceneRenderPassLoad()  const = 0;
+    // The scene pass a frame actually begins (render worker): clear or load
+    // variant, where only the targets in `liveTargets` (bit i = target i: a
+    // later command reads it, Renderer::liveTargets) are cleared or loaded
+    // and stored; the rest are neither (DONT_CARE). Load and store ops don't
+    // affect render-pass compatibility, so every variant runs the same
+    // pipelines and framebuffers.
+    virtual VkRenderPass sceneRenderPass(bool clear, uint8_t liveTargets)
+    {
+        juce::ignoreUnused(liveTargets);
+        return clear ? sceneRenderPassClear() : sceneRenderPassLoad();
+    }
     // Render pass used by effect passes (1 sampleable color attachment).
     virtual VkRenderPass effectRenderPass() const = 0;
 
     virtual const SceneBuffers& sceneBuffers(int frameSlot) const = 0;
+
+    // ---- Render targets (PipelineConfig.h) ---------------------------------
+    // The extra colour targets of the scene render passes, in attachment
+    // order after the main colour (target i = attachment / output location
+    // i + 1). One image each, shared by every frame slot: a frame clears its
+    // targets when its first scene pass begins, and the passes' external
+    // dependencies order that after the previous frame's reads. Between scene
+    // passes (effects, target-reading shaders, the final blit) they sit in
+    // SHADER_READ_ONLY_OPTIMAL and can be sampled.
+    const std::vector<Target>& targets() const { return targets_; }
+    const Image* targetImage(size_t i) const { return i < targetImages_.size() ? &targetImages_[i] : nullptr; }
+    // Changes every time the target images are (re)created (a resize, a new
+    // set), unique across every RenderTarget in the process. A shader that
+    // samples the targets rebinds when it moves: a recreated image can come
+    // back with the very same VkImageView handle value, so handles can't say.
+    uint64_t targetsGeneration() const { return targetsGeneration_; }
+    // Index of the target called `name`, or -1.
+    int targetIndex(const juce::Identifier& name) const
+    {
+        for (size_t i = 0; i < targets_.size(); ++i)
+            if (targets_[i].name == name) return static_cast<int>(i);
+        return -1;
+    }
 
     // Each RenderTarget owns a dedicated VkCommandPool. Vulkan command pools
     // are externally synchronized — every vkCmd* recording call on any
@@ -77,6 +111,16 @@ protected:
     Device& device_;
     VkCommandPool commandPool_ = VK_NULL_HANDLE;
     RenderTarget(Device& device);
+
+    std::vector<Target> targets_;
+    std::vector<Image>   targetImages_;
+    uint64_t             targetsGeneration_ = 0;
+
+    // The targets this device can carry: independentBlend is required (a
+    // draw writes one attachment and leaves the rest), and the main colour
+    // plus the targets must fit the device's colour-attachment limit and the
+    // built-in shaders' 8 outputs. The rest are dropped, with a log line.
+    std::vector<Target> validTargets(std::vector<Target> requested) const;
 };
 
 
@@ -97,7 +141,8 @@ public:
     SwapchainTarget(Device& device, VkSurfaceKHR surface,
                     uint32_t w, uint32_t h,
                     void* nativeWindow = nullptr,
-                    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR);
+                    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR,
+                    std::vector<Target> targets = {});
     ~SwapchainTarget();
 
     Frame    beginFrame() override;
@@ -117,6 +162,7 @@ public:
 
     VkRenderPass sceneRenderPassClear() const override { return sceneRPClear_; }
     VkRenderPass sceneRenderPassLoad()  const override { return sceneRPLoad_;  }
+    VkRenderPass sceneRenderPass(bool clear, uint8_t liveTargets) override;
     VkRenderPass effectRenderPass()     const override { return effectRP_;     }
 
     const SceneBuffers& sceneBuffers(int frameSlot) const override
@@ -127,6 +173,7 @@ public:
 private:
     void createSwapchain();
     void createRenderPasses();
+    VkRenderPass createSceneRenderPass(bool clear, uint8_t liveTargets) const;
     void createSceneBuffers();
     void createSyncObjects();
     void destroySwapchain();
@@ -149,6 +196,10 @@ private:
     VkRenderPass sceneRPClear_ = VK_NULL_HANDLE;
     VkRenderPass sceneRPLoad_  = VK_NULL_HANDLE;
     VkRenderPass effectRP_     = VK_NULL_HANDLE;
+    // sceneRenderPass variants with some targets dead, made on first use by
+    // the render worker (at most two per distinct live set a frame passes
+    // through). Keyed clear << 8 | live.
+    std::vector<std::pair<uint32_t, VkRenderPass>> sceneRPVariants_;
 
     static constexpr int MAX_FRAMES = 2;
     SceneBuffers sceneBuffers_[MAX_FRAMES];

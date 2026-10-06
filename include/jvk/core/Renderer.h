@@ -63,6 +63,9 @@ struct DrawCommand {
     uint8_t              stencilDepth;
     uint32_t             dataOffset;
     juce::Rectangle<int> clipBounds;
+    // Where a built-in draw lands (Graphics::setTarget): colour attachment
+    // 0 = main colour, i + 1 = render target i. Captured at record.
+    uint8_t              target = 0;
 };
 
 // =============================================================================
@@ -135,7 +138,12 @@ class State {
 public:
     State() = default;
 
-    void setPipeline(Pipeline* pipeline);
+    // Binds `pipeline`'s variant for a draw into colour attachment
+    // `attachment` (see DrawCommand::target) while the targets in `live` are
+    // still read later this frame (Renderer::liveTargets), the clip variant
+    // when a path clip is active. False (nothing bound) when that variant
+    // could not be built; the caller skips the draw.
+    bool setPipeline(Pipeline* pipeline, uint8_t attachment = 0, uint8_t live = 0xFF);
     void setCustomPipeline(VkPipeline pipeline, VkPipelineLayout layout);
     // set 0 = color source (solid default or gradient LUT), set 1 = shape source
     // (1x1 default, MSDF atlas page, or image texture). Each dirty-tracked.
@@ -190,13 +198,62 @@ public:
     Renderer(Device& device, RenderTarget& target);
     ~Renderer();
 
+    // Records a command; false when the current draw target doesn't take it
+    // (see recordsInTarget).
     template <typename Params>
-    void push(DrawOp op, const juce::Rectangle<int>& clip,
+    bool push(DrawOp op, const juce::Rectangle<int>& clip,
               uint8_t stencilDepth, const Params& params)
     {
+        if (!recordsInTarget(op)) return false;
         uint32_t offset = arena_.push(params);
-        commands_.push_back({ op, stencilDepth, offset, clip });
+        commands_.push_back({ op, stencilDepth, offset, clip, recordTarget_ });
+        return true;
     }
+
+    // ---- Draw target (render targets) --------------------------------------
+    //
+    // Where the draws recorded from now on land: colour attachment 0 (the
+    // main colour) or i + 1 (render target i). jvk::Graphics sets
+    // this from its saved state, so a target chosen inside one component's
+    // paint is restored with the graphics state like a transform or a clip.
+    // kNoTarget (a target this frame doesn't have) records no draws at all,
+    // so a draw meant for a missing target never lands in the main colour.
+    static constexpr uint8_t kNoTarget = 0xFF;
+    void setRecordTarget(uint8_t attachment) { recordTarget_ = attachment; }
+    uint8_t recordTarget() const { return recordTarget_; }
+
+    // ---- Target lifetimes --------------------------------------------------
+    //
+    // Targets are cleared at the start of every frame and their only readers
+    // are shaders drawn later in the same frame (the final blit reads the
+    // main colour alone), so a target is LIVE up to and including its last
+    // reader and DEAD after it: nothing written to it then is ever read. The
+    // replay drops that work: draws into a dead target, the clear-under-paint
+    // of main-colour draws (Target::clearedByMain), and the load and store of
+    // its image at every scene-pass boundary. A frame pays for its targets up
+    // to the point it uses them, and a frame that reads none pays nothing.
+    // Masks: bit i = target i.
+    //
+    // The command just recorded samples `targets` (jvk::Graphics::drawShader,
+    // for a shader that reads them).
+    void noteTargetsRead(uint8_t targets)
+    {
+        for (uint32_t i = 0; i < kMaxTargets; ++i)
+            if (targets & (1u << i))
+                targetReadEnd_[i] = static_cast<uint32_t>(commands_.size());
+    }
+    // The targets command `index` or a later one reads.
+    uint8_t liveTargets(size_t index) const
+    {
+        uint8_t live = 0;
+        for (uint32_t i = 0; i < kMaxTargets; ++i)
+            if (index < targetReadEnd_[i])
+                live |= static_cast<uint8_t>(1u << i);
+        return live;
+    }
+    // While replaying: liveTargets of the command being executed (for a
+    // pipeline that binds its own variants, e.g. PathPipeline).
+    uint8_t replayLiveTargets() const { return replayLive_; }
 
     // Pin a FrameRetained so its destructor will block until the GPU is
     // done with the frame this record is being assembled into. Called by
@@ -407,6 +464,27 @@ public:
     // and uses a TOP_OF_PIPE barrier that orders nothing).
     void uploadDynamic(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height);
 
+    // ---- User-owned textures (layers / mips) --------------------------------
+    //
+    // For images an application creates itself (Image with an Image::Shape)
+    // and fills over time: an atlas whose regions arrive as assets load, a
+    // texture array with one layer per animation frame. Every subresource is
+    // cleared once and lives in SHADER_READ_ONLY from then on, so a region
+    // upload never needs to know what else the image holds.
+    //
+    // initializeImage: clears every layer and mip to `clear` and leaves them
+    // SHADER_READ_ONLY. Queue it once, before the first uploadRegion() for
+    // that image (the queue records in order). The image needs TRANSFER_DST.
+    void initializeImage(const Image& dst, VkClearColorValue clear = {});
+
+    // uploadRegion: copies a w×h region (tightly packed in `src`, sized by
+    // formatInfo(format).bytesFor(w, h); for a block-compressed format, whole
+    // 4x4 blocks) into (layer, mip) at (x, y), preserving everything else.
+    // Waits for earlier frames' fragment reads of the image, like uploadRect.
+    void uploadRegion(Memory::L2::Allocation src, const Image& dst,
+                      uint32_t layer, uint32_t mip,
+                      int32_t x, int32_t y, uint32_t width, uint32_t height);
+
     // Drop any queued uploads targeting `dst`. Call before destroying /
     // retiring an image that may still have a pending entry (e.g. a dynamic
     // shader input resized twice between executes) so flushUploads never
@@ -431,7 +509,15 @@ public:
                                    VkImage dst, uint32_t width, uint32_t height,
                                    bool dynamicContent = false,
                                    bool partial = false,
-                                   int32_t dstX = 0, int32_t dstY = 0);
+                                   int32_t dstX = 0, int32_t dstY = 0,
+                                   uint32_t layer = 0, uint32_t mip = 0);
+
+    // Clear every layer/mip of `dst` and leave it SHADER_READ_ONLY (see
+    // initializeImage). Waits for earlier fragment reads, so it is also safe
+    // on an image that is already in use.
+    static void recordImageClear(VkCommandBuffer cmd, VkImage dst,
+                                 uint32_t layers, uint32_t mips,
+                                 VkClearColorValue clear);
 
     // ---- Deferred destruction ----------------------------------------------
     //
@@ -517,6 +603,45 @@ private:
     std::vector<DrawCommand> commands_;
     Arena                    arena_;
 
+    uint8_t recordTarget_ = 0;
+    std::vector<VkClearValue> clearScratch_;   // worker-only: scene pass clear values (capacity kept)
+
+    // Target lifetimes (noteTargetsRead): per target, the index of its last
+    // reader + 1 this frame (0 = never read). Up to 7 targets (PipelineConfig.h).
+    static constexpr uint32_t kMaxTargets = 7;
+    uint32_t targetReadEnd_[kMaxTargets] {};
+    uint8_t  replayLive_ = 0xFF;   // worker-only: liveTargets of the command being replayed
+
+    // Clip ops change the stencil, whatever the draw target.
+    static bool isClipOp(DrawOp op)
+    {
+        switch (op) {
+            case DrawOp::PushClipRect: case DrawOp::PopClipRect:
+            case DrawOp::PushClipPath: case DrawOp::PopClipPath:
+            case DrawOp::ExcludeClipRect: case DrawOp::RestoreClipExclude:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // Clip ops always record (they keep the stencil balanced whatever the
+    // target). Effects read and write the main colour, so they record only
+    // while the main colour is the target. Nothing else records into a
+    // missing target.
+    bool recordsInTarget(DrawOp op) const
+    {
+        if (isClipOp(op))
+            return true;
+        switch (op) {
+            case DrawOp::EffectBlend: case DrawOp::EffectNoise: case DrawOp::EffectKernel:
+            case DrawOp::EffectHSV: case DrawOp::BlurShape: case DrawOp::BlurPath:
+                return recordTarget_ == 0;
+            default:
+                return recordTarget_ != kNoTarget;
+        }
+    }
+
     // Non-POD captures (proper RAII, cleared each frame)
     std::vector<juce::Font>     fonts_;
     std::vector<juce::FillType> fills_;
@@ -533,6 +658,12 @@ private:
         // the pre-copy barrier preserves existing contents.
         bool         partial = false;
         int32_t      dstX = 0, dstY = 0;
+        // uploadRegion: the target subresource. initializeImage: `clear` is
+        // set, (layer, mip) carry the image's layer and mip COUNTS, and there
+        // is no source buffer.
+        uint32_t     layer = 0, mip = 0;
+        bool         clear = false;
+        VkClearColorValue clearValue {};
     };
     // The upload queue is pushed from the message thread (record:
     // Shader::update dynamic feeds, cache inserts, atlas pages) while the

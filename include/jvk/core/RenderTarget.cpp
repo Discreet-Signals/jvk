@@ -24,6 +24,49 @@ RenderTarget::~RenderTarget()
         vkDestroyCommandPool(device_.device(), commandPool_, nullptr);
 }
 
+std::vector<Target> RenderTarget::validTargets(std::vector<Target> requested) const
+{
+    if (requested.empty())
+        return requested;
+
+    if (!device_.supportsIndependentBlend()) {
+        diag::log("render targets unavailable: the device lacks independentBlend");
+        return {};
+    }
+
+    // The built-in fragment shaders write locations 0..7, so at most 7
+    // targets besides the main colour; fewer where the device allows fewer
+    // colour attachments (the spec minimum is 4).
+    VkPhysicalDeviceProperties props {};
+    vkGetPhysicalDeviceProperties(device_.physicalDevice(), &props);
+    const size_t limit = std::min<size_t>(7, props.limits.maxColorAttachments - 1);
+
+    std::vector<Target> kept;
+    for (auto& c : requested) {
+        // Every built-in draw into a target blends (as into the main colour),
+        // and so does paint clearing it (clearedByMain); the paint shaders
+        // write floats. So a target's format must render, sample AND blend:
+        // never an integer or block-compressed one, whatever its Blend says.
+        const auto info = formatInfo(c.format);
+        VkFormatProperties fp {};
+        vkGetPhysicalDeviceFormatProperties(device_.physicalDevice(), toVkFormat(c.format), &fp);
+        const auto needed = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT
+                          | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT;
+        if (info.integer || info.compressed || (fp.optimalTilingFeatures & needed) != needed) {
+            diag::log("render target '" + c.name.toString()
+                      + "' dropped: its format cannot be rendered, sampled and blended");
+            continue;
+        }
+        if (kept.size() == limit) {
+            diag::log("render target '" + c.name.toString() + "' dropped: more than "
+                      + juce::String((int) limit) + " targets");
+            continue;
+        }
+        kept.push_back(std::move(c));
+    }
+    return kept;
+}
+
 // =============================================================================
 // SwapchainTarget
 // =============================================================================
@@ -55,10 +98,12 @@ struct SurfaceDpiScope
 SwapchainTarget::SwapchainTarget(Device& device, VkSurfaceKHR surface,
                                  uint32_t w, uint32_t h,
                                  void* nativeWindow,
-                                 VkPresentModeKHR presentMode)
+                                 VkPresentModeKHR presentMode,
+                                 std::vector<Target> targets)
     : RenderTarget(device), surface_(surface), nativeWindow_(nativeWindow),
       presentMode_(presentMode), width_(w), height_(h)
 {
+    targets_ = validTargets(std::move(targets));
     createSwapchain();
     createRenderPasses();
     createSceneBuffers();
@@ -85,6 +130,8 @@ SwapchainTarget::~SwapchainTarget()
     destroySwapchain();
     if (sceneRPClear_ != VK_NULL_HANDLE) vkDestroyRenderPass(d, sceneRPClear_, nullptr);
     if (sceneRPLoad_  != VK_NULL_HANDLE) vkDestroyRenderPass(d, sceneRPLoad_,  nullptr);
+    for (auto& [key, rp] : sceneRPVariants_)
+        if (rp != VK_NULL_HANDLE) vkDestroyRenderPass(d, rp, nullptr);
     if (effectRP_     != VK_NULL_HANDLE) vkDestroyRenderPass(d, effectRP_,     nullptr);
     vkDestroySurfaceKHR(device_.instance(), surface_, nullptr);
 }
@@ -200,15 +247,32 @@ void SwapchainTarget::createSwapchain()
     // without ever being read.
 }
 
-void SwapchainTarget::createRenderPasses()
+VkRenderPass SwapchainTarget::sceneRenderPass(bool clear, uint8_t liveTargets)
+{
+    const uint8_t all = static_cast<uint8_t>((1u << targets_.size()) - 1u);
+    liveTargets &= all;
+    if (liveTargets == all)
+        return clear ? sceneRPClear_ : sceneRPLoad_;
+    const uint32_t key = (clear ? 0x100u : 0u) | liveTargets;
+    for (auto& [k, rp] : sceneRPVariants_)
+        if (k == key) return rp;
+    VkRenderPass rp = createSceneRenderPass(clear, liveTargets);
+    sceneRPVariants_.push_back({ key, rp });
+    return rp;
+}
+
+VkRenderPass SwapchainTarget::createSceneRenderPass(bool clear, uint8_t liveTargets) const
 {
     VkDevice d = device_.device();
 
-    // ---- Scene render passes (clear + load variants) ----
+    // ---- Scene render pass: clear (frame start) or load (after an effect) ----
     // 0: Color (sampleable) — finalLayout=SHADER_READ_ONLY so next effect/blit samples it
     // 1: Depth/stencil — preserved across segments via SHADER_READ_ONLY-ish layout? No —
     //    depth is written, not sampled. Keep it in DEPTH_STENCIL_ATTACHMENT_OPTIMAL.
-    VkAttachmentDescription sceneAtts[2] {};
+    // Attachments: [0] main colour, [1..N] render targets, [N+1] depth/stencil.
+    const uint32_t targetCount = static_cast<uint32_t>(targets_.size());
+    const uint32_t depthIndex   = 1 + targetCount;
+    std::vector<VkAttachmentDescription> sceneAtts(depthIndex + 1);
 
     // Color
     sceneAtts[0].format         = format_;
@@ -218,20 +282,40 @@ void SwapchainTarget::createRenderPasses()
     sceneAtts[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     sceneAtts[0].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    // Depth/stencil
-    sceneAtts[1].format         = VK_FORMAT_D32_SFLOAT_S8_UINT;
-    sceneAtts[1].samples        = VK_SAMPLE_COUNT_1_BIT;
-    sceneAtts[1].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-    sceneAtts[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-    sceneAtts[1].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    // Render targets: like the main colour, sampleable between scene passes.
+    // A DEAD one (not in liveTargets: nothing reads it again this frame) is
+    // neither cleared/loaded nor stored; its contents are undefined from here.
+    for (uint32_t i = 0; i < targetCount; ++i) {
+        const bool live = (liveTargets & (1u << i)) != 0;
+        auto& a = sceneAtts[1 + i];
+        a.format         = toVkFormat(targets_[i].format);
+        a.samples        = VK_SAMPLE_COUNT_1_BIT;
+        a.loadOp         = !live ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                         : clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        a.initialLayout  = live && !clear ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                          : VK_IMAGE_LAYOUT_UNDEFINED;
+        a.storeOp        = live ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        a.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        a.finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    }
 
-    VkAttachmentReference colorRef = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
-    VkAttachmentReference depthRef = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+    // Depth/stencil
+    sceneAtts[depthIndex].format         = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    sceneAtts[depthIndex].samples        = VK_SAMPLE_COUNT_1_BIT;
+    sceneAtts[depthIndex].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+    sceneAtts[depthIndex].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    sceneAtts[depthIndex].finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    std::vector<VkAttachmentReference> colorRefs(1 + targetCount);
+    for (uint32_t i = 0; i < colorRefs.size(); ++i)
+        colorRefs[i] = { i, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    VkAttachmentReference depthRef = { depthIndex, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
 
     VkSubpassDescription sub {};
     sub.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    sub.colorAttachmentCount    = 1;
-    sub.pColorAttachments       = &colorRef;
+    sub.colorAttachmentCount    = static_cast<uint32_t>(colorRefs.size());
+    sub.pColorAttachments       = colorRefs.data();
     sub.pDepthStencilAttachment = &depthRef;
 
     // -----------------------------------------------------------------
@@ -302,28 +386,37 @@ void SwapchainTarget::createRenderPasses()
 
     VkRenderPassCreateInfo rpci {};
     rpci.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    rpci.attachmentCount = 2;
-    rpci.pAttachments    = sceneAtts;
+    rpci.attachmentCount = static_cast<uint32_t>(sceneAtts.size());
+    rpci.pAttachments    = sceneAtts.data();
     rpci.subpassCount    = 1;
     rpci.pSubpasses      = &sub;
     rpci.dependencyCount = 2;
     rpci.pDependencies   = deps;
 
-    // Clear variant (frame start)
-    sceneAtts[0].loadOp        = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    sceneAtts[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    sceneAtts[1].loadOp        = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    sceneAtts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    sceneAtts[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    vkCreateRenderPass(d, &rpci, nullptr, &sceneRPClear_);
+    // Clear variant (frame start): the main colour, depth/stencil and every
+    // live target clear (each target to its own clear value, see
+    // Renderer::execute). Load variant (continuation after an effect): they
+    // load what the last scene pass stored.
+    sceneAtts[0].loadOp        = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+    sceneAtts[0].initialLayout = clear ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    sceneAtts[depthIndex].loadOp        = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+    sceneAtts[depthIndex].stencilLoadOp = sceneAtts[depthIndex].loadOp;
+    sceneAtts[depthIndex].initialLayout = clear ? VK_IMAGE_LAYOUT_UNDEFINED
+                                                : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    VkRenderPass rp = VK_NULL_HANDLE;
+    vkCreateRenderPass(d, &rpci, nullptr, &rp);
+    return rp;
+}
 
-    // Load variant (continuation after effect)
-    sceneAtts[0].loadOp        = VK_ATTACHMENT_LOAD_OP_LOAD;
-    sceneAtts[0].initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    sceneAtts[1].loadOp        = VK_ATTACHMENT_LOAD_OP_LOAD;
-    sceneAtts[1].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    sceneAtts[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    vkCreateRenderPass(d, &rpci, nullptr, &sceneRPLoad_);
+void SwapchainTarget::createRenderPasses()
+{
+    VkDevice d = device_.device();
+
+    // The scene passes with every target live; the variants with some dead
+    // are made on first use (sceneRenderPass).
+    const uint8_t all = static_cast<uint8_t>((1u << targets_.size()) - 1u);
+    sceneRPClear_ = createSceneRenderPass(true,  all);
+    sceneRPLoad_  = createSceneRenderPass(false, all);
 
     // ---- Effect render pass (color + depth/stencil) ------------------
     //
@@ -422,6 +515,16 @@ void SwapchainTarget::createRenderPasses()
 void SwapchainTarget::createSceneBuffers()
 {
     VkDevice d = device_.device();
+
+    // Render targets: one image each, shared by both frame slots (see
+    // RenderTarget::targets). Created before the framebuffers that use them.
+    targetImages_.clear();
+    for (auto& c : targets_)
+        targetImages_.emplace_back(device_.pool(), d, width_, height_, toVkFormat(c.format),
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    static std::atomic<uint64_t> generations { 0 };
+    targetsGeneration_ = ++generations;
+
     for (int i = 0; i < MAX_FRAMES; i++) {
         auto& sb = sceneBuffers_[i];
         sb.colorA = Image(device_.pool(), d, width_, height_, format_,
@@ -438,20 +541,23 @@ void SwapchainTarget::createSceneBuffers()
             VK_SAMPLE_COUNT_1_BIT,
             VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
 
-        // Scene framebuffers (color + depth). Clear and load variants share
-        // the same layout, so one framebuffer targets both.
-        VkImageView viewsA[2] = { sb.colorA.view(), sb.depthStencil.view() };
-        VkImageView viewsB[2] = { sb.colorB.view(), sb.depthStencil.view() };
+        // Scene framebuffers (color + targets + depth). Clear and load
+        // variants share the same layout, so one framebuffer targets both.
+        std::vector<VkImageView> viewsA { sb.colorA.view() };
+        std::vector<VkImageView> viewsB { sb.colorB.view() };
+        for (auto& ch : targetImages_) { viewsA.push_back(ch.view()); viewsB.push_back(ch.view()); }
+        viewsA.push_back(sb.depthStencil.view());
+        viewsB.push_back(sb.depthStencil.view());
         VkFramebufferCreateInfo fci {};
         fci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         fci.renderPass = sceneRPClear_; // compatible with sceneRPLoad_ too
-        fci.attachmentCount = 2;
+        fci.attachmentCount = static_cast<uint32_t>(viewsA.size());
         fci.width = width_;
         fci.height = height_;
         fci.layers = 1;
-        fci.pAttachments = viewsA;
+        fci.pAttachments = viewsA.data();
         vkCreateFramebuffer(d, &fci, nullptr, &sb.framebufferA);
-        fci.pAttachments = viewsB;
+        fci.pAttachments = viewsB.data();
         vkCreateFramebuffer(d, &fci, nullptr, &sb.framebufferB);
 
         // Effect framebuffers now also carry the shared depth/stencil
@@ -519,6 +625,7 @@ void SwapchainTarget::destroySceneBuffers()
         if (sb.samplerB     != VK_NULL_HANDLE) device_.bindings().free(sb.samplerB);
         sb = {};
     }
+    targetImages_.clear();   // after the framebuffers that referenced them
 }
 
 void SwapchainTarget::createSyncObjects()

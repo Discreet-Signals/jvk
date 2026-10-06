@@ -67,6 +67,12 @@ public:
     ResourceCaches& caches();
     void initCaches();
 
+    // Optional features enabled at device creation (when the GPU has them).
+    // Per-attachment blend state; render targets need it.
+    bool supportsIndependentBlend() const noexcept { return independentBlend_; }
+    // The block-compressed PixelFormats (BCn) for sampled textures.
+    bool supportsTextureCompressionBC() const noexcept { return textureCompressionBC_; }
+
     // ---- Device-lost latch -------------------------------------------------
     // Set when any submit / wait / acquire reports VK_ERROR_DEVICE_LOST (or a
     // fence wait times out — a wedged driver is indistinguishable from a lost
@@ -128,6 +134,8 @@ private:
     Memory::M  bindings_;
 
     std::atomic<bool> lost_ { false };
+    bool independentBlend_ = false;
+    bool textureCompressionBC_ = false;
 
     std::unique_ptr<ResourceCaches> caches_;
 

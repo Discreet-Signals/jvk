@@ -60,13 +60,17 @@ public:
     ClipPipeline(const ClipPipeline&) = delete;
     ClipPipeline& operator=(const ClipPipeline&) = delete;
 
+    // `targetCount`: render targets the scene pass carries besides the main
+    // colour (the clip pipelines write none of them, but must declare them).
     void init(Device& device,
               VkRenderPass sceneRenderPass,
               std::span<const uint32_t> vertSpv,
-              std::span<const uint32_t> fragSpv)
+              std::span<const uint32_t> fragSpv,
+              size_t targetCount = 0)
     {
         device_ = &device;
         VkDevice d = device.device();
+        targetCount_ = targetCount;
 
         // Set 0 — storage buffer binding that matches PathPipeline's ssbo
         // descriptor set layout exactly (identically defined = compatible
@@ -330,15 +334,14 @@ private:
         ds.front = so;
         ds.back  = so;
 
-        // Color writes OFF — we only touch the stencil.
-        VkPipelineColorBlendAttachmentState blend {};
-        blend.colorWriteMask = 0;
-        blend.blendEnable = VK_FALSE;
+        // Color writes OFF on every colour attachment (main colour and render
+        // targets) — we only touch the stencil.
+        std::vector<VkPipelineColorBlendAttachmentState> blends(1 + targetCount_, blendAttachment(Target::Blend::None));
 
         VkPipelineColorBlendStateCreateInfo cb {};
         cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1;
-        cb.pAttachments = &blend;
+        cb.attachmentCount = static_cast<uint32_t>(blends.size());
+        cb.pAttachments = blends.data();
 
         VkDynamicState dyn[] = {
             VK_DYNAMIC_STATE_VIEWPORT,
@@ -390,6 +393,7 @@ private:
 
     Device*               device_        = nullptr;
     VkPipelineLayout      layout_        = VK_NULL_HANDLE;
+    size_t                targetCount_    = 0;
     VkPipeline            pushPipeline_    = VK_NULL_HANDLE;
     VkPipeline            popPipeline_     = VK_NULL_HANDLE;
     VkPipeline            excludePipeline_ = VK_NULL_HANDLE;

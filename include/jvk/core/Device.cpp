@@ -612,7 +612,19 @@ bool Device::createLogicalDevice()
     for (auto& e : available)
         if (strcmp(e.extensionName, "VK_KHR_portability_subset") == 0) { exts.push_back("VK_KHR_portability_subset"); break; }
 
+    // Opt in to the optional features jvk can use, where the GPU has them.
+    // independentBlend: per-attachment blend state, which render targets
+    // need (built-in draws leave every target untouched while writing the
+    // main colour). Every desktop GPU and MoltenVK report it.
+    // textureCompressionBC: the BCn PixelFormats, for sampled textures.
+    VkPhysicalDeviceFeatures supported {};
+    vkGetPhysicalDeviceFeatures(physDevice_, &supported);
     VkPhysicalDeviceFeatures features {};
+    features.independentBlend = supported.independentBlend;
+    independentBlend_ = supported.independentBlend == VK_TRUE;
+    features.textureCompressionBC = supported.textureCompressionBC;
+    textureCompressionBC_ = supported.textureCompressionBC == VK_TRUE;
+
     VkDeviceCreateInfo ci {};
     ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     ci.queueCreateInfoCount = static_cast<uint32_t>(qcis.size());

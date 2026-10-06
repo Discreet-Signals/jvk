@@ -327,7 +327,12 @@ public:
         createBlackPixel();
     }
 
-    ~ResourceCaches() = default;
+    ~ResourceCaches()
+    {
+        // Before blackPixel_ (a member) destroys the image this view looks at.
+        if (blackPixelArrayView_ != VK_NULL_HANDLE)
+            vkDestroyImageView(device_.device(), blackPixelArrayView_, nullptr);
+    }
 
     Cache<uint64_t, CachedImage>&      textures()      { return textures_; }
 
@@ -510,6 +515,9 @@ public:
     VkDescriptorSet defaultDescriptor() const { return blackPixel_.descriptorSet; }
     VkImageView     defaultImageView() const { return blackPixel_.image.view(); }
     VkSampler       defaultSampler()   const { return blackPixel_.image.sampler(); }
+    // The same black pixel as a one-layer 2D ARRAY view: the default for an
+    // unbound `sampler2DArray` binding (a 2D view there is a type mismatch).
+    VkImageView     defaultArrayImageView() const { return blackPixelArrayView_; }
 
     void beginFrame(uint64_t frameId)
     {
@@ -528,6 +536,7 @@ private:
     Device& device_;
     Cache<uint64_t, CachedImage>    textures_;
     CachedImage                     blackPixel_;
+    VkImageView                     blackPixelArrayView_ = VK_NULL_HANDLE;
     uint64_t currentFrame_ = 0;
 
     void createBlackPixel()
@@ -543,6 +552,16 @@ private:
 
         Memory::M::writeImage(vkd, blackPixel_.descriptorSet, 0,
             blackPixel_.image.view(), blackPixel_.image.sampler());
+
+        if (blackPixel_.image.image() != VK_NULL_HANDLE) {
+            VkImageViewCreateInfo vi {};
+            vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            vi.image = blackPixel_.image.image();
+            vi.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+            vi.format = VK_FORMAT_R8G8B8A8_UNORM;
+            vi.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCreateImageView(vkd, &vi, nullptr, &blackPixelArrayView_);
+        }
 
         // Upload 1x1 black pixel via a one-shot command buffer with a SCOPED
         // staging buffer. This used to be the only user of Device::staging_ —

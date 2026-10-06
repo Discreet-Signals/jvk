@@ -68,6 +68,34 @@ public:
     }
 
     bool isVulkanEnabled() const { return vulkanEnabled_; }
+
+    // ===== Render targets ==================================================
+    //
+    // Extra per-pixel targets the frame draws into next to the main colour
+    // (see Target in PipelineConfig.h). None by default. Paint code selects
+    // one with jvk::Graphics::setTarget and draws into it with ordinary
+    // graphics calls; a jvk::Shader drawn later in paint reads them by
+    // declaring samplers with their names, and turns them into colour.
+    //
+    // FIXED WHILE VULKAN RUNS: every pipeline and jvk::Shader is built for one
+    // frame layout, so the set is declared before Vulkan starts (in the
+    // constructor: it starts at the first layout with a size) or while it is
+    // off (setVulkanEnabled(false)). A new set is a restart, and every Shader
+    // drawn in the old frame goes with it. While Vulkan runs this changes
+    // nothing and returns false. Targets the device can't carry are dropped
+    // when it starts: the frame's own set is RenderTarget::targets().
+    bool setTargets(std::vector<Target> targets)
+    {
+        if (target_ != nullptr) {
+            jassertfalse;   // Vulkan is running: setVulkanEnabled(false) first
+            return false;
+        }
+        targets_ = std::move(targets);
+        return true;
+    }
+    // The targets declared with setTargets.
+    const std::vector<Target>& getTargets() const { return targets_; }
+
     // Reports whether a usable Vulkan device was acquired at construction.
     // `false` means the runtime has no MoltenVK / ICD or the GPU can't
     // expose a compatible device — callers should fall back to JUCE's
@@ -503,7 +531,8 @@ private:
         // nativeWindow lets the target pin surface-size queries, acquire and
         // present to the window's own DPI-awareness context — every thread
         // then sees the same physical size (see SurfaceDpiScope).
-        target_ = std::make_unique<SwapchainTarget>(*device_, surface, w, h, nativeWindow);
+        target_ = std::make_unique<SwapchainTarget>(*device_, surface, w, h, nativeWindow,
+                                                    VK_PRESENT_MODE_FIFO_KHR, targets_);
         renderer_ = std::make_unique<Renderer>(*device_, *target_);
         registerPipelines();
         diag::log("swapchain " + juce::String((int) target_->width()) + "x" + juce::String((int) target_->height())
@@ -589,7 +618,8 @@ private:
         // variants (normal + clip) on first draw, against the scene RP
         // captured here.
         shaderPipeline_ = std::make_unique<ShaderPipeline>();
-        shaderPipeline_->init(*device_, target_->sceneRenderPassClear());
+        shaderPipeline_->init(*device_, target_->sceneRenderPassClear(), VK_SAMPLE_COUNT_1_BIT,
+                              target_->targets(), target_->effectRenderPass());
         renderer_->setShaderPipeline(shaderPipeline_.get());
 
         // Analytical-SDF path renderer. Owns a per-frame storage-buffer
@@ -599,7 +629,8 @@ private:
         pathPipeline_->init(*device_,
             target_->sceneRenderPassClear(),
             spv(path_sdf_vert_spv, path_sdf_vert_spvSize),
-            spv(path_sdf_frag_spv, path_sdf_frag_spvSize));
+            spv(path_sdf_frag_spv, path_sdf_frag_spvSize),
+            target_->targets());
         renderer_->setPathPipeline(pathPipeline_.get());
 
         // Path-aware blur — reuses PathPipeline's per-frame segment SSBO
@@ -621,7 +652,8 @@ private:
         clipPipeline_->init(*device_,
             target_->sceneRenderPassClear(),
             spv(clip_vert_spv, clip_vert_spvSize),
-            spv(clip_frag_spv, clip_frag_spvSize));
+            spv(clip_frag_spv, clip_frag_spvSize),
+            target_->targets().size());
         renderer_->setClipPipeline(clipPipeline_.get());
     }
 
@@ -675,6 +707,9 @@ private:
     std::unique_ptr<ClipPipeline>                     clipPipeline_;
 
     RenderTimer renderTimer_;
+
+    // Render targets (setTargets): fixed while Vulkan runs.
+    std::vector<Target> targets_;
     bool vulkanEnabled_ = true;
     bool vulkanAvailable_ = false;
 };

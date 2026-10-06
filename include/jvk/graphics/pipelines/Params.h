@@ -168,10 +168,24 @@ struct DrawLineParams {
     float                  scale;
 };
 
+// Per-draw constants a jvk::Shader can take (Shader::setDrawConstants): copied
+// into each draw at record time, pushed at replay after jvk's own 8 floats.
+// 24 floats + 32 bytes = 128 bytes, the push-constant size every device has.
+static constexpr int kShaderDrawConstants = 24;
+
 struct DrawShaderParams {
     void*                  shader; // Shader*
     juce::Rectangle<float> region;
     float                  scale;
+    // What the shader does with the frame's targets (bit i = target i),
+    // captured at record: reads them (a reader runs as its own pass, and sets
+    // their lifetimes: Renderer::noteTargetsRead), writes them (declared
+    // output locations 1..N), writes the main colour (location 0).
+    uint8_t                targetsRead    = 0;
+    uint8_t                targetsWritten = 0;
+    bool                   writesMain     = true;
+    uint32_t               constantCount = 0;
+    float                  constants[kShaderDrawConstants] {};
 };
 
 // Analytical SDF path fill, TILE mode (see path_sdf.frag). Graphics::fillPath

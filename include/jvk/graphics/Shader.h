@@ -41,23 +41,45 @@ public:
                 b.sampler   = tc->image.sampler();
                 b.bound     = true;
 
-                // If the shader is already live, updating descriptorSet_
-                // races against any command buffer that bound it and is
-                // still pending on the GPU (Vulkan §14.2.1 UB — the
-                // layout was created without UPDATE_AFTER_BIND_BIT, so
-                // the binding is "statically used"). Gate the write on
-                // GPU idle. Heavy-handed (one stall per rebind) but
-                // correct without requiring descriptor-indexing feature
-                // setup. If dynamic per-frame rebinding becomes a
-                // perf issue, switch to UPDATE_AFTER_BIND_BIT on
-                // Memory::M's image-sampler layout + pool, or
-                // double-buffer descriptorSet_ per frame slot.
-                if (created_ && descriptorSet_ != VK_NULL_HANDLE) {
-                    const juce::ScopedLock queueSync(Renderer::queueLock());
-                    vkDeviceWaitIdle(device_->device());
-                    Memory::M::writeImage(device_->device(), descriptorSet_,
-                                          b.binding, b.imageView, b.sampler);
-                }
+                // If the shader is already live, rewriting its descriptor
+                // sets races against any command buffer that bound them and
+                // is still pending on the GPU (Vulkan §14.2.1 UB — the
+                // layout was created without UPDATE_AFTER_BIND_BIT, so the
+                // binding is "statically used"). rewriteLiveImage gates the
+                // write on GPU idle. Heavy-handed (one stall per rebind) but
+                // correct without descriptor-indexing feature setup. If
+                // dynamic per-frame rebinding becomes a perf issue, switch
+                // to UPDATE_AFTER_BIND_BIT on Memory::M's image-sampler
+                // layout + pool.
+                rewriteLiveImage(b);
+                return;
+            }
+        }
+    }
+
+    // GPU-resident image bindings: an Image the caller created and fills on
+    // the GPU (Renderer::initializeImage + uploadRegion), for example a
+    // texture array or an atlas page. Nothing is copied and nothing goes
+    // through the shared cache. The view type must match the binding: a
+    // `sampler2DArray` needs an Image made with Shape::arrayView (or more
+    // than one layer).
+    //
+    // The CALLER owns `image` and keeps it alive while this Shader can still
+    // draw with it: destroy it after the Shader, or hand it to
+    // Renderer::retire(), which waits out the frames in flight. Binding once
+    // before the first draw is free; rebinding a live Shader costs the same
+    // device-idle as set(name, juce::Image).
+    void set(const juce::String& name, const Image& image)
+    {
+        if (image.view() == VK_NULL_HANDLE || image.sampler() == VK_NULL_HANDLE) return;
+        for (auto& b : bindings_) {
+            if (b.name == name && b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                jassert (b.arrayed == image.isArray());   // sampler2DArray ↔ array view, sampler2D ↔ 2D view
+                if (b.pinnedTexture) { b.pinnedTexture->unpin(); b.pinnedTexture = nullptr; }
+                b.imageView = image.view();
+                b.sampler   = image.sampler();
+                b.bound     = true;
+                rewriteLiveImage(b);
                 return;
             }
         }
@@ -121,12 +143,7 @@ public:
                 // Same idle-gated one-off write as set() — see the comment
                 // there. Only hit when the shader is already live AND the
                 // source was resized; steady-state frames never enter here.
-                if (created_ && descriptorSet_ != VK_NULL_HANDLE) {
-                    const juce::ScopedLock queueSync(Renderer::queueLock());
-                    vkDeviceWaitIdle(device.device());
-                    Memory::M::writeImage(device.device(), descriptorSet_,
-                                          b.binding, b.imageView, b.sampler);
-                }
+                rewriteLiveImage(b);
             }
 
             // Stage this frame's pixels and queue the copy into the frame's
@@ -173,7 +190,114 @@ public:
         }
     }
 
-    void ensureCreated(Device& device, VkRenderPass renderPass, VkSampleCountFlagBits msaa)
+    // ===== Per-draw constants ================================================
+    //
+    // Up to 24 floats that belong to ONE draw: Graphics::drawShader copies
+    // what was set last into the draw it records, so one Shader can be drawn
+    // many times in a frame with different values (an atlas drawn at several
+    // places, each with its own cell). Uniform blocks set with set() are per shader
+    // instead: every draw of a frame sees the last value. The shader reads the
+    // constants from its push-constant block, after jvk's own eight floats:
+    //
+    //   layout(push_constant) uniform PC {
+    //       float resolutionX, resolutionY, time, viewportW, viewportH,
+    //             regionX, regionY, reserved;           // jvk's, bytes 0..31
+    //       vec4  frame;                                // the draw's: bytes 32..
+    //       ...                                         //   up to 24 floats
+    //   } pc;
+    static constexpr uint32_t kDrawConstantsOffset = 32;
+
+    void setDrawConstants (std::span<const float> values)
+    {
+        jassert (values.size() <= static_cast<size_t>(kShaderDrawConstants));
+        drawConstantCount_ = static_cast<uint32_t>(std::min(values.size(), static_cast<size_t>(kShaderDrawConstants)));
+        std::copy_n(values.begin(), drawConstantCount_, drawConstants_.begin());
+    }
+    std::span<const float> drawConstants() const { return { drawConstants_.data(), drawConstantCount_ }; }
+
+    // ===== Reading targets ===================================================
+    //
+    // A shader reads a target by declaring a sampler2D with the target's name
+    // (`layout(binding = n) uniform sampler2D normal;`). Drawn inline with
+    // Graphics::drawShader, such a shader runs as ITS OWN PASS at that point
+    // in paint order: it sees everything drawn into the targets before it,
+    // and writes the main colour only (location 0, blended Over; the clip
+    // still applies). jvk binds the targets when the draw is recorded and
+    // rebinds them when the window resizes; nothing to set by hand.
+    // A shader reads THE SCENE, the main colour as painted so far, by declaring
+    // `layout(set = 1, binding = 0) uniform sampler2D scene;`. It then runs as
+    // its own pass too and REPLACES the main colour inside its region with
+    // what it outputs: it has the scene to blend with itself, so a scene
+    // reader that changes nothing outputs texture(scene, ...) (a lighting
+    // pass, a colour grade, a distortion). The clip still applies.
+    bool readsScene() const { return readsScene_; }
+
+    // The targets of `rt` this shader samples, by sampler name (bit i =
+    // target i). Worked out once per set of target images (targetsGeneration),
+    // not per draw.
+    uint8_t targetsRead (const RenderTarget& rt)
+    {
+        if (rt.targetsGeneration() != readMaskGeneration_) {
+            readMask_ = 0;
+            const auto& targets = rt.targets();
+            for (size_t i = 0; i < targets.size() && i < 8; ++i) {
+                const auto name = targets[i].name.toString();
+                for (auto& b : bindings_)
+                    if (b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && !b.arrayed && b.name == name)
+                        readMask_ |= static_cast<uint8_t>(1u << i);
+            }
+            readMaskGeneration_ = rt.targetsGeneration();
+        }
+        return readMask_;
+    }
+
+    // The targets this shader writes (bit i = target i: it declares output
+    // location i + 1), of the `targetCount` its pass carries.
+    uint8_t targetsWritten (size_t targetCount) const
+    {
+        uint8_t mask = 0;
+        for (auto location : outputLocations_)
+            if (location >= 1 && location <= targetCount && location <= 8)
+                mask |= static_cast<uint8_t>(1u << (location - 1));
+        return mask;
+    }
+
+    // Whether it writes the main colour: location 0, or no declared output.
+    bool writesMain() const { return writesLocation(0) || outputLocations_.empty(); }
+
+    // Message thread, while recording (the render worker is idle): points each
+    // sampler named after a target at that target's current image whenever
+    // the target images were recreated since the last bind (the first draw, a
+    // resize, a new set of targets, another window). Keyed on the target's
+    // generation, never on handle values: a recreated image can reuse them.
+    void bindTargets (const RenderTarget& rt)
+    {
+        if (rt.targetsGeneration() == boundTargetsGeneration_) return;
+        const auto& targets = rt.targets();
+        std::vector<const BindingInfo*> rewritten;
+        for (size_t i = 0; i < targets.size(); ++i) {
+            const Image* image = rt.targetImage(i);
+            if (image == nullptr) continue;
+            const auto name = targets[i].name.toString();
+            for (auto& b : bindings_) {
+                if (b.type != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b.arrayed || b.name != name)
+                    continue;
+                if (b.pinnedTexture) { b.pinnedTexture->unpin(); b.pinnedTexture = nullptr; }
+                b.imageView = image->view();
+                b.sampler   = image->sampler();
+                b.bound     = true;
+                rewritten.push_back(&b);
+            }
+        }
+        rewriteLiveImages(rewritten);
+        boundTargetsGeneration_ = rt.targetsGeneration();
+    }
+
+    // `targets`: the render targets of the pass this shader draws in. Each
+    // output location i + 1 the shader declares writes target i with that
+    // target's Blend; targets it doesn't declare are left untouched.
+    void ensureCreated(Device& device, VkRenderPass renderPass, VkSampleCountFlagBits msaa,
+                       const std::vector<Target>& targets = {})
     {
         if (created_) return;
         device_ = &device;
@@ -195,27 +319,38 @@ public:
                 static_cast<uint32_t>(layoutBindings.size()));
             if (layoutId_ == Memory::M::kInvalidLayout)
                 return; // created_ stays false — dispatch keeps gating on isReady()
-            descriptorSet_ = device.bindings().alloc(layoutId_);
-            if (descriptorSet_ == VK_NULL_HANDLE)
-                return;
+            // One descriptor set per frame-in-flight slot: they differ only in
+            // which slice of the uniform/storage buffer they point at (below).
+            for (auto& set : descriptorSets_) {
+                set = device.bindings().alloc(layoutId_);
+                if (set == VK_NULL_HANDLE)
+                    return;   // ~Shader frees whichever sets were allocated
+            }
             setLayout = device.bindings().getLayout(layoutId_);
 
             // Bind defaults (1x1 black pixel) for unset image bindings so the
-            // descriptor slot is never sampled uninitialized.
+            // descriptor slot is never sampled uninitialized. A sampler2DArray
+            // binding gets the array view of the same pixel.
             for (auto& b : bindings_) {
                 if (!b.bound && b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-                    b.imageView = device.caches().defaultImageView();
+                    b.imageView = b.arrayed ? device.caches().defaultArrayImageView()
+                                            : device.caches().defaultImageView();
                     b.sampler   = device.caches().defaultSampler();
                 }
             }
 
             // Back the reflected uniform/storage blocks with one host-visible
-            // coherent VkBuffer sized to the total reflected block bytes (the
-            // same total `uniformData_` is sized for). Each UBO/SSBO binding
-            // gets a descriptor write pointing at its slice via offset+range.
-            // Per-draw we memcpy uniformData_ → mapped pointer in
-            // ShaderPipeline::dispatch so set(name, value) reaches the GPU.
-            const VkDeviceSize bufferSize = uniformData_.size() * sizeof(float);
+            // coherent VkBuffer holding one SLICE PER FRAME SLOT, each sized
+            // to the total reflected block bytes (the same total `uniformData_`
+            // is sized for). Each slot's descriptor set points its UBO/SSBO
+            // bindings into its own slice. Per draw, ShaderPipeline::dispatch
+            // memcpys uniformData_ into the slice of the frame slot being
+            // recorded. With one shared slice (the old layout), that copy
+            // overwrote data the GPU could still be reading for the previous
+            // frame, which is still in flight.
+            const VkDeviceSize blockBytes = uniformData_.size() * sizeof(float);
+            slotStride_ = (blockBytes + kBlockAlign - 1) / kBlockAlign * kBlockAlign;
+            const VkDeviceSize bufferSize = slotStride_ * kSlots;
             if (bufferSize > 0) {
                 VkBufferCreateInfo bci {};
                 bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -243,43 +378,47 @@ public:
                 vkMapMemory(d, uniformMemory_, 0, bufferSize, 0, &uniformMapped_);
 
                 // Initial copy so any set() calls made before ensureCreated
-                // are visible on the GPU's first read.
-                std::memcpy(uniformMapped_, uniformData_.data(), bufferSize);
+                // are visible on the GPU's first read, whichever slot it is.
+                for (int s = 0; s < kSlots; ++s)
+                    std::memcpy(static_cast<char*>(uniformMapped_) + slotStride_ * s,
+                                uniformData_.data(), blockBytes);
             }
 
-            // Wire the descriptor set: one write per binding so the shader
-            // sees its UBO/SSBO buffers and image samplers as soon as it's
-            // bound. Image bindings either use the user-supplied descriptor
-            // (set via set(name, image, caches)) or the default 1x1 fallback.
+            // Wire the descriptor sets: one write per binding per slot so the
+            // shader sees its UBO/SSBO buffers and image samplers as soon as
+            // it's bound. Image bindings either use the user-supplied
+            // descriptor (set()/update()) or the default 1x1 fallback.
             std::vector<VkWriteDescriptorSet>   writes;
             std::vector<VkDescriptorBufferInfo> bufferInfos;
             std::vector<VkDescriptorImageInfo>  imageInfos;
-            bufferInfos.reserve(bindings_.size());
-            imageInfos.reserve(bindings_.size());
-            for (auto& b : bindings_) {
-                if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
-                    b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
-                    bufferInfos.push_back({ uniformBuffer_, b.offsetInBuffer, b.sizeInBuffer });
-                    VkWriteDescriptorSet w {};
-                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                    w.dstSet = descriptorSet_;
-                    w.dstBinding = b.binding;
-                    w.descriptorType = b.type;
-                    w.descriptorCount = 1;
-                    w.pBufferInfo = &bufferInfos.back();
-                    writes.push_back(w);
-                }
-                else if (b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-                    imageInfos.push_back({ b.sampler, b.imageView,
-                                           VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
-                    VkWriteDescriptorSet w {};
-                    w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                    w.dstSet = descriptorSet_;
-                    w.dstBinding = b.binding;
-                    w.descriptorType = b.type;
-                    w.descriptorCount = 1;
-                    w.pImageInfo = &imageInfos.back();
-                    writes.push_back(w);
+            bufferInfos.reserve(bindings_.size() * kSlots);   // pointers into these stay valid
+            imageInfos.reserve(bindings_.size() * kSlots);
+            for (int s = 0; s < kSlots; ++s) {
+                for (auto& b : bindings_) {
+                    if (b.type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+                        b.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                        bufferInfos.push_back({ uniformBuffer_, slotStride_ * s + b.offsetInBuffer, b.sizeInBuffer });
+                        VkWriteDescriptorSet w {};
+                        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                        w.dstSet = descriptorSets_[s];
+                        w.dstBinding = b.binding;
+                        w.descriptorType = b.type;
+                        w.descriptorCount = 1;
+                        w.pBufferInfo = &bufferInfos.back();
+                        writes.push_back(w);
+                    }
+                    else if (b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                        imageInfos.push_back({ b.sampler, b.imageView,
+                                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL });
+                        VkWriteDescriptorSet w {};
+                        w.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                        w.dstSet = descriptorSets_[s];
+                        w.dstBinding = b.binding;
+                        w.descriptorType = b.type;
+                        w.descriptorCount = 1;
+                        w.pImageInfo = &imageInfos.back();
+                        writes.push_back(w);
+                    }
                 }
             }
             if (!writes.empty())
@@ -314,18 +453,30 @@ public:
         }
 
         // Push constant layout mirrors shader_region.vert:
-        //   bytes  0..11 — resolution (vec2) + time (float) — vertex + fragment
-        //   bytes 12..27 — viewport (vec2) + region origin (vec2) — vertex only
-        // One unified range covers both stages; fragment just reads the head.
+        //   bytes   0..11  — resolution (vec2) + time (float) — vertex + fragment
+        //   bytes  12..27  — viewport (vec2) + region origin (vec2) — vertex only
+        //   bytes  32..127 — the draw's constants (setDrawConstants), fragment
+        // One unified range covers both stages; each reads what it declares.
         VkPushConstantRange pushRange {
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(float) * 7
+            0, kDrawConstantsOffset + sizeof(float) * kShaderDrawConstants
         };
 
         VkPipelineLayoutCreateInfo pli {};
         pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pli.setLayoutCount = (setLayout != VK_NULL_HANDLE) ? 1u : 0u;
-        pli.pSetLayouts = (setLayout != VK_NULL_HANDLE) ? &setLayout : nullptr;
+        // A scene reader's set 1 is the scene's sampler, the IMAGE_SAMPLER layout of the
+        // descriptor sets jvk keeps for each half of the scene (bound per draw at replay).
+        // Its set 0, when it declares no bindings of its own, borrows that layout too.
+        VkDescriptorSetLayout setLayouts[2] = { setLayout, VK_NULL_HANDLE };
+        uint32_t setCount = (setLayout != VK_NULL_HANDLE) ? 1u : 0u;
+        if (readsScene_) {
+            VkDescriptorSetLayout sceneLayout = device.bindings().getLayout(Memory::M::IMAGE_SAMPLER);
+            if (setLayouts[0] == VK_NULL_HANDLE) setLayouts[0] = sceneLayout;
+            setLayouts[1] = sceneLayout;
+            setCount = 2;
+        }
+        pli.setLayoutCount = setCount;
+        pli.pSetLayouts = setCount > 0 ? setLayouts : nullptr;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pushRange;
         vkCreatePipelineLayout(d, &pli, nullptr, &layout_);
@@ -362,21 +513,22 @@ public:
         ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
         ms.rasterizationSamples = msaa;
 
-        VkPipelineColorBlendAttachmentState blend {};
-        blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-        blend.blendEnable = VK_TRUE;
-        blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-        blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        blend.colorBlendOp = VK_BLEND_OP_ADD;
-        blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-        blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-        blend.alphaBlendOp = VK_BLEND_OP_ADD;
+        // Location 0: the main colour, blended Over (replaced by a shader that
+        // reads the scene: what it writes is the colour it read, modified). Locations 1..N: the pass's render targets, each
+        // with its declared Blend where this shader writes it, untouched where
+        // it doesn't. A shader with no location-0 output leaves the main
+        // colour untouched too.
+        std::vector<VkPipelineColorBlendAttachmentState> blends(1 + targets.size(), blendAttachment(Target::Blend::None));
+        if (writesMain())
+            blends[0] = blendAttachment(readsScene_ ? Target::Blend::Replace : Target::Blend::Over);
+        for (size_t i = 0; i < targets.size(); ++i)
+            if (writesLocation(static_cast<uint32_t>(i + 1)))
+                blends[1 + i] = blendAttachment(targets[i].blend);
 
         VkPipelineColorBlendStateCreateInfo cb {};
         cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1;
-        cb.pAttachments = &blend;
+        cb.attachmentCount = static_cast<uint32_t>(blends.size());
+        cb.pAttachments = blends.data();
 
         // Stencil reference is pushed per-draw (= current clip depth). We
         // no longer mask bits per-level — stencilCompareMask stays at the
@@ -437,6 +589,10 @@ public:
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);
 
+        builtFor_.clear();
+        for (auto& t : targets)
+            builtFor_.push_back(t.format);
+
         // Only a fully-built shader is ready. The old code set created_
         // unconditionally, so a failed vkCreateGraphicsPipelines still
         // reported isReady() and dispatch bound VK_NULL_HANDLE.
@@ -446,18 +602,39 @@ public:
 
     bool isReady() const { return created_; }
 
+    // True when the pipeline was built for a pass carrying exactly these
+    // targets (by format, which is what makes two passes compatible). A
+    // Shader builds once, for the first pass it draws in, and drawing it in
+    // a pass of another layout is invalid Vulkan: targets are fixed while
+    // Vulkan runs, so a new set means new Shaders (AudioProcessorEditor::
+    // setTargets).
+    bool isBuiltFor (const std::vector<Target>& targets) const
+    {
+        return std::equal(builtFor_.begin(), builtFor_.end(), targets.begin(), targets.end(),
+                          [](PixelFormat f, const Target& t) { return f == t.format; });
+    }
+
+    // Frame-in-flight slots, matching the Renderer's. Each slot has its own
+    // descriptor set and its own slice of the uniform/storage buffer.
+    static constexpr int kSlots = 2;
+
     VkPipeline       pipeline()      const { return pipeline_; }
     VkPipeline       clipPipeline()  const { return clipPipeline_ ? clipPipeline_ : pipeline_; }
     VkPipelineLayout layout()        const { return layout_; }
-    VkDescriptorSet  descriptorSet() const { return descriptorSet_; }
+    VkDescriptorSet  descriptorSet (int frameSlot) const { return descriptorSets_[slotIndex (frameSlot)]; }
 
     const float* uniformData()   const { return uniformData_.data(); }
     size_t       uniformSize()   const { return uniformData_.size() * sizeof(float); }
-    // Persistently-mapped pointer to the GPU-visible uniform/storage buffer
-    // backing every reflected block. Null if the shader declared no UBO/SSBO
-    // bindings. ShaderPipeline::dispatch memcpys uniformData_ into this each
-    // draw so set(name, value) propagates to the GPU.
-    void*        uniformMapped() const { return uniformMapped_; }
+    // Persistently-mapped pointer to this frame slot's slice of the
+    // GPU-visible uniform/storage buffer backing every reflected block. Null
+    // if the shader declared no UBO/SSBO bindings. ShaderPipeline::dispatch
+    // memcpys uniformData_ into it each draw so set(name, value) reaches the
+    // GPU without touching a slice an earlier frame is still reading.
+    void* uniformMapped (int frameSlot) const
+    {
+        return uniformMapped_ == nullptr ? nullptr
+             : static_cast<char*>(uniformMapped_) + slotStride_ * slotIndex (frameSlot);
+    }
 
     ~Shader() override
     {
@@ -497,7 +674,8 @@ public:
         if (pipeline_       != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_,     nullptr);
         if (clipPipeline_   != VK_NULL_HANDLE) vkDestroyPipeline(d, clipPipeline_, nullptr);
         if (layout_         != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
-        if (descriptorSet_  != VK_NULL_HANDLE) device_->bindings().free(descriptorSet_);
+        for (auto set : descriptorSets_)
+            if (set != VK_NULL_HANDLE) device_->bindings().free(set);
         if (layoutId_ != Memory::M::kInvalidLayout)
             device_->bindings().unregisterLayout(layoutId_);
     }
@@ -513,8 +691,9 @@ private:
         VkImageView      imageView = VK_NULL_HANDLE;
         VkSampler        sampler   = VK_NULL_HANDLE;
         bool             bound = false;
+        bool             arrayed = false;   // an image binding declared as an array (sampler2DArray)
         // Durable pin on the shared-cache CachedImage whose view+sampler
-        // are baked into this Shader's descriptorSet_. Without this, the
+        // are baked into this Shader's descriptor sets. Without this, the
         // cache's 120-frame LRU could evict the entry (no one re-hits
         // getTexture for a Shader-bound image — drawShader only binds the
         // Shader's own descriptor set), freeing the VkImage/View/Sampler
@@ -552,7 +731,13 @@ private:
         spvReflectEnumerateDescriptorBindings(&module, &count, reflBindings.data());
 
         uint32_t bufferOffset = 0;
+        readsScene_ = false;
         for (auto* rb : reflBindings) {
+            if (rb->set == 1) {   // set 1, binding 0: the scene (readsScene); jvk binds it
+                readsScene_ = readsScene_
+                    || (rb->binding == 0 && rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+                continue;
+            }
             BindingInfo info;
             // Use CharPointer_UTF8 rather than the raw-char-ptr String ctor so
             // we sidestep juce_String.cpp:327's ASCII-validity jassert — SPIRV-
@@ -565,6 +750,8 @@ private:
                 info.blockName = juce::String(juce::CharPointer_UTF8(rb->type_description->type_name));
             info.binding = rb->binding;
             info.type = static_cast<VkDescriptorType>(rb->descriptor_type);
+            if (rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                info.arrayed = rb->image.arrayed != 0;
 
             if (rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
                 rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
@@ -579,6 +766,13 @@ private:
                     const auto& last = rb->block.members[rb->block.member_count - 1];
                     blockSize = last.offset + (last.padded_size != 0 ? last.padded_size : last.size);
                 }
+                // Every block starts on a kBlockAlign boundary: a descriptor's
+                // buffer offset must be a multiple of the device's
+                // min{Uniform,Storage}BufferOffsetAlignment, which the spec
+                // caps at 256. Packed back to back, a second block (say a
+                // 176-byte block followed by another) landed on an offset
+                // most devices reject.
+                bufferOffset        = (bufferOffset + kBlockAlign - 1) / kBlockAlign * kBlockAlign;
                 info.offsetInBuffer = bufferOffset;
                 info.sizeInBuffer   = blockSize;
                 bufferOffset       += blockSize;
@@ -586,34 +780,104 @@ private:
             bindings_.push_back(std::move(info));
         }
 
-        uniformData_.resize(bufferOffset / sizeof(float), 0.0f);
+        uniformData_.resize((bufferOffset + sizeof(float) - 1) / sizeof(float), 0.0f);
+
+        // Fragment outputs: which colour locations this shader writes
+        // (location 0 = main colour, i + 1 = render target i). An output
+        // array covers consecutive locations.
+        outputLocations_.clear();
+        uint32_t outCount = 0;
+        spvReflectEnumerateOutputVariables(&module, &outCount, nullptr);
+        std::vector<SpvReflectInterfaceVariable*> outs(outCount);
+        spvReflectEnumerateOutputVariables(&module, &outCount, outs.data());
+        for (auto* v : outs) {
+            if (v == nullptr || (v->decoration_flags & SPV_REFLECT_DECORATION_BUILT_IN) != 0) continue;
+            const uint32_t n = v->array.dims_count > 0 ? std::max(1u, v->array.dims[0]) : 1u;
+            for (uint32_t k = 0; k < n; ++k)
+                outputLocations_.push_back(v->location + k);
+        }
+
         spvReflectDestroyShaderModule(&module);
+    }
+
+    bool writesLocation (uint32_t location) const
+    {
+        return std::find(outputLocations_.begin(), outputLocations_.end(), location) != outputLocations_.end();
+    }
+
+    // The largest min{Uniform,Storage}BufferOffsetAlignment the spec allows.
+    static constexpr VkDeviceSize kBlockAlign = 256;
+
+    static int slotIndex (int frameSlot) { return ((frameSlot % kSlots) + kSlots) % kSlots; }
+
+    // A binding's image changed on a Shader that is already live: write it
+    // into every slot's descriptor set. The sets were created without
+    // UPDATE_AFTER_BIND, so a command buffer still pending on the GPU may
+    // reference them (Vulkan §14.2.1); gate the write on device idle. Heavy
+    // handed, one stall per rebind, so bind before the first draw where you
+    // can.
+    void rewriteLiveImage (const BindingInfo& b) { rewriteLiveImages({ &b }); }
+
+    // Every slot's descriptor set at once, after ONE device idle: a set may
+    // still be in use by a frame in flight.
+    void rewriteLiveImages (const std::vector<const BindingInfo*>& changed)
+    {
+        if (!created_ || device_ == nullptr || changed.empty()) return;
+        const juce::ScopedLock queueSync(Renderer::queueLock());
+        vkDeviceWaitIdle(device_->device());
+        for (auto* b : changed)
+            for (auto set : descriptorSets_)
+                if (set != VK_NULL_HANDLE)
+                    Memory::M::writeImage(device_->device(), set, b->binding, b->imageView, b->sampler);
     }
 
     std::vector<BindingInfo>  bindings_;
     std::vector<uint32_t>     spirv_;
     std::vector<float>        uniformData_;
+    std::vector<uint32_t>     outputLocations_;     // reflected fragment output locations
+    std::vector<PixelFormat>  builtFor_;            // the targets of the pass the pipeline was built for
+    std::array<float, kShaderDrawConstants> drawConstants_ {};   // setDrawConstants
+    uint32_t                  drawConstantCount_ = 0;
+    uint64_t                  boundTargetsGeneration_ = 0;   // bindTargets: the targets the samplers point at
+    uint64_t                  readMaskGeneration_ = ~uint64_t(0);   // targetsRead: the targets readMask_ is for
+    uint8_t                   readMask_ = 0;
+    bool                      readsScene_ = false;            // set 1, binding 0: the scene (readsScene)
 
     Device*          device_        = nullptr;
     VkPipeline       pipeline_      = VK_NULL_HANDLE;
     VkPipeline       clipPipeline_  = VK_NULL_HANDLE;
     VkPipelineLayout layout_        = VK_NULL_HANDLE;
-    VkDescriptorSet  descriptorSet_ = VK_NULL_HANDLE;
+    VkDescriptorSet  descriptorSets_[kSlots] = {};
     // kInvalidLayout = "never registered" — the old default of 0 aliased
     // IMAGE_SAMPLER, so an unregister from a binding-less shader would have
     // decremented the shared built-in layout's refcount.
     Memory::M::LayoutID layoutId_   = Memory::M::kInvalidLayout;
 
-    // Single host-visible coherent buffer backing every reflected UBO/SSBO
-    // block. NOTE: not double-buffered — fine for shaders drawn once per
-    // frame whose uniforms drift slowly (e.g. a `time` value); for shaders
-    // that draw multiple times per frame with different per-draw uniforms,
-    // a per-frame-slot ring would be needed to avoid GPU-vs-CPU races.
+    // One host-visible coherent buffer backing every reflected UBO/SSBO
+    // block, one slice (slotStride_ bytes) per frame slot, so a frame's copy
+    // never lands on data the GPU is still reading for the frame before.
+    // Within ONE frame the slice is still shared: a Shader drawn several
+    // times per frame gives every draw the values from the last set() before
+    // the frame executes.
     VkBuffer       uniformBuffer_ = VK_NULL_HANDLE;
     VkDeviceMemory uniformMemory_ = VK_NULL_HANDLE;
     void*          uniformMapped_ = nullptr;
+    VkDeviceSize   slotStride_    = 0;
 
     bool   created_   = false;
 };
+
+inline void Graphics::prepareShaderDraw(Shader& shader, DrawShaderParams& params)
+{
+    const auto& rt = renderer_.target();
+    params.targetsRead    = shader.targetsRead(rt);
+    params.targetsWritten = shader.targetsWritten(rt.targets().size());
+    params.writesMain     = shader.writesMain();
+    if (params.targetsRead != 0)
+        shader.bindTargets(rt);
+    const auto constants = shader.drawConstants();
+    params.constantCount = static_cast<uint32_t>(constants.size());
+    std::copy(constants.begin(), constants.end(), params.constants);
+}
 
 } // namespace jvk

@@ -3,20 +3,30 @@ namespace jvk {
 Pipeline::~Pipeline()
 {
     VkDevice d = device_.device();
-    if (pipeline_     != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_,     nullptr);
-    if (clipPipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(d, clipPipeline_, nullptr);
-    if (layout_       != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
+    variants_.destroy(d);
+    if (layout_ != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
 }
 
 Pipeline::Pipeline(Pipeline&& o) noexcept
-    : device_(o.device_), pipeline_(o.pipeline_), clipPipeline_(o.clipPipeline_),
-      layout_(o.layout_), vertSpirv_(std::move(o.vertSpirv_)),
-      fragSpirv_(std::move(o.fragSpirv_)), built_(o.built_)
+    : device_(o.device_), paintClearsTargets_(o.paintClearsTargets_),
+      variants_(std::move(o.variants_)),
+      layout_(o.layout_), renderPass_(o.renderPass_), targets_(std::move(o.targets_)),
+      vertSpirv_(std::move(o.vertSpirv_)), fragSpirv_(std::move(o.fragSpirv_)),
+      built_(o.built_), hasClip_(o.hasClip_)
 {
-    o.pipeline_     = VK_NULL_HANDLE;
-    o.clipPipeline_ = VK_NULL_HANDLE;
-    o.layout_       = VK_NULL_HANDLE;
-    o.built_        = false;
+    o.layout_ = VK_NULL_HANDLE;
+    o.built_  = false;
+}
+
+VkPipeline Pipeline::variant(uint8_t attachment, bool clip, uint8_t live)
+{
+    if (!built_) return VK_NULL_HANDLE;
+    clip = clip && hasClip_;   // no clip config: the normal variant serves both
+    const uint8_t clears = paintClears(targets_, attachment, paintClearsTargets_, live);
+    return variants_.get(attachment, clip, clears, targets_.size(), [&]
+    {
+        return buildVariant(clip ? *clipConfig() : config(), renderPass_, layout_, attachment, clears);
+    });
 }
 
 void Pipeline::loadVertexShader(std::span<const uint32_t> spirv)
@@ -29,10 +39,12 @@ void Pipeline::loadFragmentShader(std::span<const uint32_t> spirv)
     fragSpirv_.assign(spirv.begin(), spirv.end());
 }
 
-void Pipeline::build(VkRenderPass renderPass)
+void Pipeline::build(VkRenderPass renderPass, const std::vector<Target>& targets)
 {
     if (built_) return;
     VkDevice d = device_.device();
+    renderPass_ = renderPass;
+    targets_    = targets;
 
     // Two descriptor sets, both IMAGE_SAMPLER layout:
     //   set 0 = color source (solid default or gradient LUT)
@@ -56,22 +68,28 @@ void Pipeline::build(VkRenderPass renderPass)
     // Single-sample only. Geometric AA comes from SDF/MSDF shaders per-pixel;
     // path-fill edges and shader-rendered content can optionally be smoothed
     // via a final subpixel-offset supersample effect pass.
-    pipeline_ = buildVariant(cfg, renderPass, layout_);
-    if (pipeline_ == VK_NULL_HANDLE)
+    // The defaults: into the main colour, every target live (the frame's
+    // common case up to its last target reader).
+    const uint8_t clears = paintClears(targets_, 0, paintClearsTargets_, 0xFF);
+    VkPipeline normal = buildVariant(cfg, renderPass, layout_, 0, clears);
+    if (normal == VK_NULL_HANDLE)
         return;   // built_ stays false
+    variants_.add(0, false, clears, normal);
 
     auto clip = clipConfig();
+    hasClip_ = clip.has_value();
     if (clip) {
-        clipPipeline_ = buildVariant(*clip, renderPass, layout_);
-        if (clipPipeline_ == VK_NULL_HANDLE)
+        VkPipeline clipped = buildVariant(*clip, renderPass, layout_, 0, clears);
+        if (clipped == VK_NULL_HANDLE)
             return;
+        variants_.add(0, true, clears, clipped);
     }
 
     built_ = true;
 }
 
 VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass renderPass,
-                                   VkPipelineLayout layout)
+                                   VkPipelineLayout layout, uint8_t attachment, uint8_t clears)
 {
     VkDevice d = device_.device();
 
@@ -221,10 +239,9 @@ VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass render
             blend.alphaBlendOp = VK_BLEND_OP_ADD; break;
     }
 
-    VkPipelineColorBlendStateCreateInfo colorBlend {};
-    colorBlend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    colorBlend.attachmentCount = 1;
-    colorBlend.pAttachments = &blend;
+    // This draw's blend on the attachment it lands on, the rest per DrawTargets.
+    DrawTargets drawTargets(targets_, attachment, blend, clears);
+    stages[1].pSpecializationInfo = &drawTargets.specialization.info;
 
     VkDynamicState dynamicStates[] = {
         VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
@@ -245,7 +262,7 @@ VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass render
     pci.pRasterizationState = &raster;
     pci.pMultisampleState = &multisample;
     pci.pDepthStencilState = &depthStencil;
-    pci.pColorBlendState = &colorBlend;
+    pci.pColorBlendState = &drawTargets.colorBlend;
     pci.pDynamicState = &dynamicState;
     pci.layout = layout;
     pci.renderPass = renderPass;

@@ -81,7 +81,7 @@ for spv_file, var_name in shaders:
 
 out += '} // jvk::shaders::ui2d\n'
 
-with open('../include/jvk/graphics/UI2DShaders.h', 'w') as f:
+with open('../include/jvk/graphics/UI2DShaders.h', 'w', encoding='utf-8') as f:
     f.write(out)
 
 for spv_file, var_name in shaders:

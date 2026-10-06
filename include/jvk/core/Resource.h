@@ -54,15 +54,56 @@ public:
           VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT,
           VkFilter filter = VK_FILTER_LINEAR,
           VkSamplerAddressMode addressMode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
-        : device_(device), w_(width), h_(height)
     {
+        create(pool, device, width, height, format, usage, Shape {}, samples, aspect, filter, addressMode);
+    }
+
+    // The subresource layout of a sampled texture: array layers, mip levels,
+    // and whether the view is a 2D ARRAY (what a `sampler2DArray` binding
+    // needs, even for a single layer). A shader samples every layer and mip
+    // through the one view; uploads address a (layer, mip) pair each.
+    struct Shape
+    {
+        uint32_t layers    = 1;
+        uint32_t mips      = 1;
+        bool     arrayView = false;
+    };
+
+    // A texture with layers and/or mips (single-sampled, colour), in a
+    // jvk::PixelFormat. Create it, then Renderer::initializeImage() once
+    // before any Renderer::uploadRegion(). `usage` defaults to what a sampled,
+    // uploaded texture needs.
+    Image(Memory::L1& pool, VkDevice device,
+          uint32_t width, uint32_t height, PixelFormat format, Shape shape,
+          VkImageUsageFlags usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+          VkFilter filter = VK_FILTER_LINEAR,
+          VkSamplerAddressMode addressMode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE)
+    {
+        create(pool, device, width, height, toVkFormat(format), usage, shape,
+               VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_ASPECT_COLOR_BIT, filter, addressMode);
+    }
+
+private:
+    void create(Memory::L1& pool, VkDevice device,
+                uint32_t width, uint32_t height, VkFormat format,
+                VkImageUsageFlags usage, Shape shape,
+                VkSampleCountFlagBits samples, VkImageAspectFlags aspect,
+                VkFilter filter, VkSamplerAddressMode addressMode)
+    {
+        device_ = device;
+        w_ = width; h_ = height;
+        layers_ = std::max(1u, shape.layers);
+        mips_   = std::max(1u, shape.mips);
+        format_ = format;
+        array_  = shape.arrayView || layers_ > 1;
+
         VkImageCreateInfo ci {};
         ci.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
         ci.imageType = VK_IMAGE_TYPE_2D;
         ci.format = format;
         ci.extent = { width, height, 1 };
-        ci.mipLevels = 1;
-        ci.arrayLayers = 1;
+        ci.mipLevels = mips_;
+        ci.arrayLayers = layers_;
         ci.samples = samples;
         ci.tiling = VK_IMAGE_TILING_OPTIMAL;
         ci.usage = usage;
@@ -85,9 +126,9 @@ public:
         VkImageViewCreateInfo vi {};
         vi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         vi.image = image_;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.viewType = array_ ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
         vi.format = format;
-        vi.subresourceRange = { aspect, 0, 1, 0, 1 };
+        vi.subresourceRange = { aspect, 0, mips_, 0, layers_ };
         vkCreateImageView(device, &vi, nullptr, &view_);
 
         if (samples == VK_SAMPLE_COUNT_1_BIT && (usage & VK_IMAGE_USAGE_SAMPLED_BIT)) {
@@ -100,9 +141,12 @@ public:
             si.addressModeW = addressMode;
             si.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
             si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+            si.maxLod = static_cast<float>(mips_ - 1);   // 0 for a single level: unchanged
             vkCreateSampler(device, &si, nullptr, &sampler_);
         }
     }
+
+public:
 
     ~Image() override
     {
@@ -115,13 +159,13 @@ public:
     Image(Image&& o) noexcept
         : Resource(std::move(o)), device_(o.device_),
           image_(o.image_), view_(o.view_), sampler_(o.sampler_),
-          w_(o.w_), h_(o.h_)
+          w_(o.w_), h_(o.h_), layers_(o.layers_), mips_(o.mips_), format_(o.format_), array_(o.array_)
     {
         o.device_ = VK_NULL_HANDLE;
         o.image_ = VK_NULL_HANDLE;
         o.view_ = VK_NULL_HANDLE;
         o.sampler_ = VK_NULL_HANDLE;
-        o.w_ = 0; o.h_ = 0;
+        o.w_ = 0; o.h_ = 0; o.layers_ = 1; o.mips_ = 1; o.array_ = false;
     }
 
     Image& operator=(Image&& o) noexcept
@@ -133,9 +177,10 @@ public:
             Resource::operator=(std::move(o));
             device_ = o.device_; image_ = o.image_; view_ = o.view_;
             sampler_ = o.sampler_; w_ = o.w_; h_ = o.h_;
+            layers_ = o.layers_; mips_ = o.mips_; format_ = o.format_; array_ = o.array_;
             o.device_ = VK_NULL_HANDLE; o.image_ = VK_NULL_HANDLE;
             o.view_ = VK_NULL_HANDLE; o.sampler_ = VK_NULL_HANDLE;
-            o.w_ = 0; o.h_ = 0;
+            o.w_ = 0; o.h_ = 0; o.layers_ = 1; o.mips_ = 1; o.array_ = false;
         }
         return *this;
     }
@@ -145,6 +190,10 @@ public:
     VkSampler   sampler() const { return sampler_; }
     uint32_t    width()   const { return w_; }
     uint32_t    height()  const { return h_; }
+    uint32_t    layers()  const { return layers_; }
+    uint32_t    mips()    const { return mips_; }
+    VkFormat    format()  const { return format_; }
+    bool        isArray() const { return array_; }   // the view is 2D ARRAY
 
 private:
     VkDevice    device_  = VK_NULL_HANDLE;
@@ -152,6 +201,9 @@ private:
     VkImageView view_    = VK_NULL_HANDLE;
     VkSampler   sampler_ = VK_NULL_HANDLE;
     uint32_t    w_ = 0, h_ = 0;
+    uint32_t    layers_ = 1, mips_ = 1;
+    VkFormat    format_ = VK_FORMAT_UNDEFINED;
+    bool        array_  = false;
 };
 
 

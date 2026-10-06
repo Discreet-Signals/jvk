@@ -60,13 +60,19 @@ public:
     PathPipeline(const PathPipeline&) = delete;
     PathPipeline& operator=(const PathPipeline&) = delete;
 
+    // `targets`: the render targets of the scene pass (see Pipeline::build).
     void init(Device& device,
               VkRenderPass sceneRenderPass,
               std::span<const uint32_t> vertSpv,
-              std::span<const uint32_t> fragSpv)
+              std::span<const uint32_t> fragSpv,
+              const std::vector<Target>& targets = {})
     {
         device_ = &device;
         VkDevice d = device.device();
+        renderPass_ = sceneRenderPass;
+        vertSpv_.assign(vertSpv.begin(), vertSpv.end());
+        fragSpv_.assign(fragSpv.begin(), fragSpv.end());
+        targets_ = targets;
 
         // --- Set 0 — colorLUT layout (SHARED) ----------------------------
         // Reuse the global IMAGE_SAMPLER layout so the existing
@@ -138,8 +144,25 @@ public:
         // Pipeline's built-in clipHandle() variant. Without it a path fill
         // is scissor-clipped only, so it spills out of every non-rectangular
         // clip (a rounded-rect reduceClipRegion leaves square corners).
-        pipeline_     = buildPipeline(sceneRenderPass, vertSpv, fragSpv, false);
-        clipPipeline_ = buildPipeline(sceneRenderPass, vertSpv, fragSpv, true);
+        // The defaults: into the main colour, every target live.
+        const uint8_t clears = paintClears(targets_, 0, /*paint*/ true, 0xFF);
+        pipeline_     = buildPipeline(sceneRenderPass, vertSpv, fragSpv, false, 0, clears);
+        clipPipeline_ = buildPipeline(sceneRenderPass, vertSpv, fragSpv, true, 0, clears);
+        variants_.add(0, false, clears, pipeline_);
+        variants_.add(0, true, clears, clipPipeline_);
+    }
+
+    // The fill pipeline for a draw into colour attachment `attachment` (see
+    // DrawCommand::target) while the targets in `live` are still read later
+    // this frame (Renderer::liveTargets), built on first use. A path fill is
+    // paint (path_sdf.frag).
+    VkPipeline variant(uint8_t attachment, bool clip, uint8_t live)
+    {
+        const uint8_t clears = paintClears(targets_, attachment, /*paint*/ true, live);
+        return variants_.get(attachment, clip, clears, targets_.size(), [&]
+        {
+            return buildPipeline(renderPass_, vertSpv_, fragSpv_, clip, attachment, clears);
+        });
     }
 
     bool ready() const { return device_ != nullptr && pipeline_ != VK_NULL_HANDLE; }
@@ -218,7 +241,9 @@ public:
         // tests it. Keyed off State's depth, not the command's: State is what
         // pushes the matching stencil reference, so the two cannot disagree.
         const bool clipped = state.stencilDepth() > 0 && clipPipeline_ != VK_NULL_HANDLE;
-        state.setCustomPipeline(clipped ? clipPipeline_ : pipeline_, layout_);
+        VkPipeline fill = variant(drawCmd.target, clipped, r.replayLiveTargets());
+        if (fill == VK_NULL_HANDLE) return;
+        state.setCustomPipeline(fill, layout_);
 
         // Scissor and viewport — use the command's clipBounds for scissor.
         auto clip = drawCmd.clipBounds;
@@ -371,7 +396,9 @@ private:
     VkPipeline buildPipeline(VkRenderPass renderPass,
                              std::span<const uint32_t> vertSpv,
                              std::span<const uint32_t> fragSpv,
-                             bool clipVariant)
+                             bool clipVariant,
+                             uint8_t attachment,
+                             uint8_t clears)
     {
         VkDevice d = device_->device();
 
@@ -463,10 +490,9 @@ private:
         blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         blend.alphaBlendOp = VK_BLEND_OP_ADD;
 
-        VkPipelineColorBlendStateCreateInfo cb {};
-        cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-        cb.attachmentCount = 1;
-        cb.pAttachments = &blend;
+        // The rest per DrawTargets.
+        DrawTargets drawTargets(targets_, attachment, blend, clears);
+        stages[1].pSpecializationInfo = &drawTargets.specialization.info;
 
         // The clip variant's reference is dynamic (State pushes the clip depth
         // per draw) — WITHOUT this the baked reference 0 stands and
@@ -490,7 +516,7 @@ private:
         pci.pRasterizationState = &raster;
         pci.pMultisampleState = &ms;
         pci.pDepthStencilState = &ds;
-        pci.pColorBlendState = &cb;
+        pci.pColorBlendState = &drawTargets.colorBlend;
         pci.pDynamicState = &dynState;
         pci.layout = layout_;
         pci.renderPass = renderPass;
@@ -507,8 +533,8 @@ private:
     {
         if (!device_) return;
         VkDevice d = device_->device();
-        if (pipeline_       != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_, nullptr);
-        if (clipPipeline_   != VK_NULL_HANDLE) vkDestroyPipeline(d, clipPipeline_, nullptr);
+        variants_.destroy(d);   // includes pipeline_ and clipPipeline_
+        pipeline_ = clipPipeline_ = VK_NULL_HANDLE;
         if (layout_         != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
         if (ssboSetLayout_  != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(d, ssboSetLayout_, nullptr);
         if (descPool_       != VK_NULL_HANDLE) vkDestroyDescriptorPool(d, descPool_, nullptr);
@@ -529,6 +555,10 @@ private:
     VkPipelineLayout      layout_            = VK_NULL_HANDLE;
     VkPipeline            pipeline_          = VK_NULL_HANDLE;
     VkPipeline            clipPipeline_      = VK_NULL_HANDLE;   // stencil-tested variant
+    PipelineVariants      variants_;          // every built pipeline, owned here
+    VkRenderPass          renderPass_        = VK_NULL_HANDLE;
+    std::vector<uint32_t> vertSpv_, fragSpv_; // for variants built after init
+    std::vector<Target>   targets_;           // the pass's render targets
     VkDescriptorSetLayout ssboSetLayout_     = VK_NULL_HANDLE;
     VkDescriptorPool      descPool_          = VK_NULL_HANDLE;
     VkDescriptorSet       ssboDescSets_[MAX_FRAMES]  {};
