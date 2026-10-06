@@ -63,7 +63,13 @@ layout(location = 4) flat in vec2 fragTileOrigin;  // tile top-left (px)
 
 layout(location = 0) out vec4 outColor;
 // Render targets: the same colour at every other location (see ui2d.frag).
-layout(location = 1) out vec4 outChannels[7];
+layout(location = 1) out vec4 outChannel0;
+layout(location = 2) out vec4 outChannel1;
+layout(location = 3) out vec4 outChannel2;
+layout(location = 4) out vec4 outChannel3;
+layout(location = 5) out vec4 outChannel4;
+layout(location = 6) out vec4 outChannel5;
+layout(location = 7) out vec4 outChannel6;
 
 float sdSegment(vec2 p, vec2 a, vec2 b)
 {
@@ -100,18 +106,15 @@ layout(constant_id = 19) const float kClear6r = 0.0; layout(constant_id = 20) co
 
 void writeTargets(vec4 colour)
 {
-    if (kPaintsMain == 0) {
-        for (int i = 0; i < 7; ++i) outChannels[i] = colour;
-        return;
-    }
+    bool paint = kPaintsMain != 0;
     float a = colour.a;
-    outChannels[0] = vec4(kClear0r, kClear0g, kClear0b, a);
-    outChannels[1] = vec4(kClear1r, kClear1g, kClear1b, a);
-    outChannels[2] = vec4(kClear2r, kClear2g, kClear2b, a);
-    outChannels[3] = vec4(kClear3r, kClear3g, kClear3b, a);
-    outChannels[4] = vec4(kClear4r, kClear4g, kClear4b, a);
-    outChannels[5] = vec4(kClear5r, kClear5g, kClear5b, a);
-    outChannels[6] = vec4(kClear6r, kClear6g, kClear6b, a);
+    outChannel0 = paint ? vec4(kClear0r, kClear0g, kClear0b, a) : colour;
+    outChannel1 = paint ? vec4(kClear1r, kClear1g, kClear1b, a) : colour;
+    outChannel2 = paint ? vec4(kClear2r, kClear2g, kClear2b, a) : colour;
+    outChannel3 = paint ? vec4(kClear3r, kClear3g, kClear3b, a) : colour;
+    outChannel4 = paint ? vec4(kClear4r, kClear4g, kClear4b, a) : colour;
+    outChannel5 = paint ? vec4(kClear5r, kClear5g, kClear5b, a) : colour;
+    outChannel6 = paint ? vec4(kClear6r, kClear6g, kClear6b, a) : colour;
 }
 
 void main()

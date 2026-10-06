@@ -15,8 +15,15 @@ layout(location = 0) out vec4 outColor;
 // Render targets (jvk::Target): the same colour at every other location. A
 // pipeline variant enables writes on the ONE attachment its draw targets
 // (Graphics::setTarget) and masks the rest; locations with no attachment in
-// the pass are discarded.
-layout(location = 1) out vec4 outChannels[7];
+// the pass are discarded. One variable per location, never an array: MoltenVK's
+// SPIRV-Cross can't mask part of an output array (the Metal shader fails).
+layout(location = 1) out vec4 outChannel0;
+layout(location = 2) out vec4 outChannel1;
+layout(location = 3) out vec4 outChannel2;
+layout(location = 4) out vec4 outChannel3;
+layout(location = 5) out vec4 outChannel4;
+layout(location = 6) out vec4 outChannel5;
+layout(location = 7) out vec4 outChannel6;
 
 // Signed distance to a rounded rectangle centered at origin
 float roundedRectSDF(vec2 p, vec2 b, float r) {
@@ -222,18 +229,15 @@ layout(constant_id = 19) const float kClear6r = 0.0; layout(constant_id = 20) co
 
 void writeTargets(vec4 colour)
 {
-    if (kPaintsMain == 0) {
-        for (int i = 0; i < 7; ++i) outChannels[i] = colour;
-        return;
-    }
+    bool paint = kPaintsMain != 0;
     float a = colour.a;
-    outChannels[0] = vec4(kClear0r, kClear0g, kClear0b, a);
-    outChannels[1] = vec4(kClear1r, kClear1g, kClear1b, a);
-    outChannels[2] = vec4(kClear2r, kClear2g, kClear2b, a);
-    outChannels[3] = vec4(kClear3r, kClear3g, kClear3b, a);
-    outChannels[4] = vec4(kClear4r, kClear4g, kClear4b, a);
-    outChannels[5] = vec4(kClear5r, kClear5g, kClear5b, a);
-    outChannels[6] = vec4(kClear6r, kClear6g, kClear6b, a);
+    outChannel0 = paint ? vec4(kClear0r, kClear0g, kClear0b, a) : colour;
+    outChannel1 = paint ? vec4(kClear1r, kClear1g, kClear1b, a) : colour;
+    outChannel2 = paint ? vec4(kClear2r, kClear2g, kClear2b, a) : colour;
+    outChannel3 = paint ? vec4(kClear3r, kClear3g, kClear3b, a) : colour;
+    outChannel4 = paint ? vec4(kClear4r, kClear4g, kClear4b, a) : colour;
+    outChannel5 = paint ? vec4(kClear5r, kClear5g, kClear5b, a) : colour;
+    outChannel6 = paint ? vec4(kClear6r, kClear6g, kClear6b, a) : colour;
 }
 
 void main() {
