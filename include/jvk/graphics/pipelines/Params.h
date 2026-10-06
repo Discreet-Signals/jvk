@@ -184,6 +184,9 @@ struct DrawShaderParams {
     uint8_t                targetsRead    = 0;
     uint8_t                targetsWritten = 0;
     bool                   writesMain     = true;
+    // A TARGET PASS: it writes targets but not the main colour, and reads targets or
+    // writes scaled ones (Target::scale), so it runs as its own pass on what it writes.
+    bool                   targetPass     = false;
     uint32_t               constantCount = 0;
     float                  constants[kShaderDrawConstants] {};
 };

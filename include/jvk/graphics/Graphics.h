@@ -85,7 +85,8 @@ public:
     // land in the main colour by mistake. Effects (blur, saturate, darken,
     // noise) work on the main colour only and are skipped while a target is
     // the target. jvk::Shader draws write the locations their shader declares,
-    // whatever the target. Returns false if `name` isn't a target here.
+    // whatever the target. Returns false if `name` isn't a target here, or is
+    // a scaled one (Target::scale: only shaders write those, by location).
     static inline const juce::Identifier mainTarget { "main" };
 
     bool setTarget(const juce::Identifier& name)
@@ -94,8 +95,10 @@ public:
         if (name.isNull() || name == mainTarget) {
             s.target = 0;
         } else {
-            const int i = renderer_.target().targetIndex(name);
-            s.target = i < 0 ? Renderer::kNoTarget : static_cast<uint8_t>(i + 1);
+            const auto& rt = renderer_.target();
+            const int i = rt.targetIndex(name);
+            s.target = i < 0 || rt.targets()[static_cast<size_t>(i)].isScaled() ? Renderer::kNoTarget
+                                                                                 : static_cast<uint8_t>(i + 1);
         }
         s.targetName = name;
         syncTarget();

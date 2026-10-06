@@ -589,6 +589,10 @@ void Renderer::execute()
     // here on is neither loaded nor stored (see Renderer::liveTargets): it
     // can only die at a reader, and a reader always ends the scene pass, so
     // whatever is live where a pass begins stays live to its end.
+    // The scene pass is open (beginSceneRP) or not: a pass of its own ends it (endScene),
+    // and it reopens only for the next command that draws into it (the replay loop), so a
+    // run of passes pays no empty scene segments in between.
+    bool sceneOpen = false;
     auto beginSceneRP = [&](bool withClears, size_t firstCommand) {
         VkRenderPassBeginInfo rpbi {};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -609,6 +613,7 @@ void Renderer::execute()
             rpbi.pClearValues = clearScratch_.data();
         }
         vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+        sceneOpen = true;
 
         VkViewport vp {};
         vp.width    = static_cast<float>(frame.extent.width);
@@ -619,6 +624,95 @@ void Renderer::execute()
         vkCmdSetScissor(frame.cmd, 0, 1, &sc);
 
         state_.invalidate();
+    };
+    auto endScene = [&] {
+        if (sceneOpen) vkCmdEndRenderPass(frame.cmd);
+        sceneOpen = false;
+    };
+
+    // Commands that run as passes of their own (each ends the scene pass if it's open).
+    auto runsOwnPass = [&](const DrawCommand& c) {
+        switch (c.op) {
+            case DrawOp::EffectKernel: case DrawOp::EffectHSV: case DrawOp::BlurShape: case DrawOp::BlurPath:
+                return true;
+            case DrawOp::DrawShader: {
+                const auto& sp = arena_.read<DrawShaderParams>(c.dataOffset);
+                const auto* s = static_cast<Shader*>(sp.shader);
+                return s == nullptr || sp.targetPass || sp.targetsRead != 0 || s->readsScene();
+            }
+            default:
+                return false;
+        }
+    };
+
+    // SCALED targets (Target::scale) aren't scene attachments: they hold their clear value
+    // until their first write in a frame. That write's pass clears them first; a pass that
+    // reads one before then clears it here (outside any render pass).
+    const uint8_t scaled = target_.scaledTargets();
+    uint8_t scaledWritten = 0;
+    auto clearScaled = [&](uint8_t reads) {
+        const uint8_t pending = reads & scaled & static_cast<uint8_t>(~scaledWritten);
+        for (size_t i = 0; pending != 0 && i < target_.targets().size(); ++i) {
+            if ((pending & (1u << i)) == 0) continue;
+            VkImageMemoryBarrier b {};
+            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = target_.targetImage(i)->image();
+            b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(frame.cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &b);
+            const VkClearColorValue clear = target_.targets()[i].clear;
+            vkCmdClearColorImage(frame.cmd, b.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &b.subresourceRange);
+            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            vkCmdPipelineBarrier(frame.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &b);
+            scaledWritten |= static_cast<uint8_t>(1u << i);
+        }
+    };
+
+    // A TARGET PASS (DrawShaderParams::targetPass): the shader draws into the targets it
+    // writes as their own pass, outside the scene pass, in their pixels (the region and
+    // clip scale with them).
+    auto targetPass = [&](const DrawCommand& c, const DrawShaderParams& sp, Shader& shader) {
+        endScene();
+        clearScaled(sp.targetsRead);
+        const uint8_t written = sp.targetsWritten;
+        size_t first = 0;
+        while ((written & (1u << first)) == 0) ++first;
+        VkRenderPass rp = target_.targetPass(written, written & scaled & static_cast<uint8_t>(~scaledWritten));
+        VkFramebuffer fb = target_.targetFramebuffer(written);
+        if (rp == VK_NULL_HANDLE || fb == VK_NULL_HANDLE) return;
+        const auto e = target_.targetExtent(first);
+        const float s = target_.targets()[first].scale;
+
+        clearScratch_.clear();
+        for (size_t i = 0; i < target_.targets().size(); ++i)
+            if ((written & (1u << i)) != 0) {
+                VkClearValue v {};
+                v.color = target_.targets()[i].clear;
+                clearScratch_.push_back(v);
+            }
+        VkRenderPassBeginInfo rpbi {};
+        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rpbi.renderPass = rp;
+        rpbi.framebuffer = fb;
+        rpbi.renderArea.extent = e;
+        rpbi.clearValueCount = static_cast<uint32_t>(clearScratch_.size());
+        rpbi.pClearValues = clearScratch_.data();
+        vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+        shaderPipeline_->dispatchTarget(frame.cmd, shader, rp, sp.region * s,
+            static_cast<float>(e.width), static_cast<float>(e.height),
+            (c.clipBounds.toFloat() * s).getSmallestIntegerContainer(),
+            frameTime, frame.frameSlot, { sp.constants, sp.constantCount });
+        vkCmdEndRenderPass(frame.cmd);
+        scaledWritten |= written & scaled;
     };
 
     // Runs a single post-process pass (caller provides the dispatch via
@@ -717,6 +811,8 @@ void Renderer::execute()
         if (cmd.target > 0 && (replayLive_ & (1u << (cmd.target - 1))) == 0
             && !isClipOp(cmd.op) && cmd.op != DrawOp::DrawShader)
             continue;
+        if (!sceneOpen && !runsOwnPass(cmd))
+            beginSceneRP(/*withClears=*/false, k);
         if (cmd.op == DrawOp::EffectKernel) {
             // Separable Gaussian blur, ROI-walked: V (last) outputs the
             // final region R, so H must output R padded by V's VERTICAL
@@ -731,7 +827,7 @@ void Renderer::execute()
                 const VkRect2D scH = roiScissor(R, 0.0f, m);
                 const VkRect2D scV = roiScissor(R, 0.0f, 0.0f);
 
-                vkCmdEndRenderPass(frame.cmd);
+                endScene();
                 // Seed the intermediate half's outside-clip pixels within
                 // H's scissor (V's taps cross the clip edge and read them).
                 preCopyIfClipped(cmd.stencilDepth, &scH);
@@ -747,7 +843,6 @@ void Renderer::execute()
                         0.0f, 1.0f, bp.radius,
                         static_cast<uint32_t>(cmd.stencilDepth), &scV);
                 });
-                beginSceneRP(/*withClears=*/false, k + 1);
             }
             continue;
         }
@@ -895,7 +990,12 @@ void Renderer::execute()
                 auto* shader = static_cast<Shader*>(sp.shader);
                 const float fw = static_cast<float>(frame.extent.width);
                 const float fh = static_cast<float>(frame.extent.height);
-                if (shader && shader->readsScene()) {
+                if (sp.targetPass) {
+                    // (One whose targets nothing reads any more is skipped.)
+                    if (shader && (sp.targetsWritten & replayLive_) != 0)
+                        targetPass(cmd, sp, *shader);
+                }
+                else if (shader && shader->readsScene()) {
                     // A SCENE READER (it may read targets too): a non-separable
                     // effect, ROI-walked like EffectHSV. One region pass samples
                     // the current half as its `scene` and REPLACES the region in
@@ -916,7 +1016,8 @@ void Renderer::execute()
                             { sp.constants, sp.constantCount }, src);
                         vkCmdEndRenderPass(frame.cmd);
                     };
-                    vkCmdEndRenderPass(frame.cmd);
+                    endScene();
+                    clearScaled(sp.targetsRead);
                     if (coversFrame(sc)) {
                         preCopyIfClipped(cmd.stencilDepth, &sc);
                         effectPassAndSwap(pass);
@@ -924,10 +1025,10 @@ void Renderer::execute()
                         effectPassAndSwap(pass);
                         copyBackAndSwap(sc, cmd.stencilDepth);
                     }
-                    beginSceneRP(/*withClears=*/false, k + 1);
                 }
                 else if (shader && sp.targetsRead != 0) {
-                    vkCmdEndRenderPass(frame.cmd);
+                    endScene();
+                    clearScaled(sp.targetsRead);
                     VkRenderPassBeginInfo rpbi {};
                     rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
                     rpbi.renderPass = target_.effectRenderPass();
@@ -938,7 +1039,6 @@ void Renderer::execute()
                         cmd.clipBounds, cmd.stencilDepth, frameTime, frame.frameSlot,
                         { sp.constants, sp.constantCount });
                     vkCmdEndRenderPass(frame.cmd);
-                    beginSceneRP(/*withClears=*/false, k + 1);
                 }
                 else if (shader && (sp.writesMain || (sp.targetsWritten & replayLive_) != 0)) {
                     // (One that writes only targets nothing reads any more is skipped.)
@@ -970,7 +1070,7 @@ void Renderer::execute()
                 pc.scaleH = hp.scaleH; pc.scaleS = hp.scaleS; pc.scaleV = hp.scaleV;
                 pc.deltaH = hp.deltaH; pc.deltaS = hp.deltaS; pc.deltaV = hp.deltaV;
 
-                vkCmdEndRenderPass(frame.cmd);
+                endScene();
                 if (coversFrame(sc)) {
                     // Full-window transform: ONE pass, single swap (the old
                     // cost). Pre-copy seeds outside-clip pixels when clipped.
@@ -990,7 +1090,6 @@ void Renderer::execute()
                     });
                     copyBackAndSwap(sc, cmd.stencilDepth);
                 }
-                beginSceneRP(/*withClears=*/false, k + 1);
             }
             continue;
         }
@@ -1045,7 +1144,7 @@ void Renderer::execute()
                 const float m = std::ceil(sp.maxRadius * sp.blurStep) + 2.0f;
                 const VkRect2D scR = roiScissor(R, 0.0f, 0.0f);
 
-                vkCmdEndRenderPass(frame.cmd);
+                endScene();
                 if (kt == 0) {
                     // Separable H then V — V's vertical apron dictates H's
                     // output rect; two swaps land back on the start half.
@@ -1081,7 +1180,6 @@ void Renderer::execute()
                     });
                     copyBackAndSwap(scR, cmd.stencilDepth);
                 }
-                beginSceneRP(/*withClears=*/false, k + 1);
             }
             continue;
         }
@@ -1121,7 +1219,7 @@ void Renderer::execute()
                 const float m = std::ceil(bp.maxRadius) + 2.0f;
                 const VkRect2D scR = roiScissor(R, 0.0f, 0.0f);
 
-                vkCmdEndRenderPass(frame.cmd);
+                endScene();
                 if (kt == 0) {
                     const VkRect2D scH = roiScissor(R, 0.0f, m);
                     preCopyIfClipped(cmd.stencilDepth, &scH);
@@ -1150,7 +1248,6 @@ void Renderer::execute()
                     });
                     copyBackAndSwap(scR, cmd.stencilDepth);
                 }
-                beginSceneRP(/*withClears=*/false, k + 1);
             }
             continue;
         }
@@ -1163,7 +1260,7 @@ void Renderer::execute()
         pipeline->execute(*this, arena_, cmd);
     }
 
-    vkCmdEndRenderPass(frame.cmd);
+    endScene();
 
     // After the command stream, `cur` is the index of whichever ping-pong
     // half holds the final composited frame (full-window single-pass effects

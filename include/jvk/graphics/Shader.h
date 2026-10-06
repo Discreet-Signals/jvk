@@ -873,6 +873,21 @@ inline void Graphics::prepareShaderDraw(Shader& shader, DrawShaderParams& params
     params.targetsRead    = shader.targetsRead(rt);
     params.targetsWritten = shader.targetsWritten(rt.targets().size());
     params.writesMain     = shader.writesMain();
+    const uint8_t scaled  = rt.scaledTargets();
+    params.targetPass     = !params.writesMain && params.targetsWritten != 0
+                         && (params.targetsRead != 0 || (params.targetsWritten & scaled) != 0);
+    // A pass's attachments are one size, and only a pass writes a scaled target: a shader
+    // writing the main colour and a scaled target, or targets of two sizes, draws nothing.
+    bool valid = !(params.writesMain && (params.targetsWritten & scaled) != 0);
+    float passScale = 0.0f;
+    for (size_t i = 0; params.targetPass && i < rt.targets().size(); ++i)
+        if ((params.targetsWritten & (1u << i)) != 0) {
+            valid = valid && (passScale == 0.0f || rt.targets()[i].scale == passScale);
+            passScale = rt.targets()[i].scale;
+        }
+    jassert (valid);
+    if (!valid)
+        params.shader = nullptr;
     if (params.targetsRead != 0)
         shader.bindTargets(rt);
     const auto constants = shader.drawConstants();

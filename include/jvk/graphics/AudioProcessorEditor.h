@@ -194,6 +194,7 @@ private:
         setOpaque(true);
         addComponentListener(this);
         renderTimer_.callback = [this] { if (vulkanEnabled_ && renderer_) render(); };
+        catchUp_.callback = [this] { if (missedTick_ && vulkanEnabled_ && renderer_) render(); };
 
         // vulkanEnabled_ defaults to true — wire up the Vulkan resources so
         // construction matches the historical behavior. Subclasses that want
@@ -276,6 +277,8 @@ private:
 
         paintContext_.reset();   // references renderer_ — must go first
         renderer_.reset();
+        catchUp_.cancelPendingUpdate();   // the worker is gone: nothing posts after this
+        missedTick_ = false;
         target_.reset();
 
     #if JUCE_MAC
@@ -413,7 +416,11 @@ private:
         // interval, longer under DWM drag stalls), skip this tick — we
         // never block the message thread. Resulting render rate adapts to
         // what the worker can sustain; input responsiveness stays at 60 Hz.
-        if (renderer_->isBusy()) return;
+        // A skipped tick isn't lost: the worker's onIdle renders it as soon
+        // as it frees up (catchUp_), so a timer drifting against vsync
+        // doesn't drop a frame each time it lands on a busy worker.
+        if (renderer_->isBusy()) { missedTick_ = true; return; }
+        missedTick_ = false;
 
         renderer_->reset();
         // Process-wide monotonic tick. Every editor advances the SAME
@@ -534,6 +541,7 @@ private:
         target_ = std::make_unique<SwapchainTarget>(*device_, surface, w, h, nativeWindow,
                                                     VK_PRESENT_MODE_FIFO_KHR, targets_);
         renderer_ = std::make_unique<Renderer>(*device_, *target_);
+        renderer_->onIdle = [this] { catchUp_.triggerAsyncUpdate(); };
         registerPipelines();
         diag::log("swapchain " + juce::String((int) target_->width()) + "x" + juce::String((int) target_->height())
                   + " and pipelines built");
@@ -661,6 +669,12 @@ private:
         std::function<void()> callback;
         void timerCallback() override { if (callback) callback(); }
     };
+    // The worker's onIdle posts here; on the message thread, a tick skipped while
+    // the worker was busy (missedTick_) renders now. One skipped tick, one frame.
+    struct RenderCatchUp : public juce::AsyncUpdater {
+        std::function<void()> callback;
+        void handleAsyncUpdate() override { if (callback) callback(); }
+    };
 
     struct NullCachedImage : public juce::CachedComponentImage {
         void paint(juce::Graphics&) override {}
@@ -669,6 +683,8 @@ private:
         void releaseResources() override {}
     };
 
+    RenderCatchUp catchUp_;   // before renderer_: outlives the worker that posts to it
+    bool          missedTick_ = false;   // message thread only
     std::shared_ptr<Device> device_;
     std::unique_ptr<SwapchainTarget> target_;
     std::unique_ptr<Renderer> renderer_;

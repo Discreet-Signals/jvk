@@ -131,10 +131,20 @@ struct Target
     // jvk::Shader draws don't clear it. Up to 7 targets.
     bool              clearedByMain = false;
 
+    // Its size relative to the frame's, per side (ceil(frame x scale)). At 1 it is an
+    // attachment of the scene passes, as above. A SCALED target (down- or upsampled) is
+    // not: only jvk::Shader draws write it (by output location, as any target), each as
+    // its own TARGET PASS with it as the attachment (Renderer), in its own pixels and
+    // without path clips; ordinary draws can't select it and clearedByMain doesn't apply.
+    // It holds its clear value until its first write in a frame.
+    float             scale = 1.0f;
+
+    bool isScaled() const { return scale != 1.0f; }
+
     bool operator==(const Target& o) const
     {
         return name == o.name && format == o.format && blend == o.blend
-            && clearedByMain == o.clearedByMain
+            && clearedByMain == o.clearedByMain && scale == o.scale
             && std::memcmp(&clear, &o.clear, sizeof(clear)) == 0;
     }
 };

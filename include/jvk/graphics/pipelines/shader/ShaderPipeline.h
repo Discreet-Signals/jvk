@@ -107,6 +107,50 @@ public:
         vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
+    // Draws `shader` in a TARGET PASS the caller has begun (`renderPass`: the targets it
+    // writes, Renderer), over `region` in those targets' pixels (the viewport is their
+    // size), scissored to `clip` within it. The pass has no stencil, so no path clips. Such
+    // a shader is built against that pass on first use and is only ever drawn this way.
+    void dispatchTarget(VkCommandBuffer cmd, Shader& shader, VkRenderPass renderPass,
+                        juce::Rectangle<float> region, float viewportW, float viewportH,
+                        const juce::Rectangle<int>& clip, float frameTime, int frameSlot,
+                        std::span<const float> drawConstants = {})
+    {
+        if (!device_) return;
+        shader.ensureCreated(*device_, renderPass, VK_SAMPLE_COUNT_1_BIT, targets_);
+        if (!shader.isReady()) return;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shader.pipeline());
+
+        const auto c = clip.getIntersection(region.getSmallestIntegerContainer());
+        const int x0 = std::max(0, c.getX()), y0 = std::max(0, c.getY());
+        const int x1 = std::max(x0, std::min(c.getRight(),  static_cast<int>(viewportW)));
+        const int y1 = std::max(y0, std::min(c.getBottom(), static_cast<int>(viewportH)));
+        const VkRect2D scissor { { x0, y0 }, { static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0) } };
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        VkViewport vp {};
+        vp.width    = viewportW;
+        vp.height   = viewportH;
+        vp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+
+        const float push[7] = {
+            region.getWidth(), region.getHeight(), frameTime,
+            viewportW, viewportH, region.getX(), region.getY(),
+        };
+        vkCmdPushConstants(cmd, shader.layout(),
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
+        pushDrawConstants(cmd, shader, drawConstants);
+
+        VkDescriptorSet set = shader.descriptorSet(frameSlot);
+        if (set != VK_NULL_HANDLE) {
+            if (void* dst = shader.uniformMapped(frameSlot))
+                std::memcpy(dst, shader.uniformData(), shader.uniformSize());
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                shader.layout(), 0, 1, &set, 0, nullptr);
+        }
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
     bool ready() const { return device_ != nullptr; }
 
     // Dispatch one DrawShader command inside the active scene render pass.

@@ -331,6 +331,9 @@ public:
     // True while the worker is mid-execute. Check before recording the next
     // frame — the caller must not touch Renderer state while this is true.
     bool isBusy() const { return workerBusy_.load(std::memory_order_acquire); }
+    // Called on the worker thread each time it finishes a frame (isBusy() is false
+    // by then): set once before the first submit, cheap and thread-safe.
+    std::function<void()> onIdle;
 
     // Block the caller until the worker is idle. Use before operations that
     // need exclusive access outside the normal record→submit cycle
@@ -764,6 +767,7 @@ private:
                 if (threadShouldExit()) break;
                 owner.execute();
                 owner.workerBusy_.store(false, std::memory_order_release);
+                if (owner.onIdle) owner.onIdle();
             }
         }
 
