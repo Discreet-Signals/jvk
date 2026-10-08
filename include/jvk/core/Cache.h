@@ -311,6 +311,120 @@ struct CachedBuffer {
 };
 
 // =============================================================================
+// ImageSource — a CPU image of ANY pixel format, as the texture cache takes it.
+//
+// `key` names its CONTENT: every draw of the same key, in every window, shares
+// one upload, kept by the cache's LRU like any texture. `fill` writes its texels
+// (tightly packed rows, formatInfo(format) bytes a texel) into the upload's
+// staging memory; it runs on the message thread inside the call that resolves
+// the source (ResourceCaches::getTexture), and only when the key isn't cached,
+// reading `pixels`, which the caller keeps alive for that call.
+//
+// A juce::Image is one kind (of: RGBA8, premultiplied as juce stores it, keyed by
+// its pixel buffer); raw texels another (of: keyed by their address).
+// =============================================================================
+
+struct ImageSource
+{
+    uint64_t    key    = 0;
+    uint32_t    width  = 0, height = 0;
+    PixelFormat format = PixelFormat::RGBA8;
+    const void* pixels = nullptr;
+    void      (*fill)(const ImageSource& self, uint8_t* dst) = nullptr;
+
+    bool isValid() const { return key != 0 && width > 0 && height > 0 && fill != nullptr; }
+
+    // A juce::Image's key: the address of its top-left pixel plus its size and
+    // line stride. Stable across the ephemeral SubsectionPixelData wrappers JUCE
+    // builds for 9-arg drawImage calls (those sit on the stack and are reused at
+    // the same address, which makes getPixelData().get() useless as a key).
+    // BitmapData::data for a subsection points into the parent's buffer at the
+    // subsection origin, so different source offsets key differently while
+    // identical draws of the same subsection key the same.
+    static uint64_t keyOf(const juce::Image& img)
+    {
+        if (!img.isValid()) return 0;
+        juce::Image::BitmapData bd(img, juce::Image::BitmapData::readOnly);
+        uint64_t h = reinterpret_cast<uint64_t>(bd.data);
+        h ^= (static_cast<uint64_t>(static_cast<uint32_t>(img.getWidth())) << 32)
+           |  static_cast<uint64_t>(static_cast<uint32_t>(img.getHeight()));
+        h ^= static_cast<uint64_t>(bd.lineStride) * 0x9e3779b97f4a7c15ULL;
+        return h;
+    }
+
+    // A juce::Image (`img` alive while it resolves): RGBA8, PREMULTIPLIED, exactly
+    // as juce stores it — the sampler has to interpolate premultiplied values or
+    // edge texels bleed the undefined colour of their fully-transparent
+    // neighbours; ui2d.frag and ColorPipeline (BlendMode::Premultiplied) are
+    // premultiplied end-to-end to match.
+    static ImageSource of(const juce::Image& img, uint64_t key)
+    {
+        ImageSource s;
+        if (!img.isValid()) return s;
+        s.key = key;
+        s.width = static_cast<uint32_t>(img.getWidth());
+        s.height = static_cast<uint32_t>(img.getHeight());
+        s.format = PixelFormat::RGBA8;
+        s.pixels = &img;
+        s.fill = [](const ImageSource& self, uint8_t* dst)
+        {
+            const auto& image = *static_cast<const juce::Image*>(self.pixels);
+            const uint32_t w = self.width, h = self.height;
+            juce::Image::BitmapData bmp(image, juce::Image::BitmapData::readOnly);
+            // Fast path for JUCE ARGB (byte order B,G,R,A on little-endian): row
+            // copy + in-register swizzle to the texture's R,G,B,A. Per-pixel
+            // getPixelColour was ~1M virtual format-dispatch calls for a 1024²
+            // image, on the message thread, inside paint. The slow path agrees on
+            // the alpha convention: getPixelColour yields (0,0,0,a) for
+            // SingleChannel and a=255 for RGB, both valid premultiplied values.
+            if (image.getFormat() == juce::Image::ARGB) {
+                for (uint32_t y = 0; y < h; y++) {
+                    const auto* src = bmp.getLinePointer(static_cast<int>(y));
+                    auto* out = dst + static_cast<size_t>(y) * w * 4;
+                    for (uint32_t x = 0; x < w; x++) {
+                        out[x * 4 + 0] = src[x * 4 + 2]; // R
+                        out[x * 4 + 1] = src[x * 4 + 1]; // G
+                        out[x * 4 + 2] = src[x * 4 + 0]; // B
+                        out[x * 4 + 3] = src[x * 4 + 3]; // A
+                    }
+                }
+            } else {
+                for (uint32_t y = 0; y < h; y++)
+                    for (uint32_t x = 0; x < w; x++) {
+                        auto c = bmp.getPixelColour(static_cast<int>(x), static_cast<int>(y));
+                        auto idx = (y * w + x) * 4;
+                        dst[idx + 0] = c.getRed();
+                        dst[idx + 1] = c.getGreen();
+                        dst[idx + 2] = c.getBlue();
+                        dst[idx + 3] = c.getAlpha();
+                    }
+            }
+        };
+        return s;
+    }
+    static ImageSource of(const juce::Image& img) { return of(img, keyOf(img)); }
+
+    // Texels already in `format`, tightly packed (`texels` alive while it resolves),
+    // keyed by their address: a buffer that keeps its texels keeps its key.
+    static ImageSource of(const void* texels, uint32_t width, uint32_t height, PixelFormat format)
+    {
+        ImageSource s;
+        if (texels == nullptr || width == 0 || height == 0) return s;
+        s.key = reinterpret_cast<uint64_t>(texels) ^ ((static_cast<uint64_t>(width) << 32) | height)
+              ^ (static_cast<uint64_t>(format) + 1) * 0x9e3779b97f4a7c15ULL;
+        s.width = width;
+        s.height = height;
+        s.format = format;
+        s.pixels = texels;
+        s.fill = [](const ImageSource& self, uint8_t* dst)
+        {
+            std::memcpy(dst, self.pixels, static_cast<size_t>(formatInfo(self.format).bytesFor(self.width, self.height)));
+        };
+        return s;
+    }
+};
+
+// =============================================================================
 // ResourceCaches — shared across all plugin instances. Holds state that is
 // genuinely shareable because it is mutated only from the (single) JUCE
 // message thread: the texture cache (image-dedup across editors) and the
@@ -368,27 +482,12 @@ public:
         return h;
     }
 
-    // Hash a juce::Image by the actual pixel-buffer address of its top-left
-    // pixel plus dimensions and line stride. Stable across the ephemeral
-    // SubsectionPixelData wrappers that JUCE builds for 9-arg drawImage calls
-    // (those wrappers sit on the stack and get reused at the same address,
-    // which makes getPixelData().get() useless as a cache key). BitmapData::data
-    // for a subsection points into the parent's buffer at the subsection origin,
-    // so different source-Y offsets hash differently while identical draws of
-    // the same subsection hash the same.
-    static uint64_t hashImage(const juce::Image& img)
-    {
-        if (!img.isValid()) return 0;
-        juce::Image::BitmapData bd(img, juce::Image::BitmapData::readOnly);
-        uint64_t h = reinterpret_cast<uint64_t>(bd.data);
-        h ^= (static_cast<uint64_t>(static_cast<uint32_t>(img.getWidth())) << 32)
-           |  static_cast<uint64_t>(static_cast<uint32_t>(img.getHeight()));
-        h ^= static_cast<uint64_t>(bd.lineStride) * 0x9e3779b97f4a7c15ULL;
-        return h;
-    }
+    // A juce::Image's cache key (ImageSource::keyOf).
+    static uint64_t hashImage(const juce::Image& img) { return ImageSource::keyOf(img); }
 
-    // The shared texture cache. Called from the message thread during
-    // record (Graphics::drawImage), so inserts/lookups never race another
+    // The shared texture cache, for an image of any format (ImageSource).
+    // Called from the message thread during record (Graphics::drawImage,
+    // a Shader's per-draw images), so inserts/lookups never race another
     // editor — JUCE serializes the message thread.
     //
     // Per-Renderer safety against eviction: every access (hit or miss)
@@ -401,71 +500,28 @@ public:
     // Cross-instance eviction: if ~CachedImage fires on editor A's beginFrame
     // while editor B still has a pin, FrameRetained blocks and forceDrainAll
     // idles every Renderer + vkDeviceWaitIdle's before the image is freed.
-    VkDescriptorSet getTexture(uint64_t hash, const juce::Image& img, Renderer& r)
+    VkDescriptorSet getTexture(const ImageSource& src, Renderer& r)
     {
         // Hit path: atomic find+pin. Pin is added while still holding the
         // cache lock, so no concurrent eviction can free this entry between
         // the map lookup and the retain.
-        if (auto* cached = textures_.findAndPin(hash,
+        if (auto* cached = textures_.findAndPin(src.key,
                 [&](CachedImage* v) { r.retain(v); }))
         {
             return cached->descriptorSet;
         }
+        if (!src.isValid()) return VK_NULL_HANDLE;
+        const auto w = src.width, h = src.height;
 
-        auto w = static_cast<uint32_t>(img.getWidth());
-        auto h = static_cast<uint32_t>(img.getHeight());
-        if (w == 0 || h == 0) return VK_NULL_HANDLE;
-
-        // Stage the pixels FIRST — if the staging allocator is out of memory
+        // Stage the texels FIRST — if the staging allocator is out of memory
         // there is nothing sane to insert into the cache (a never-uploaded
         // entry samples UNDEFINED forever).
-        VkDeviceSize byteSize = static_cast<VkDeviceSize>(w) * h * 4;
-        auto staging = r.staging().alloc(byteSize);
+        auto staging = r.staging().alloc(formatInfo(src.format).bytesFor(w, h));
         if (staging.mappedPtr == nullptr) return VK_NULL_HANDLE;
-        auto* dst = static_cast<uint8_t*>(staging.mappedPtr);
-        juce::Image::BitmapData bmp(img, juce::Image::BitmapData::readOnly);
-
-        // Fast path for JUCE ARGB (byte order B,G,R,A on little-endian):
-        // row copy + in-register swizzle to the texture's R,G,B,A. The old
-        // per-pixel getPixelColour was ~1M virtual format-dispatch calls for
-        // a 1024² image, on the message thread, inside paint.
-        //
-        // ALPHA CONVENTION: textures stay PREMULTIPLIED, exactly as juce
-        // stores them — do not un-premultiply here. The sampler has to
-        // interpolate premultiplied values or edge texels bleed the
-        // undefined colour of their fully-transparent neighbours. ui2d.frag
-        // and ColorPipeline (BlendMode::Premultiplied) are premultiplied
-        // end-to-end to match. The slow path below agrees: juce's
-        // getPixelColour yields (0,0,0,a) for SingleChannel and a=255 for
-        // RGB, both already valid premultiplied values.
-        if (img.getFormat() == juce::Image::ARGB) {
-            for (uint32_t y = 0; y < h; y++) {
-                const auto* src = bmp.getLinePointer(static_cast<int>(y));
-                auto* out = dst + static_cast<size_t>(y) * w * 4;
-                for (uint32_t x = 0; x < w; x++) {
-                    out[x * 4 + 0] = src[x * 4 + 2]; // R
-                    out[x * 4 + 1] = src[x * 4 + 1]; // G
-                    out[x * 4 + 2] = src[x * 4 + 0]; // B
-                    out[x * 4 + 3] = src[x * 4 + 3]; // A
-                }
-            }
-        } else {
-            for (uint32_t y = 0; y < h; y++) {
-                for (uint32_t x = 0; x < w; x++) {
-                    auto c = bmp.getPixelColour(static_cast<int>(x), static_cast<int>(y));
-                    auto idx = (y * w + x) * 4;
-                    dst[idx + 0] = c.getRed();
-                    dst[idx + 1] = c.getGreen();
-                    dst[idx + 2] = c.getBlue();
-                    dst[idx + 3] = c.getAlpha();
-                }
-            }
-        }
+        src.fill(src, static_cast<uint8_t*>(staging.mappedPtr));
 
         auto ci = std::make_unique<CachedImage>();
-        ci->image = Image(device_.pool(), device_.device(), w, h,
-            VK_FORMAT_R8G8B8A8_UNORM,
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        ci->image = Image(device_.pool(), device_.device(), w, h, src.format, Image::Shape {});
         if (!ci->image.valid()) return VK_NULL_HANDLE;
         ci->descriptorSet = device_.bindings().alloc();
         if (ci->descriptorSet == VK_NULL_HANDLE) return VK_NULL_HANDLE;
@@ -485,16 +541,22 @@ public:
         // guarantees no other thread can observe the entry as unpinned
         // before this Renderer has a pin — so the eviction skip-if-pinned
         // rule covers this entry from the moment it's visible.
-        auto& inserted = textures_.insertAndPin(hash, std::move(ci),
+        auto& inserted = textures_.insertAndPin(src.key, std::move(ci),
                 [&](CachedImage* v) { r.retain(v); });
 
-        // Queue the pixel upload into the Renderer's command buffer. Order
+        // Queue the texel upload into the Renderer's command buffer. Order
         // relative to insertAndPin doesn't matter for correctness anymore —
         // the entry is pinned from the moment it enters the cache, and the
         // pin outlives the worker's flushUploads + the frame's GPU fence.
         r.upload(staging, dstImage, w, h);
 
         return inserted.descriptorSet;
+    }
+
+    // A juce::Image under its key (hashImage).
+    VkDescriptorSet getTexture(uint64_t hash, const juce::Image& img, Renderer& r)
+    {
+        return getTexture(ImageSource::of(img, hash), r);
     }
 
     static uint64_t hashGradient(const juce::ColourGradient& g)

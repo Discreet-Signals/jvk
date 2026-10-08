@@ -172,6 +172,7 @@ struct DrawLineParams {
 // into each draw at record time, pushed at replay after jvk's own 8 floats.
 // 24 floats + 32 bytes = 128 bytes, the push-constant size every device has.
 static constexpr int kShaderDrawConstants = 24;
+static constexpr int kShaderDrawImages = 4;   // per-draw images: descriptor sets 2..5 (Shader::setDrawImage)
 
 struct DrawShaderParams {
     void*                  shader; // Shader*
@@ -189,6 +190,10 @@ struct DrawShaderParams {
     bool                   targetPass     = false;
     uint32_t               constantCount = 0;
     float                  constants[kShaderDrawConstants] {};
+    // The draw's own images (Shader::setDrawImage), resolved through the texture
+    // cache at record: the cached textures' descriptor sets, bound as sets 2...
+    uint32_t               imageCount = 0;
+    VkDescriptorSet        images[kShaderDrawImages] {};
 };
 
 // Analytical SDF path fill, TILE mode (see path_sdf.frag). Graphics::fillPath

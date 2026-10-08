@@ -14,7 +14,7 @@ namespace jvk {
 //      tracker knows the normal pipeline cache is stale.
 //   3. Set scissor/viewport and push constants matching shader_region.vert's
 //      layout (resolution, time, viewport, region origin — all physical px).
-//   4. Bind the shader's descriptor set (only if it has any reflected bindings).
+//   4. Bind the shader's descriptor sets: its own, the scene's, the draw's images.
 //   5. Issue one fullscreen triangle draw.
 //
 // Registered with the Renderer via setShaderPipeline(); execute() hands off
@@ -55,6 +55,7 @@ public:
                       uint8_t stencilDepth,
                       float frameTime, int frameSlot,
                       std::span<const float> drawConstants = {},
+                      std::span<const VkDescriptorSet> drawImages = {},
                       VkDescriptorSet sceneSet = VK_NULL_HANDLE)
     {
         if (!device_ || passRenderPass_ == VK_NULL_HANDLE) return;
@@ -88,22 +89,8 @@ public:
         vkCmdPushConstants(cmd, shader.layout(),
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
         pushDrawConstants(cmd, shader, drawConstants);
-
-        VkDescriptorSet own = shader.descriptorSet(frameSlot);
-        if (own != VK_NULL_HANDLE) {
-            if (void* dst = shader.uniformMapped(frameSlot))
-                std::memcpy(dst, shader.uniformData(), shader.uniformSize());
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                shader.layout(), 0, 1, &own, 0, nullptr);
-        }
-        if (shader.readsScene()) {
-            if (sceneSet == VK_NULL_HANDLE) return;   // nothing to read: no draw
-            // Set 1 = the scene; set 0, if the shader has none of its own, the same set
-            // (its layout is the scene's: Shader::ensureCreated).
-            VkDescriptorSet sets[2] = { own != VK_NULL_HANDLE ? own : sceneSet, sceneSet };
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                shader.layout(), 0, 2, sets, 0, nullptr);
-        }
+        if (shader.readsScene() && sceneSet == VK_NULL_HANDLE) return;   // nothing to read: no draw
+        bindSets(cmd, shader, frameSlot, drawImages, sceneSet);
         vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
@@ -114,7 +101,8 @@ public:
     void dispatchTarget(VkCommandBuffer cmd, Shader& shader, VkRenderPass renderPass,
                         juce::Rectangle<float> region, float viewportW, float viewportH,
                         const juce::Rectangle<int>& clip, float frameTime, int frameSlot,
-                        std::span<const float> drawConstants = {})
+                        std::span<const float> drawConstants = {},
+                        std::span<const VkDescriptorSet> drawImages = {})
     {
         if (!device_) return;
         shader.ensureCreated(*device_, renderPass, VK_SAMPLE_COUNT_1_BIT, targets_);
@@ -140,14 +128,7 @@ public:
         vkCmdPushConstants(cmd, shader.layout(),
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
         pushDrawConstants(cmd, shader, drawConstants);
-
-        VkDescriptorSet set = shader.descriptorSet(frameSlot);
-        if (set != VK_NULL_HANDLE) {
-            if (void* dst = shader.uniformMapped(frameSlot))
-                std::memcpy(dst, shader.uniformData(), shader.uniformSize());
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                shader.layout(), 0, 1, &set, 0, nullptr);
-        }
+        bindSets(cmd, shader, frameSlot, drawImages);
         vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
@@ -178,7 +159,8 @@ public:
                   uint8_t stencilDepth,
                   float frameTime,
                   int frameSlot,
-                  std::span<const float> drawConstants = {})
+                  std::span<const float> drawConstants = {},
+                  std::span<const VkDescriptorSet> drawImages = {})
     {
         if (!device_) return;
         shader.ensureCreated(*device_, renderPass_, msaa_, targets_);
@@ -241,25 +223,7 @@ public:
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
             0, sizeof(push), push);
         pushDrawConstants(cmd, shader, drawConstants);
-
-        // Bind the shader's descriptor set only if it actually has bindings.
-        // Fragment-only shaders (push-constant-driven) leave descriptorSet()
-        // VK_NULL_HANDLE and use a zero-set pipeline layout.
-        VkDescriptorSet set = shader.descriptorSet(frameSlot);
-        if (set != VK_NULL_HANDLE) {
-            // Refresh this frame slot's slice of the GPU-visible uniform/
-            // storage buffer from the shader's CPU shadow before binding —
-            // this is what makes set(name, value) actually reach the GPU each
-            // draw. The memory is HOST_COHERENT so no flush is needed before
-            // the descriptor read, and the slice belongs to a slot whose
-            // previous frame the worker has already waited out.
-            if (void* dst = shader.uniformMapped(frameSlot)) {
-                std::memcpy(dst, shader.uniformData(), shader.uniformSize());
-            }
-
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                shader.layout(), 0, 1, &set, 0, nullptr);
-        }
+        bindSets(cmd, shader, frameSlot, drawImages);
 
         vkCmdDraw(cmd, 3, 1, 0, 0);
 
@@ -271,6 +235,32 @@ public:
     }
 
 private:
+    // Binds the shader's descriptor sets (as many as its layout has: Shader::descriptorSetCount):
+    // set 0 its own bindings, set 1 the scene a reader reads, sets 2.. the draw's images
+    // (Shader::setDrawImage, cached textures' own sets). A set it doesn't use takes the black
+    // pixel; set 0 of a shader without bindings of its own borrows the scene's or the pixel's.
+    // First refreshes this frame slot's slice of the shader's uniform/storage buffer from its
+    // CPU shadow — what makes set(name, value) reach the GPU each draw. The memory is
+    // HOST_COHERENT so no flush is needed before the descriptor read, and the slice belongs to a
+    // slot whose previous frame the worker has already waited out.
+    void bindSets(VkCommandBuffer cmd, Shader& shader, int frameSlot,
+                  std::span<const VkDescriptorSet> drawImages, VkDescriptorSet sceneSet = VK_NULL_HANDLE)
+    {
+        const VkDescriptorSet own = shader.descriptorSet(frameSlot);
+        if (own != VK_NULL_HANDLE)
+            if (void* dst = shader.uniformMapped(frameSlot))
+                std::memcpy(dst, shader.uniformData(), shader.uniformSize());
+        const uint32_t count = std::min<uint32_t>(shader.descriptorSetCount(), 2 + kShaderDrawImages);
+        if (count == 0) return;
+        const VkDescriptorSet pixel = device_->caches().defaultDescriptor();
+        VkDescriptorSet sets[2 + kShaderDrawImages] {};
+        sets[0] = own != VK_NULL_HANDLE ? own : (sceneSet != VK_NULL_HANDLE ? sceneSet : pixel);
+        if (count > 1) sets[1] = sceneSet != VK_NULL_HANDLE ? sceneSet : pixel;
+        for (uint32_t i = 2; i < count; ++i)
+            sets[i] = (i - 2 < drawImages.size() && drawImages[i - 2] != VK_NULL_HANDLE) ? drawImages[i - 2] : pixel;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shader.layout(), 0, count, sets, 0, nullptr);
+    }
+
     // The draw's own constants (Shader::setDrawConstants), after jvk's floats.
     static void pushDrawConstants(VkCommandBuffer cmd, Shader& shader, std::span<const float> values)
     {

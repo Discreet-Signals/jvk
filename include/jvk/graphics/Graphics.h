@@ -1310,6 +1310,10 @@ public:
 
     Renderer& getRenderer() { return renderer_; }
 
+    // The Shader for `spirv` from this window's shader cache (Renderer::shader):
+    // built on first ask, kept with the context, shared by every caller.
+    Shader& shader(std::span<const uint32_t> spirv) { return renderer_.shader(spirv); }
+
 private:
     // drawShader's record-time step: binds the targets the shader reads and
     // copies its per-draw constants. Defined in Shader.h: this header only

@@ -10,6 +10,7 @@ class HSVPipeline;
 class ShapeBlurPipeline;
 class PathBlurPipeline;
 class ShaderPipeline;
+class Shader;
 class PathPipeline;
 class ClipPipeline;
 class GradientAtlas;   // defined in Cache.h (included after this header)
@@ -573,6 +574,17 @@ public:
     Device&         device()   { return device_; }
     RenderTarget&   target()   { return target_; }
     ResourceCaches& caches()   { return device_.caches(); }
+
+    // ---- Shaders --------------------------------------------------------------
+    //
+    // The context's shader cache: the Shader for `spirv` (keyed by its code's
+    // address: a program compiled into the binary), built on first ask and kept
+    // for this Renderer's life. Every component drawing in this window draws the
+    // one compiled program, none of them owns it, and it goes with the context
+    // (a window switched to software keeps no shader). Shared by every caller,
+    // so what differs per caller goes per draw (Shader::setDrawConstants,
+    // setDrawImage). Message thread, while recording.
+    Shader& shader(std::span<const uint32_t> spirv);
     State&          state()    { return state_; }
     Memory::V&      vertices() { return vertices_; }
     const Arena&    arena() const { return arena_; }
@@ -597,6 +609,8 @@ public:
     VkDescriptorSet gradientDescriptor() const;
 
 private:
+    std::map<const uint32_t*, std::unique_ptr<Shader>> shaders_;   // shader()
+
     Device&       device_;
     RenderTarget& target_;
     State         state_;

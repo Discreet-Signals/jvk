@@ -215,6 +215,31 @@ public:
     }
     std::span<const float> drawConstants() const { return { drawConstants_.data(), drawConstantCount_ }; }
 
+    // ===== Per-draw images ===================================================
+    //
+    // A sampler declared in a descriptor set of its own, set 2 or above, at
+    // binding 0 (`layout(set = 2, binding = 0) uniform sampler2D albedo;`), is a
+    // PER-DRAW image: setDrawImage names what the NEXT draw binds there (the draw
+    // takes it; a slot left unnamed samples the black pixel). It resolves
+    // through the texture cache when the draw is recorded — one upload per
+    // content key, shared by every draw and window — and the draw binds the
+    // cached texture's own descriptor set: nothing is written into this
+    // Shader's descriptors and it holds no image, so one Shader draws any
+    // number of images a frame without a stall. Up to kShaderDrawImages.
+    void setDrawImage (const juce::String& name, const ImageSource& source)
+    {
+        for (size_t i = 0; i < drawImageNames_.size(); ++i)
+            if (drawImageNames_[i] == name)
+                drawImages_[i] = source;
+    }
+
+    // The per-draw images the next draw takes, by slot (set - 2); cleared by it.
+    uint32_t drawImageCount() const { return static_cast<uint32_t>(drawImageNames_.size()); }
+    ImageSource takeDrawImage (uint32_t slot) { return std::exchange (drawImages_[slot], {}); }
+
+    // How many descriptor sets its layout has (ShaderPipeline::bindSets).
+    uint32_t descriptorSetCount() const { return setCount_; }
+
     // ===== Reading targets ===================================================
     //
     // A shader reads a target by declaring a sampler2D with the target's name
@@ -464,19 +489,19 @@ public:
 
         VkPipelineLayoutCreateInfo pli {};
         pli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        // A scene reader's set 1 is the scene's sampler, the IMAGE_SAMPLER layout of the
-        // descriptor sets jvk keeps for each half of the scene (bound per draw at replay).
-        // Its set 0, when it declares no bindings of its own, borrows that layout too.
-        VkDescriptorSetLayout setLayouts[2] = { setLayout, VK_NULL_HANDLE };
-        uint32_t setCount = (setLayout != VK_NULL_HANDLE) ? 1u : 0u;
-        if (readsScene_) {
-            VkDescriptorSetLayout sceneLayout = device.bindings().getLayout(Memory::M::IMAGE_SAMPLER);
-            if (setLayouts[0] == VK_NULL_HANDLE) setLayouts[0] = sceneLayout;
-            setLayouts[1] = sceneLayout;
-            setCount = 2;
-        }
-        pli.setLayoutCount = setCount;
-        pli.pSetLayouts = setCount > 0 ? setLayouts : nullptr;
+        // Set 0: its own bindings. Set 1: a scene reader's scene, the IMAGE_SAMPLER layout of
+        // the descriptor sets jvk keeps for each half of the scene (bound per draw at replay).
+        // Sets 2..: its per-draw images, the same layout (each cached texture's own set). The
+        // layout has every set up to its last: one it doesn't use takes the IMAGE_SAMPLER
+        // layout and the black pixel (ShaderPipeline::bindSets).
+        VkDescriptorSetLayout imageLayout = device.bindings().getLayout(Memory::M::IMAGE_SAMPLER);
+        VkDescriptorSetLayout setLayouts[2 + kShaderDrawImages] {};
+        setCount_ = drawImageNames_.empty() ? (readsScene_ ? 2u : (setLayout != VK_NULL_HANDLE ? 1u : 0u))
+                                            : 2u + static_cast<uint32_t>(drawImageNames_.size());
+        for (uint32_t i = 0; i < setCount_; ++i)
+            setLayouts[i] = (i == 0 && setLayout != VK_NULL_HANDLE) ? setLayout : imageLayout;
+        pli.setLayoutCount = setCount_;
+        pli.pSetLayouts = setCount_ > 0 ? setLayouts : nullptr;
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pushRange;
         vkCreatePipelineLayout(d, &pli, nullptr, &layout_);
@@ -681,6 +706,10 @@ public:
     }
 
 private:
+    std::vector<juce::String> drawImageNames_;                    // per-draw image slots (set - 2), by sampler name
+    std::array<ImageSource, kShaderDrawImages> drawImages_ {};     // what the next draw binds there
+    uint32_t setCount_ = 0;                                        // the pipeline layout's descriptor sets
+
     struct BindingInfo {
         juce::String     name;
         juce::String     blockName;   // a uniform block's declared name; set() takes either
@@ -732,10 +761,22 @@ private:
 
         uint32_t bufferOffset = 0;
         readsScene_ = false;
+        drawImageNames_.clear();
         for (auto* rb : reflBindings) {
             if (rb->set == 1) {   // set 1, binding 0: the scene (readsScene); jvk binds it
                 readsScene_ = readsScene_
                     || (rb->binding == 0 && rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+                continue;
+            }
+            if (rb->set >= 2) {   // a set of its own, binding 0: a per-draw image (setDrawImage)
+                const auto slot = rb->set - 2;
+                jassert (rb->binding == 0 && slot < kShaderDrawImages
+                         && rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+                if (rb->binding == 0 && slot < kShaderDrawImages
+                    && rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+                    if (drawImageNames_.size() <= slot) drawImageNames_.resize(slot + 1);
+                    drawImageNames_[slot] = rb->name != nullptr ? juce::String(juce::CharPointer_UTF8(rb->name)) : juce::String();
+                }
                 continue;
             }
             BindingInfo info;
@@ -893,6 +934,11 @@ inline void Graphics::prepareShaderDraw(Shader& shader, DrawShaderParams& params
     const auto constants = shader.drawConstants();
     params.constantCount = static_cast<uint32_t>(constants.size());
     std::copy(constants.begin(), constants.end(), params.constants);
+    params.imageCount = std::min<uint32_t>(shader.drawImageCount(), kShaderDrawImages);
+    for (uint32_t i = 0; i < params.imageCount; ++i) {
+        const auto source = shader.takeDrawImage(i);
+        params.images[i] = source.isValid() ? renderer_.caches().getTexture(source, renderer_) : VK_NULL_HANDLE;
+    }
 }
 
 } // namespace jvk

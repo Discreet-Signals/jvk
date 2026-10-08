@@ -57,6 +57,16 @@ VkDescriptorSet Renderer::gradientDescriptor() const
     return gradientAtlas_->descriptorSet();
 }
 
+Shader& Renderer::shader(std::span<const uint32_t> spirv)
+{
+    auto& s = shaders_[spirv.data()];
+    if (s == nullptr) {
+        s = std::make_unique<Shader>();
+        s->load(spirv);
+    }
+    return *s;
+}
+
 void Renderer::reset()
 {
     commands_.clear();
@@ -89,6 +99,7 @@ Renderer::~Renderer()
     }
     if (worker_) worker_.reset();
     flushRetains();
+    shaders_.clear();   // its frames are done: no draw of them is in flight
     // Return slot-parked staging blocks to the belt so ~L2 frees them —
     // Block is a plain handle struct, so destroying the vectors alone would
     // leak the VkBuffer/VkDeviceMemory. GPU is idle per the dtor contract.
@@ -710,7 +721,7 @@ void Renderer::execute()
         shaderPipeline_->dispatchTarget(frame.cmd, shader, rp, sp.region * s,
             static_cast<float>(e.width), static_cast<float>(e.height),
             (c.clipBounds.toFloat() * s).getSmallestIntegerContainer(),
-            frameTime, frame.frameSlot, { sp.constants, sp.constantCount });
+            frameTime, frame.frameSlot, { sp.constants, sp.constantCount }, { sp.images, sp.imageCount });
         vkCmdEndRenderPass(frame.cmd);
         scaledWritten |= written & scaled;
     };
@@ -1013,7 +1024,7 @@ void Renderer::execute()
                         vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
                         shaderPipeline_->dispatchPass(frame.cmd, *shader, sp.region, fw, fh,
                             cmd.clipBounds, cmd.stencilDepth, frameTime, frame.frameSlot,
-                            { sp.constants, sp.constantCount }, src);
+                            { sp.constants, sp.constantCount }, { sp.images, sp.imageCount }, src);
                         vkCmdEndRenderPass(frame.cmd);
                     };
                     endScene();
@@ -1037,7 +1048,7 @@ void Renderer::execute()
                     vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
                     shaderPipeline_->dispatchPass(frame.cmd, *shader, sp.region, fw, fh,
                         cmd.clipBounds, cmd.stencilDepth, frameTime, frame.frameSlot,
-                        { sp.constants, sp.constantCount });
+                        { sp.constants, sp.constantCount }, { sp.images, sp.imageCount });
                     vkCmdEndRenderPass(frame.cmd);
                 }
                 else if (shader && (sp.writesMain || (sp.targetsWritten & replayLive_) != 0)) {
@@ -1048,7 +1059,7 @@ void Renderer::execute()
                         cmd.stencilDepth,
                         frameTime,
                         frame.frameSlot,
-                        { sp.constants, sp.constantCount });
+                        { sp.constants, sp.constantCount }, { sp.images, sp.imageCount });
                 }
             }
             continue;
