@@ -145,7 +145,7 @@ public:
         // is scissor-clipped only, so it spills out of every non-rectangular
         // clip (a rounded-rect reduceClipRegion leaves square corners).
         // The defaults: into the main colour, every target live.
-        const uint8_t clears = paintClears(targets_, 0, /*paint*/ true, 0xFF);
+        const TargetMask clears = paintClears(targets_, 0, /*paint*/ true, TargetMask(~0u));
         pipeline_     = buildPipeline(sceneRenderPass, vertSpv, fragSpv, false, 0, clears);
         clipPipeline_ = buildPipeline(sceneRenderPass, vertSpv, fragSpv, true, 0, clears);
         variants_.add(0, false, clears, pipeline_);
@@ -156,9 +156,9 @@ public:
     // DrawCommand::target) while the targets in `live` are still read later
     // this frame (Renderer::liveTargets), built on first use. A path fill is
     // paint (path_sdf.frag).
-    VkPipeline variant(uint8_t attachment, bool clip, uint8_t live)
+    VkPipeline variant(uint8_t attachment, bool clip, TargetMask live)
     {
-        const uint8_t clears = paintClears(targets_, attachment, /*paint*/ true, live);
+        const TargetMask clears = paintClears(targets_, attachment, /*paint*/ true, live);
         return variants_.get(attachment, clip, clears, targets_.size(), [&]
         {
             return buildPipeline(renderPass_, vertSpv_, fragSpv_, clip, attachment, clears);
@@ -398,7 +398,7 @@ private:
                              std::span<const uint32_t> fragSpv,
                              bool clipVariant,
                              uint8_t attachment,
-                             uint8_t clears)
+                             TargetMask clears)
     {
         VkDevice d = device_->device();
 

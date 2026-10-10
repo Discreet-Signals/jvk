@@ -18,11 +18,11 @@ Pipeline::Pipeline(Pipeline&& o) noexcept
     o.built_  = false;
 }
 
-VkPipeline Pipeline::variant(uint8_t attachment, bool clip, uint8_t live)
+VkPipeline Pipeline::variant(uint8_t attachment, bool clip, TargetMask live)
 {
     if (!built_) return VK_NULL_HANDLE;
     clip = clip && hasClip_;   // no clip config: the normal variant serves both
-    const uint8_t clears = paintClears(targets_, attachment, paintClearsTargets_, live);
+    const TargetMask clears = paintClears(targets_, attachment, paintClearsTargets_, live);
     return variants_.get(attachment, clip, clears, targets_.size(), [&]
     {
         return buildVariant(clip ? *clipConfig() : config(), renderPass_, layout_, attachment, clears);
@@ -70,7 +70,7 @@ void Pipeline::build(VkRenderPass renderPass, const std::vector<Target>& targets
     // via a final subpixel-offset supersample effect pass.
     // The defaults: into the main colour, every target live (the frame's
     // common case up to its last target reader).
-    const uint8_t clears = paintClears(targets_, 0, paintClearsTargets_, 0xFF);
+    const TargetMask clears = paintClears(targets_, 0, paintClearsTargets_, TargetMask(~0u));
     VkPipeline normal = buildVariant(cfg, renderPass, layout_, 0, clears);
     if (normal == VK_NULL_HANDLE)
         return;   // built_ stays false
@@ -89,7 +89,7 @@ void Pipeline::build(VkRenderPass renderPass, const std::vector<Target>& targets
 }
 
 VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass renderPass,
-                                   VkPipelineLayout layout, uint8_t attachment, uint8_t clears)
+                                   VkPipelineLayout layout, uint8_t attachment, TargetMask clears)
 {
     VkDevice d = device_.device();
 

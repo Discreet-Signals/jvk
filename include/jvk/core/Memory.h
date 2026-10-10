@@ -94,6 +94,10 @@ private:
 // =============================================================================
 // L2 — Staging (host-visible, CPU→GPU transfer, linear bump allocator)
 //
+// Blocks are BLOCK_SIZE and reused; a request larger than that gets a
+// DEDICATED block of its own size, destroyed once its fence passes. Free
+// blocks idle for kIdleMs go back to the driver, down to kKeepBlocks.
+//
 // Every mutator takes `lock_`. L2 is used in two shapes:
 //   1. Per-Renderer (Renderer::staging_): record-phase allocs on the message
 //      thread, worker-phase allocs on the render-worker thread. The
@@ -204,6 +208,8 @@ public:
         // in-flight command buffer, so only the normal fence-keyed park may
         // release it (recycleUnrecorded must skip it).
         bool         recordedFrom = false;
+        // Millisecond counter when it last joined the free list.
+        uint32_t     freedAt = 0;
     };
 
     // Mark an allocation's data as queued (called by Renderer::upload under
@@ -223,20 +229,19 @@ public:
     // by the worker's flushUploads in the same lock hold as the queue swap;
     // parked blocks recycle when the frame slot's fence next signals. The
     // surviving current block is marked recordedFrom — this flush may have
-    // recorded copies sourced from it.
+    // recorded copies sourced from it. A dedicated block is never current.
     void parkAllButCurrent(std::vector<Block>& out)
     {
         const juce::ScopedLock lk(lock_);
-        if (activeBlocks.empty()) return;
-        for (size_t i = 0; i + 1 < activeBlocks.size(); ) {
-            if (activeBlocks[i].uncommitted == 0) {
+        for (size_t i = 0; i < activeBlocks.size(); ) {
+            if (! isCurrent(i) && activeBlocks[i].uncommitted == 0) {
                 out.push_back(std::move(activeBlocks[i]));
                 activeBlocks.erase(activeBlocks.begin() + static_cast<ptrdiff_t>(i));
             } else {
                 ++i;
             }
         }
-        activeBlocks.back().recordedFrom = true;
+        if (! activeBlocks.empty()) activeBlocks.back().recordedFrom = true;
     }
 
     // Skip-path bound (no submission happened): return to the free list any
@@ -246,14 +251,13 @@ public:
     void recycleUnrecorded(const std::vector<VkBuffer>& stillReferenced)
     {
         const juce::ScopedLock lk(lock_);
+        const auto now = juce::Time::getMillisecondCounter();
         for (size_t i = 0; i < activeBlocks.size(); ) {
             auto& b = activeBlocks[i];
             const bool referenced = std::find(stillReferenced.begin(), stillReferenced.end(),
                                               b.buffer) != stillReferenced.end();
-            const bool isCurrent  = (i + 1 == activeBlocks.size());
-            if (!referenced && !isCurrent && !b.recordedFrom && b.uncommitted == 0) {
-                b.writeHead = 0;
-                freeBlocks.push_back(std::move(b));
+            if (!referenced && !isCurrent(i) && !b.recordedFrom && b.uncommitted == 0) {
+                release(b, now);
                 activeBlocks.erase(activeBlocks.begin() + static_cast<ptrdiff_t>(i));
             } else {
                 ++i;
@@ -261,16 +265,18 @@ public:
         }
     }
 
+    // Called once per executed frame with the blocks its slot's fence just
+    // freed, so it also trims the free list.
     void recycle(std::vector<Block>& used)
     {
         const juce::ScopedLock lk(lock_);
-        for (auto& b : used) {
-            b.writeHead = 0;
-            b.uncommitted = 0;
-            b.recordedFrom = false;
-            freeBlocks.push_back(std::move(b));
-        }
+        const auto now = juce::Time::getMillisecondCounter();
+        for (auto& b : used) release(b, now);
         used.clear();
+        while (freeBlocks.size() > kKeepBlocks && now - freeBlocks.front().freedAt > kIdleMs) {
+            destroyBlock(freeBlocks.front());
+            freeBlocks.erase(freeBlocks.begin());
+        }
     }
 
 private:
@@ -278,6 +284,8 @@ private:
     // VkBufferImageCopy::bufferOffset must be a multiple of 4 and of the
     // texel block size; 16 covers every format jvk stages.
     static constexpr VkDeviceSize kOffsetAlign = 16;
+    static constexpr uint32_t     kIdleMs = 2000;
+    static constexpr size_t       kKeepBlocks = 4;
 
     std::vector<Block> activeBlocks;
     std::vector<Block> freeBlocks;
@@ -316,6 +324,22 @@ private:
         b.uncommitted = 0;
         b.recordedFrom = false;
         return true;
+    }
+
+    bool isCurrent(size_t i) const
+    {
+        return i + 1 == activeBlocks.size() && activeBlocks[i].capacity <= BLOCK_SIZE;
+    }
+
+    // A dedicated block is destroyed; a shared one joins the free list.
+    void release(Block& b, uint32_t now)
+    {
+        if (b.capacity > BLOCK_SIZE) { destroyBlock(b); return; }
+        b.writeHead = 0;
+        b.uncommitted = 0;
+        b.recordedFrom = false;
+        b.freedAt = now;
+        freeBlocks.push_back(std::move(b));
     }
 
     void destroyBlock(Block& b)

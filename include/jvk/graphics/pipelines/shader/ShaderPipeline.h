@@ -95,17 +95,18 @@ public:
     }
 
     // Draws `shader` in a TARGET PASS the caller has begun (`renderPass`: the targets it
-    // writes, Renderer), over `region` in those targets' pixels (the viewport is their
-    // size), scissored to `clip` within it. The pass has no stencil, so no path clips. Such
-    // a shader is built against that pass on first use and is only ever drawn this way.
-    void dispatchTarget(VkCommandBuffer cmd, Shader& shader, VkRenderPass renderPass,
+    // writes, at `slots`, Renderer), over `region` in those targets' pixels (the viewport
+    // is their size), scissored to `clip` within it. The pass has no stencil, so no path
+    // clips. Such a shader is built against that pass on first use and is only ever drawn
+    // this way.
+    void dispatchTarget(VkCommandBuffer cmd, Shader& shader, VkRenderPass renderPass, TargetSlots slots,
                         juce::Rectangle<float> region, float viewportW, float viewportH,
                         const juce::Rectangle<int>& clip, float frameTime, int frameSlot,
                         std::span<const float> drawConstants = {},
                         std::span<const VkDescriptorSet> drawImages = {})
     {
         if (!device_) return;
-        shader.ensureCreated(*device_, renderPass, VK_SAMPLE_COUNT_1_BIT, targets_);
+        shader.ensureCreated(*device_, renderPass, VK_SAMPLE_COUNT_1_BIT, targets_, slots);
         if (!shader.isReady()) return;
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shader.pipeline());
 

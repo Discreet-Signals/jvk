@@ -144,7 +144,7 @@ public:
     // still read later this frame (Renderer::liveTargets), the clip variant
     // when a path clip is active. False (nothing bound) when that variant
     // could not be built; the caller skips the draw.
-    bool setPipeline(Pipeline* pipeline, uint8_t attachment = 0, uint8_t live = 0xFF);
+    bool setPipeline(Pipeline* pipeline, uint8_t attachment = 0, TargetMask live = TargetMask(~0u));
     void setCustomPipeline(VkPipeline pipeline, VkPipelineLayout layout);
     // set 0 = color source (solid default or gradient LUT), set 1 = shape source
     // (1x1 default, MSDF atlas page, or image texture). Each dirty-tracked.
@@ -237,24 +237,24 @@ public:
     //
     // The command just recorded samples `targets` (jvk::Graphics::drawShader,
     // for a shader that reads them).
-    void noteTargetsRead(uint8_t targets)
+    void noteTargetsRead(TargetMask targets)
     {
         for (uint32_t i = 0; i < kMaxTargets; ++i)
             if (targets & (1u << i))
                 targetReadEnd_[i] = static_cast<uint32_t>(commands_.size());
     }
     // The targets command `index` or a later one reads.
-    uint8_t liveTargets(size_t index) const
+    TargetMask liveTargets(size_t index) const
     {
-        uint8_t live = 0;
+        TargetMask live = 0;
         for (uint32_t i = 0; i < kMaxTargets; ++i)
             if (index < targetReadEnd_[i])
-                live |= static_cast<uint8_t>(1u << i);
+                live |= static_cast<TargetMask>(1u << i);
         return live;
     }
     // While replaying: liveTargets of the command being executed (for a
     // pipeline that binds its own variants, e.g. PathPipeline).
-    uint8_t replayLiveTargets() const { return replayLive_; }
+    TargetMask replayLiveTargets() const { return replayLive_; }
 
     // Pin a FrameRetained so its destructor will block until the GPU is
     // done with the frame this record is being assembled into. Called by
@@ -624,10 +624,9 @@ private:
     std::vector<VkClearValue> clearScratch_;   // worker-only: scene pass clear values (capacity kept)
 
     // Target lifetimes (noteTargetsRead): per target, the index of its last
-    // reader + 1 this frame (0 = never read). Up to 7 targets (PipelineConfig.h).
-    static constexpr uint32_t kMaxTargets = 7;
-    uint32_t targetReadEnd_[kMaxTargets] {};
-    uint8_t  replayLive_ = 0xFF;   // worker-only: liveTargets of the command being replayed
+    // reader + 1 this frame (0 = never read). Up to kMaxTargets (PipelineConfig.h).
+    uint32_t   targetReadEnd_[kMaxTargets] {};
+    TargetMask replayLive_ = TargetMask(~0u);   // worker-only: liveTargets of the command being replayed
 
     // Clip ops change the stencil, whatever the draw target.
     static bool isClipOp(DrawOp op)

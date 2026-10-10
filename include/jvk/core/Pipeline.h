@@ -15,7 +15,7 @@ public:
     // first time it is asked for. Null for a target the pass doesn't have. A
     // failed build is remembered (as null) so it is never retried per draw.
     template <typename Build>
-    VkPipeline get(uint8_t attachment, bool clip, uint8_t clears, size_t targetCount, Build&& build)
+    VkPipeline get(uint8_t attachment, bool clip, TargetMask clears, size_t targetCount, Build&& build)
     {
         for (auto& v : variants_)
             if (v.attachment == attachment && v.clip == clip && v.clears == clears)
@@ -27,7 +27,7 @@ public:
     }
 
     // A variant built up front (the defaults).
-    void add(uint8_t attachment, bool clip, uint8_t clears, VkPipeline handle)
+    void add(uint8_t attachment, bool clip, TargetMask clears, VkPipeline handle)
     {
         variants_.push_back({ attachment, clip, clears, handle });
     }
@@ -40,7 +40,7 @@ public:
     }
 
 private:
-    struct Variant { uint8_t attachment; bool clip; uint8_t clears; VkPipeline handle; };
+    struct Variant { uint8_t attachment; bool clip; TargetMask clears; VkPipeline handle; };
     std::vector<Variant> variants_;
 };
 
@@ -84,8 +84,8 @@ public:
     // fragment shaders write the same colour to every output location; a
     // variant enables writes on its one attachment only (plus, for paint into
     // the main colour, the live targets it clears).
-    VkPipeline       handle    (uint8_t attachment = 0, uint8_t live = 0xFF) { return variant(attachment, false, live); }
-    VkPipeline       clipHandle(uint8_t attachment = 0, uint8_t live = 0xFF) { return variant(attachment, true, live); }
+    VkPipeline       handle    (uint8_t attachment = 0, TargetMask live = TargetMask(~0u)) { return variant(attachment, false, live); }
+    VkPipeline       clipHandle(uint8_t attachment = 0, TargetMask live = TargetMask(~0u)) { return variant(attachment, true, live); }
     VkPipelineLayout layout()     const { return layout_; }
 
 protected:
@@ -106,9 +106,9 @@ private:
     bool built_ = false;
     bool hasClip_ = false;
 
-    VkPipeline variant(uint8_t attachment, bool clip, uint8_t live);
+    VkPipeline variant(uint8_t attachment, bool clip, TargetMask live);
     VkPipeline buildVariant(const PipelineConfig& cfg, VkRenderPass renderPass,
-                            VkPipelineLayout layout, uint8_t attachment, uint8_t clears);
+                            VkPipelineLayout layout, uint8_t attachment, TargetMask clears);
 };
 
 } // namespace jvk

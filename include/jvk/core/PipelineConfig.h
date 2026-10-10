@@ -80,8 +80,10 @@ struct PipelineConfig
 //     target exactly as it would to the main colour. The selection is part of
 //     the saved graphics state.
 //   - A jvk::Shader writes target i by declaring output `layout(location =
-//     i + 1)`; location 0 is always the main colour. Each write combines with
-//     what the target holds through the target's Blend.
+//     i + 1)`; location 0 is always the main colour. A SCALED target (below)
+//     it may write instead by declaring an output named after it, at any
+//     location from 1. Each write combines with what the target holds through
+//     the target's Blend.
 //   - A jvk::Shader reads targets as inputs by declaring samplers with their
 //     names. Drawn inline (Graphics::drawShader), it runs as its own pass at
 //     that point in paint order, sees everything drawn into the targets
@@ -94,7 +96,16 @@ struct PipelineConfig
 // Declare them with AudioProcessorEditor::setTargets, before Vulkan starts:
 // they are fixed while it runs. They need the independentBlend device
 // feature (Device::supportsIndependentBlend).
+//
+// Up to kMaxTargets in all. The ones at scale 1 are the scene passes' colour
+// attachments, target i at location i + 1, so there are at most
+// kMaxSceneTargets of them (fewer where the device allows fewer colour
+// attachments), each among the first that many declared.
 // =============================================================================
+
+// Targets as a mask: bit i = target i.
+using TargetMask = uint16_t;
+inline constexpr size_t kMaxTargets = 16, kMaxSceneTargets = 7;
 
 struct Target
 {
@@ -128,26 +139,64 @@ struct Target
     // written for something is replaced by the clear value wherever ordinary
     // paint lands over it later (a label, a panel). Draws INTO the target
     // (Graphics::setTarget) are unaffected; effects, Multiply blends and
-    // jvk::Shader draws don't clear it. Up to 7 targets.
+    // jvk::Shader draws don't clear it.
     bool              clearedByMain = false;
 
     // Its size relative to the frame's, per side (ceil(frame x scale)). At 1 it is an
     // attachment of the scene passes, as above. A SCALED target (down- or upsampled) is
-    // not: only jvk::Shader draws write it (by output location, as any target), each as
-    // its own TARGET PASS with it as the attachment (Renderer), in its own pixels and
-    // without path clips; ordinary draws can't select it and clearedByMain doesn't apply.
-    // It holds its clear value until its first write in a frame.
+    // not: only jvk::Shader draws write it (by output location, or by an output named
+    // after it), each as its own TARGET PASS with it as the attachment (Renderer), in its
+    // own pixels and without path clips; ordinary draws can't select it and clearedByMain
+    // doesn't apply. It holds its clear value until its first write in a frame.
     float             scale = 1.0f;
 
-    bool isScaled() const { return scale != 1.0f; }
+    // A FIXED HEIGHT in pixels (0: none), in place of `scale`: the target is this tall at
+    // any frame size and keeps the frame's shape (its scale is height / the frame's
+    // height), so filling it costs the same in any window, each of its pixels spreading
+    // over more of the frame as the window grows. Scaled, as above.
+    int               height = 0;
+
+    bool isScaled() const { return scale != 1.0f || height > 0; }
+
+    // Whether it is always the size of `o`: what one target pass can write together.
+    bool sameSize(const Target& o) const { return scale == o.scale && height == o.height; }
 
     bool operator==(const Target& o) const
     {
         return name == o.name && format == o.format && blend == o.blend
-            && clearedByMain == o.clearedByMain && scale == o.scale
+            && clearedByMain == o.clearedByMain && sameSize(o)
             && std::memcmp(&clear, &o.clear, sizeof(clear)) == 0;
     }
 };
+
+// The colour slots of the scene passes: the main colour, then one per target up to the
+// last at scale 1 (slot i + 1 = target i; a scaled target's among them is unused).
+inline size_t sceneSlots(const std::vector<Target>& targets)
+{
+    size_t n = 1;
+    for (size_t i = 0; i < targets.size(); ++i)
+        if (!targets[i].isScaled()) n = i + 2;
+    return n;
+}
+
+// The colour slots of a TARGET PASS: byte L = 1 + the target its shader writes at output
+// location L (0: none; location 0, the main colour, is never one).
+using TargetSlots = uint64_t;
+inline int slotTarget(TargetSlots slots, uint32_t location) { return static_cast<int>((slots >> (8 * location)) & 0xFFu) - 1; }
+inline TargetMask slotTargets(TargetSlots slots)
+{
+    TargetMask mask = 0;
+    for (uint32_t l = 1; l < 8; ++l)
+        if (const int t = slotTarget(slots, l); t >= 0) mask |= static_cast<TargetMask>(1u << t);
+    return mask;
+}
+inline uint32_t slotCount(TargetSlots slots)
+{
+    uint32_t n = 0;
+    for (uint32_t l = 1; l < 8; ++l)
+        if (slotTarget(slots, l) >= 0) n = l + 1;
+    return n;
+}
 
 // The blend of a draw into the main colour on a target it clears
 // (Target::clearedByMain): the draw writes (clear.rgb, its alpha) there.
@@ -232,31 +281,32 @@ inline VkPipelineColorBlendAttachmentState blendAttachment(Target::Blend mode)
 // nothing reads any more is a dead store). `paint`: the pipeline's fragment
 // shader is a paint shader (ui2d.frag, path_sdf.frag: it writes every output
 // location and takes PaintSpecialization). Every other draw clears none.
-inline uint8_t paintClears(const std::vector<Target>& targets, uint8_t attachment,
-                           bool paint, uint8_t live)
+inline TargetMask paintClears(const std::vector<Target>& targets, uint8_t attachment,
+                              bool paint, TargetMask live)
 {
     if (!paint || attachment != 0) return 0;
-    uint8_t clears = 0;
-    for (size_t i = 0; i < targets.size() && i < 8; ++i)
+    TargetMask clears = 0;
+    for (size_t i = 0; i < targets.size(); ++i)
         if (targets[i].clearedByMain)
-            clears |= static_cast<uint8_t>(1u << i);
+            clears |= static_cast<TargetMask>(1u << i);
     return clears & live;
 }
 
 // How a BUILT-IN draw lands in a pass with render targets: the one rule
 // every built-in pipeline builds from (Pipeline, PathPipeline). Per colour
-// attachment of the pass: the draw's `blend` on the attachment it lands on
-// (0 = main colour, i + 1 = target i; overwritten, not blended, on a target
-// declared Replace), nothing written on the others, except the targets in
-// `clears` (paintClears), set to their clear values under the paint. Holds
-// pointers into itself: build it where the pipeline is created, never copy it.
+// attachment of the scene pass (sceneSlots): the draw's `blend` on the
+// attachment it lands on (0 = main colour, i + 1 = target i; overwritten, not
+// blended, on a target declared Replace), nothing written on the others,
+// except the targets in `clears` (paintClears), set to their clear values
+// under the paint. Holds pointers into itself: build it where the pipeline is
+// created, never copy it.
 struct DrawTargets
 {
     DrawTargets(const std::vector<Target>& targets, uint8_t attachment,
-                VkPipelineColorBlendAttachmentState blend, uint8_t clears)
+                VkPipelineColorBlendAttachmentState blend, TargetMask clears)
         : paintsMain(attachment == 0 && clears != 0 && blend.colorWriteMask != 0),
           specialization(paintsMain, targets),
-          states(1 + targets.size(), blendAttachment(Target::Blend::None))
+          states(sceneSlots(targets), blendAttachment(Target::Blend::None))
     {
         if (attachment > 0 && attachment <= targets.size()
             && targets[attachment - 1].blend == Target::Blend::Replace)
@@ -264,7 +314,7 @@ struct DrawTargets
         if (attachment < states.size())
             states[attachment] = blend;
         if (paintsMain)
-            for (size_t i = 0; i < targets.size() && i < 8; ++i)
+            for (size_t i = 0; 1 + i < states.size(); ++i)
                 if (clears & (1u << i))
                     states[1 + i] = clearedByMainAttachment(targets[i]);
 

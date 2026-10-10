@@ -86,7 +86,7 @@ public:
     // noise) work on the main colour only and are skipped while a target is
     // the target. jvk::Shader draws write the locations their shader declares,
     // whatever the target. Returns false if `name` isn't a target here, or is
-    // a scaled one (Target::scale: only shaders write those, by location).
+    // a scaled one (Target::scale: only shaders write those).
     static inline const juce::Identifier mainTarget { "main" };
 
     bool setTarget(const juce::Identifier& name)

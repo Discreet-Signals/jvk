@@ -65,7 +65,7 @@ public:
     // and stored; the rest are neither (DONT_CARE). Load and store ops don't
     // affect render-pass compatibility, so every variant runs the same
     // pipelines and framebuffers.
-    virtual VkRenderPass sceneRenderPass(bool clear, uint8_t liveTargets)
+    virtual VkRenderPass sceneRenderPass(bool clear, TargetMask liveTargets)
     {
         juce::ignoreUnused(liveTargets);
         return clear ? sceneRenderPassClear() : sceneRenderPassLoad();
@@ -77,8 +77,8 @@ public:
 
     // ---- Render targets (PipelineConfig.h) ---------------------------------
     // The extra colour targets of the scene render passes, in attachment
-    // order after the main colour (target i = attachment / output location
-    // i + 1). One image each, shared by every frame slot: a frame clears its
+    // order after the main colour (target i = output location i + 1; a scaled
+    // one is no attachment of theirs). One image each, shared by every frame slot: a frame clears its
     // targets when its first scene pass begins, and the passes' external
     // dependencies order that after the previous frame's reads. Between scene
     // passes (effects, target-reading shaders, the final blit) they sit in
@@ -97,28 +97,36 @@ public:
             if (targets_[i].name == name) return static_cast<int>(i);
         return -1;
     }
-    // The scaled targets (Target::scale), bit i = target i: not scene-pass attachments.
-    uint8_t scaledTargets() const
+    // The scaled targets (Target::scale, Target::height), bit i = target i: not scene-pass attachments.
+    TargetMask scaledTargets() const
     {
-        uint8_t mask = 0;
-        for (size_t i = 0; i < targets_.size() && i < 8; ++i)
-            if (targets_[i].isScaled()) mask |= static_cast<uint8_t>(1u << i);
+        TargetMask mask = 0;
+        for (size_t i = 0; i < targets_.size(); ++i)
+            if (targets_[i].isScaled()) mask |= static_cast<TargetMask>(1u << i);
         return mask;
     }
-    // Target i's size in pixels: the frame's, times its scale, rounded up.
+    // Target i's size relative to the frame's, per side: its scale, or its fixed height over the frame's.
+    float targetScale(size_t i) const
+    {
+        if (i >= targets_.size()) return 1.0f;
+        const auto& t = targets_[i];
+        return t.height > 0 ? static_cast<float>(t.height) / static_cast<float>(std::max(1u, height())) : t.scale;
+    }
+    // Target i's size in pixels: the frame's, times its scale, rounded up (a fixed height exactly).
     VkExtent2D targetExtent(size_t i) const
     {
-        const float s = i < targets_.size() ? targets_[i].scale : 1.0f;
-        if (s == 1.0f) return { width(), height() };
-        return { std::max(1u, static_cast<uint32_t>(std::ceil(static_cast<float>(width())  * s))),
-                 std::max(1u, static_cast<uint32_t>(std::ceil(static_cast<float>(height()) * s))) };
+        if (i >= targets_.size() || !targets_[i].isScaled()) return { width(), height() };
+        const float s = targetScale(i);
+        const auto h = targets_[i].height > 0 ? static_cast<uint32_t>(targets_[i].height)
+                                              : static_cast<uint32_t>(std::ceil(static_cast<float>(height()) * s));
+        return { std::max(1u, static_cast<uint32_t>(std::ceil(static_cast<float>(width()) * s))), std::max(1u, h) };
     }
-    // A TARGET PASS (Renderer): a jvk::Shader drawing into the targets in `written` (one
-    // size) outside the scene pass. Its render pass, those targets as attachments at their
-    // output locations (the rest unused), clearing the ones in `clears` first and loading
-    // the rest; and its framebuffer. Null where this target can't run one.
-    virtual VkRenderPass  targetPass(uint8_t written, uint8_t clears) { juce::ignoreUnused(written, clears); return VK_NULL_HANDLE; }
-    virtual VkFramebuffer targetFramebuffer(uint8_t written) { juce::ignoreUnused(written); return VK_NULL_HANDLE; }
+    // A TARGET PASS (Renderer): a jvk::Shader drawing into the targets of `slots` (one size)
+    // outside the scene pass. Its render pass, those targets as attachments at the output
+    // locations their shader writes them at (the rest unused), clearing the ones in `clears`
+    // first and loading the rest; and its framebuffer. Null where this target can't run one.
+    virtual VkRenderPass  targetPass(TargetSlots slots, TargetMask clears) { juce::ignoreUnused(slots, clears); return VK_NULL_HANDLE; }
+    virtual VkFramebuffer targetFramebuffer(TargetSlots slots) { juce::ignoreUnused(slots); return VK_NULL_HANDLE; }
 
     // Each RenderTarget owns a dedicated VkCommandPool. Vulkan command pools
     // are externally synchronized — every vkCmd* recording call on any
@@ -184,10 +192,10 @@ public:
 
     VkRenderPass sceneRenderPassClear() const override { return sceneRPClear_; }
     VkRenderPass sceneRenderPassLoad()  const override { return sceneRPLoad_;  }
-    VkRenderPass sceneRenderPass(bool clear, uint8_t liveTargets) override;
+    VkRenderPass sceneRenderPass(bool clear, TargetMask liveTargets) override;
     VkRenderPass effectRenderPass()     const override { return effectRP_;     }
-    VkRenderPass  targetPass(uint8_t written, uint8_t clears) override;
-    VkFramebuffer targetFramebuffer(uint8_t written) override;
+    VkRenderPass  targetPass(TargetSlots slots, TargetMask clears) override;
+    VkFramebuffer targetFramebuffer(TargetSlots slots) override;
 
     const SceneBuffers& sceneBuffers(int frameSlot) const override
     {
@@ -197,7 +205,7 @@ public:
 private:
     void createSwapchain();
     void createRenderPasses();
-    VkRenderPass createSceneRenderPass(bool clear, uint8_t liveTargets) const;
+    VkRenderPass createSceneRenderPass(bool clear, TargetMask liveTargets) const;
     void createSceneBuffers();
     void createSyncObjects();
     void destroySwapchain();
@@ -222,13 +230,13 @@ private:
     VkRenderPass effectRP_     = VK_NULL_HANDLE;
     // sceneRenderPass variants with some targets dead, made on first use by
     // the render worker (at most two per distinct live set a frame passes
-    // through). Keyed clear << 8 | live.
+    // through). Keyed clear << 16 | live.
     std::vector<std::pair<uint32_t, VkRenderPass>> sceneRPVariants_;
-    // Target passes, made on first use by the render worker: render passes keyed
-    // clears << 8 | written (they outlive resizes), framebuffers keyed written (remade
-    // with the target images).
-    std::vector<std::pair<uint32_t, VkRenderPass>>  targetPasses_;
-    std::vector<std::pair<uint8_t, VkFramebuffer>>  targetFramebuffers_;
+    // Target passes, made on first use by the render worker: render passes keyed by their
+    // slots and clears (they outlive resizes), framebuffers by their slots (remade with the
+    // target images).
+    std::vector<std::pair<std::pair<TargetSlots, TargetMask>, VkRenderPass>> targetPasses_;
+    std::vector<std::pair<TargetSlots, VkFramebuffer>>                       targetFramebuffers_;
 
     static constexpr int MAX_FRAMES = 2;
     SceneBuffers sceneBuffers_[MAX_FRAMES];

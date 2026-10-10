@@ -661,7 +661,7 @@ private:
             target_->sceneRenderPassClear(),
             spv(clip_vert_spv, clip_vert_spvSize),
             spv(clip_frag_spv, clip_frag_spvSize),
-            target_->targets().size());
+            sceneSlots(target_->targets()) - 1);
         renderer_->setClipPipeline(clipPipeline_.get());
     }
 

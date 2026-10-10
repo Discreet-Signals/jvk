@@ -180,10 +180,11 @@ struct DrawShaderParams {
     float                  scale;
     // What the shader does with the frame's targets (bit i = target i),
     // captured at record: reads them (a reader runs as its own pass, and sets
-    // their lifetimes: Renderer::noteTargetsRead), writes them (declared
-    // output locations 1..N), writes the main colour (location 0).
-    uint8_t                targetsRead    = 0;
-    uint8_t                targetsWritten = 0;
+    // their lifetimes: Renderer::noteTargetsRead), writes them (at the output
+    // locations of targetSlots), writes the main colour (location 0).
+    TargetMask             targetsRead    = 0;
+    TargetMask             targetsWritten = 0;
+    TargetSlots            targetSlots    = 0;
     bool                   writesMain     = true;
     // A TARGET PASS: it writes targets but not the main colour, and reads targets or
     // writes scaled ones (Target::scale), so it runs as its own pass on what it writes.

@@ -258,33 +258,19 @@ public:
     bool readsScene() const { return readsScene_; }
 
     // The targets of `rt` this shader samples, by sampler name (bit i =
-    // target i). Worked out once per set of target images (targetsGeneration),
-    // not per draw.
-    uint8_t targetsRead (const RenderTarget& rt)
+    // target i), and the ones it writes at each output location (TargetSlots):
+    // the scaled target its output there is named after, else target
+    // location - 1. Worked out once per set of target images
+    // (targetsGeneration), not per draw.
+    TargetMask targetsRead (const RenderTarget& rt)
     {
-        if (rt.targetsGeneration() != readMaskGeneration_) {
-            readMask_ = 0;
-            const auto& targets = rt.targets();
-            for (size_t i = 0; i < targets.size() && i < 8; ++i) {
-                const auto name = targets[i].name.toString();
-                for (auto& b : bindings_)
-                    if (b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && !b.arrayed && b.name == name)
-                        readMask_ |= static_cast<uint8_t>(1u << i);
-            }
-            readMaskGeneration_ = rt.targetsGeneration();
-        }
+        resolveTargets(rt);
         return readMask_;
     }
-
-    // The targets this shader writes (bit i = target i: it declares output
-    // location i + 1), of the `targetCount` its pass carries.
-    uint8_t targetsWritten (size_t targetCount) const
+    TargetSlots targetSlots (const RenderTarget& rt)
     {
-        uint8_t mask = 0;
-        for (auto location : outputLocations_)
-            if (location >= 1 && location <= targetCount && location <= 8)
-                mask |= static_cast<uint8_t>(1u << (location - 1));
-        return mask;
+        resolveTargets(rt);
+        return slots_;
     }
 
     // Whether it writes the main colour: location 0, or no declared output.
@@ -318,11 +304,12 @@ public:
         boundTargetsGeneration_ = rt.targetsGeneration();
     }
 
-    // `targets`: the render targets of the pass this shader draws in. Each
-    // output location i + 1 the shader declares writes target i with that
+    // `targets`: the frame's render targets; `slots`: for a TARGET PASS, the
+    // ones it writes and where (TargetSlots), else 0 for the scene pass. Each
+    // output location the shader declares writes the target there with that
     // target's Blend; targets it doesn't declare are left untouched.
     void ensureCreated(Device& device, VkRenderPass renderPass, VkSampleCountFlagBits msaa,
-                       const std::vector<Target>& targets = {})
+                       const std::vector<Target>& targets = {}, TargetSlots slots = 0)
     {
         if (created_) return;
         device_ = &device;
@@ -539,16 +526,20 @@ public:
         ms.rasterizationSamples = msaa;
 
         // Location 0: the main colour, blended Over (replaced by a shader that
-        // reads the scene: what it writes is the colour it read, modified). Locations 1..N: the pass's render targets, each
+        // reads the scene: what it writes is the colour it read, modified). Locations 1..N: the pass's render targets
+        // (the scene pass's: target i at i + 1; a target pass's: its slots), each
         // with its declared Blend where this shader writes it, untouched where
         // it doesn't. A shader with no location-0 output leaves the main
         // colour untouched too.
-        std::vector<VkPipelineColorBlendAttachmentState> blends(1 + targets.size(), blendAttachment(Target::Blend::None));
+        std::vector<VkPipelineColorBlendAttachmentState> blends(slots != 0 ? slotCount(slots) : targets.empty() ? 1 : sceneSlots(targets),
+                                                                blendAttachment(Target::Blend::None));
         if (writesMain())
             blends[0] = blendAttachment(readsScene_ ? Target::Blend::Replace : Target::Blend::Over);
-        for (size_t i = 0; i < targets.size(); ++i)
-            if (writesLocation(static_cast<uint32_t>(i + 1)))
-                blends[1 + i] = blendAttachment(targets[i].blend);
+        for (uint32_t l = 1; l < blends.size(); ++l) {
+            const int t = slots != 0 ? slotTarget(slots, l) : static_cast<int>(l) - 1;
+            if (t >= 0 && static_cast<size_t>(t) < targets.size() && writesLocation(l))
+                blends[l] = blendAttachment(targets[static_cast<size_t>(t)].blend);
+        }
 
         VkPipelineColorBlendStateCreateInfo cb {};
         cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -824,9 +815,11 @@ private:
         uniformData_.resize((bufferOffset + sizeof(float) - 1) / sizeof(float), 0.0f);
 
         // Fragment outputs: which colour locations this shader writes
-        // (location 0 = main colour, i + 1 = render target i). An output
-        // array covers consecutive locations.
+        // (location 0 = main colour, i + 1 = render target i, or the scaled
+        // target an output is named after). An output array covers consecutive
+        // locations, by location alone.
         outputLocations_.clear();
+        outputNames_.clear();
         uint32_t outCount = 0;
         spvReflectEnumerateOutputVariables(&module, &outCount, nullptr);
         std::vector<SpvReflectInterfaceVariable*> outs(outCount);
@@ -834,11 +827,39 @@ private:
         for (auto* v : outs) {
             if (v == nullptr || (v->decoration_flags & SPV_REFLECT_DECORATION_BUILT_IN) != 0) continue;
             const uint32_t n = v->array.dims_count > 0 ? std::max(1u, v->array.dims[0]) : 1u;
-            for (uint32_t k = 0; k < n; ++k)
+            for (uint32_t k = 0; k < n; ++k) {
                 outputLocations_.push_back(v->location + k);
+                outputNames_.push_back(n == 1 && v->name != nullptr ? juce::String(v->name) : juce::String());
+            }
         }
 
         spvReflectDestroyShaderModule(&module);
+    }
+
+    // readMask_ and slots_ for `rt`'s targets (targetsRead, targetSlots).
+    void resolveTargets (const RenderTarget& rt)
+    {
+        if (rt.targetsGeneration() == readMaskGeneration_) return;
+        const auto& targets = rt.targets();
+        readMask_ = 0;
+        for (size_t i = 0; i < targets.size(); ++i) {
+            const auto name = targets[i].name.toString();
+            for (auto& b : bindings_)
+                if (b.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && !b.arrayed && b.name == name)
+                    readMask_ |= static_cast<TargetMask>(1u << i);
+        }
+        slots_ = 0;
+        for (size_t k = 0; k < outputLocations_.size(); ++k) {
+            const uint32_t l = outputLocations_[k];
+            if (l < 1 || l > 7) continue;
+            int t = -1;
+            for (size_t i = 0; i < targets.size() && outputNames_[k].isNotEmpty(); ++i)
+                if (targets[i].isScaled() && targets[i].name.toString() == outputNames_[k]) t = static_cast<int>(i);
+            if (t < 0)
+                t = l - 1 < targets.size() ? static_cast<int>(l - 1) : -1;
+            if (t >= 0) slots_ |= static_cast<TargetSlots>(t + 1) << (8 * l);
+        }
+        readMaskGeneration_ = rt.targetsGeneration();
     }
 
     bool writesLocation (uint32_t location) const
@@ -876,12 +897,14 @@ private:
     std::vector<uint32_t>     spirv_;
     std::vector<float>        uniformData_;
     std::vector<uint32_t>     outputLocations_;     // reflected fragment output locations
+    std::vector<juce::String> outputNames_;         // and their names ("" for an array's)
     std::vector<PixelFormat>  builtFor_;            // the targets of the pass the pipeline was built for
     std::array<float, kShaderDrawConstants> drawConstants_ {};   // setDrawConstants
     uint32_t                  drawConstantCount_ = 0;
     uint64_t                  boundTargetsGeneration_ = 0;   // bindTargets: the targets the samplers point at
-    uint64_t                  readMaskGeneration_ = ~uint64_t(0);   // targetsRead: the targets readMask_ is for
-    uint8_t                   readMask_ = 0;
+    uint64_t                  readMaskGeneration_ = ~uint64_t(0);   // resolveTargets: the targets readMask_ and slots_ are for
+    TargetMask                readMask_ = 0;
+    TargetSlots               slots_ = 0;
     bool                      readsScene_ = false;            // set 1, binding 0: the scene (readsScene)
 
     Device*          device_        = nullptr;
@@ -912,19 +935,20 @@ inline void Graphics::prepareShaderDraw(Shader& shader, DrawShaderParams& params
 {
     const auto& rt = renderer_.target();
     params.targetsRead    = shader.targetsRead(rt);
-    params.targetsWritten = shader.targetsWritten(rt.targets().size());
+    params.targetSlots    = shader.targetSlots(rt);
+    params.targetsWritten = slotTargets(params.targetSlots);
     params.writesMain     = shader.writesMain();
-    const uint8_t scaled  = rt.scaledTargets();
+    const TargetMask scaled = rt.scaledTargets();
     params.targetPass     = !params.writesMain && params.targetsWritten != 0
                          && (params.targetsRead != 0 || (params.targetsWritten & scaled) != 0);
     // A pass's attachments are one size, and only a pass writes a scaled target: a shader
     // writing the main colour and a scaled target, or targets of two sizes, draws nothing.
     bool valid = !(params.writesMain && (params.targetsWritten & scaled) != 0);
-    float passScale = 0.0f;
+    const Target* passSize = nullptr;
     for (size_t i = 0; params.targetPass && i < rt.targets().size(); ++i)
         if ((params.targetsWritten & (1u << i)) != 0) {
-            valid = valid && (passScale == 0.0f || rt.targets()[i].scale == passScale);
-            passScale = rt.targets()[i].scale;
+            valid = valid && (passSize == nullptr || rt.targets()[i].sameSize(*passSize));
+            passSize = &rt.targets()[i];
         }
     jassert (valid);
     if (!valid)

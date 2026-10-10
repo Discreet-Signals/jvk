@@ -611,14 +611,13 @@ void Renderer::execute()
         rpbi.framebuffer = pp[cur].sceneFB;
         rpbi.renderArea.extent = frame.extent;
 
-        // [0] main colour, [1..N] render targets (each its own clear
-        // value), [N+1] depth/stencil.
-        const auto& targets = target_.targets();
-        clearScratch_.assign(targets.size() + 2, VkClearValue {});
+        // The main colour, the targets at scale 1 (each its own clear
+        // value), depth/stencil: the scene pass's attachments in order.
+        clearScratch_.assign(1, VkClearValue {});
         clearScratch_[0].color = {{ 0.0f, 0.0f, 0.0f, 0.0f }};
-        for (size_t i = 0; i < targets.size(); ++i)
-            clearScratch_[1 + i].color = targets[i].clear;
-        clearScratch_.back().depthStencil = { 1.0f, 0 };
+        for (const auto& t : target_.targets())
+            if (!t.isScaled()) clearScratch_.emplace_back().color = t.clear;
+        clearScratch_.emplace_back().depthStencil = { 1.0f, 0 };
         if (withClears) {
             rpbi.clearValueCount = static_cast<uint32_t>(clearScratch_.size());
             rpbi.pClearValues = clearScratch_.data();
@@ -659,10 +658,10 @@ void Renderer::execute()
     // SCALED targets (Target::scale) aren't scene attachments: they hold their clear value
     // until their first write in a frame. That write's pass clears them first; a pass that
     // reads one before then clears it here (outside any render pass).
-    const uint8_t scaled = target_.scaledTargets();
-    uint8_t scaledWritten = 0;
-    auto clearScaled = [&](uint8_t reads) {
-        const uint8_t pending = reads & scaled & static_cast<uint8_t>(~scaledWritten);
+    const TargetMask scaled = target_.scaledTargets();
+    TargetMask scaledWritten = 0;
+    auto clearScaled = [&](TargetMask reads) {
+        const TargetMask pending = reads & scaled & static_cast<TargetMask>(~scaledWritten);
         for (size_t i = 0; pending != 0 && i < target_.targets().size(); ++i) {
             if ((pending & (1u << i)) == 0) continue;
             VkImageMemoryBarrier b {};
@@ -684,32 +683,31 @@ void Renderer::execute()
             b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             vkCmdPipelineBarrier(frame.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                 0, 0, nullptr, 0, nullptr, 1, &b);
-            scaledWritten |= static_cast<uint8_t>(1u << i);
+            scaledWritten |= static_cast<TargetMask>(1u << i);
         }
     };
 
     // A TARGET PASS (DrawShaderParams::targetPass): the shader draws into the targets it
-    // writes as their own pass, outside the scene pass, in their pixels (the region and
-    // clip scale with them).
+    // writes (its slots: TargetSlots) as their own pass, outside the scene pass, in their
+    // pixels (the region and clip scale with them).
     auto targetPass = [&](const DrawCommand& c, const DrawShaderParams& sp, Shader& shader) {
         endScene();
         clearScaled(sp.targetsRead);
-        const uint8_t written = sp.targetsWritten;
-        size_t first = 0;
-        while ((written & (1u << first)) == 0) ++first;
-        VkRenderPass rp = target_.targetPass(written, written & scaled & static_cast<uint8_t>(~scaledWritten));
-        VkFramebuffer fb = target_.targetFramebuffer(written);
+        const TargetMask written = sp.targetsWritten;
+        VkRenderPass rp = target_.targetPass(sp.targetSlots, written & scaled & static_cast<TargetMask>(~scaledWritten));
+        VkFramebuffer fb = target_.targetFramebuffer(sp.targetSlots);
         if (rp == VK_NULL_HANDLE || fb == VK_NULL_HANDLE) return;
-        const auto e = target_.targetExtent(first);
-        const float s = target_.targets()[first].scale;
 
+        // Its attachments in location order, each target's own clear value.
         clearScratch_.clear();
-        for (size_t i = 0; i < target_.targets().size(); ++i)
-            if ((written & (1u << i)) != 0) {
-                VkClearValue v {};
-                v.color = target_.targets()[i].clear;
-                clearScratch_.push_back(v);
+        size_t first = 0;
+        for (uint32_t l = 1; l < 8; ++l)
+            if (const int t = slotTarget(sp.targetSlots, l); t >= 0) {
+                if (clearScratch_.empty()) first = static_cast<size_t>(t);
+                clearScratch_.emplace_back().color = target_.targets()[static_cast<size_t>(t)].clear;
             }
+        const auto e = target_.targetExtent(first);
+        const float s = target_.targetScale(first);
         VkRenderPassBeginInfo rpbi {};
         rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         rpbi.renderPass = rp;
@@ -718,7 +716,7 @@ void Renderer::execute()
         rpbi.clearValueCount = static_cast<uint32_t>(clearScratch_.size());
         rpbi.pClearValues = clearScratch_.data();
         vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-        shaderPipeline_->dispatchTarget(frame.cmd, shader, rp, sp.region * s,
+        shaderPipeline_->dispatchTarget(frame.cmd, shader, rp, sp.targetSlots, sp.region * s,
             static_cast<float>(e.width), static_cast<float>(e.height),
             (c.clipBounds.toFloat() * s).getSmallestIntegerContainer(),
             frameTime, frame.frameSlot, { sp.constants, sp.constantCount }, { sp.images, sp.imageCount });
@@ -1405,7 +1403,7 @@ void State::invalidate()
     boundVertexBuffer_ = VK_NULL_HANDLE;
 }
 
-bool State::setPipeline(Pipeline* pipeline, uint8_t attachment, uint8_t live)
+bool State::setPipeline(Pipeline* pipeline, uint8_t attachment, TargetMask live)
 {
     if (!pipeline) return false;
 
