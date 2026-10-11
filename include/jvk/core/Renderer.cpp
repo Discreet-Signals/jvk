@@ -870,6 +870,7 @@ void Renderer::execute()
         if (cmd.op == DrawOp::PushClipPath) {
             // Analytical-SDF clip push — fragment shader discards outside the
             // clip shape, stencil INCR_WRAP where inside at stencil == parentDepth.
+            // An image-alpha clip (shape 3) runs ClipPipeline's mask pair.
             if (clipPipeline_ && pathPipeline_) {
                 auto& p = arena_.read<ClipShapeParams>(cmd.dataOffset);
                 ClipPipeline::PushConstants pc {};
@@ -885,12 +886,18 @@ void Renderer::execute()
                 pc.stripCount   = p.stripCount;
                 pc.stripMinY    = p.stripMinY;
                 pc.invStripH    = p.invStripH;
-                clipPipeline_->pushClip(state_, frame.cmd, *this, cmd,
-                    pc, p.coverRect,
-                    pathPipeline_->ssboDescriptorSet(),
-                    static_cast<uint32_t>(cmd.stencilDepth),
-                    static_cast<float>(frame.extent.width),
-                    static_cast<float>(frame.extent.height));
+                if (p.shapeType == 3u)
+                    clipPipeline_->pushMask(state_, frame.cmd, cmd, p,
+                        static_cast<uint32_t>(cmd.stencilDepth),
+                        static_cast<float>(frame.extent.width),
+                        static_cast<float>(frame.extent.height));
+                else
+                    clipPipeline_->pushClip(state_, frame.cmd, *this, cmd,
+                        pc, p.coverRect,
+                        pathPipeline_->ssboDescriptorSet(),
+                        static_cast<uint32_t>(cmd.stencilDepth),
+                        static_cast<float>(frame.extent.width),
+                        static_cast<float>(frame.extent.height));
             }
             state_.pushStencilDepth();
             continue;
@@ -915,12 +922,18 @@ void Renderer::execute()
                 pc.stripCount   = p.stripCount;
                 pc.stripMinY    = p.stripMinY;
                 pc.invStripH    = p.invStripH;
-                clipPipeline_->popClip(state_, frame.cmd, *this, cmd,
-                    pc, p.coverRect,
-                    pathPipeline_->ssboDescriptorSet(),
-                    static_cast<uint32_t>(cmd.stencilDepth),
-                    static_cast<float>(frame.extent.width),
-                    static_cast<float>(frame.extent.height));
+                if (p.shapeType == 3u)
+                    clipPipeline_->popMask(state_, frame.cmd, cmd, p,
+                        static_cast<uint32_t>(cmd.stencilDepth),
+                        static_cast<float>(frame.extent.width),
+                        static_cast<float>(frame.extent.height));
+                else
+                    clipPipeline_->popClip(state_, frame.cmd, *this, cmd,
+                        pc, p.coverRect,
+                        pathPipeline_->ssboDescriptorSet(),
+                        static_cast<uint32_t>(cmd.stencilDepth),
+                        static_cast<float>(frame.extent.width),
+                        static_cast<float>(frame.extent.height));
             }
             state_.popStencilDepth();
             continue;

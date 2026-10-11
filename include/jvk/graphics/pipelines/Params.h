@@ -247,11 +247,18 @@ struct FillRectListParams {
 //     even-odd (1) winding; the clip frag shader walks the segments and
 //     computes the winding number per fragment.
 //
+//   shapeType == 3  Image alpha (Graphics::clipToImageAlpha)
+//     maskDesc is the mask's texture; toMask maps physical pixels to its
+//     texels as clip_mask.frag reads it: the x row (mat00 mat01), the y
+//     row (mat10 mat11), the offset (mat02 mat12) of the juce transform;
+//     maskNearest is the resampling the clip was made with. Inside
+//     where the sampled alpha is at least one half (clip_mask.frag).
+//
 // coverRect is the bounding box + 1px AA margin in physical pixels —
 // emitted as a 6-vertex quad so the clip fragment shader runs for every
 // pixel the shape could occupy.
 struct ClipShapeParams {
-    uint32_t               shapeType;       // 1 = rrect, 2 = path
+    uint32_t               shapeType;       // 1 = rrect, 2 = path, 3 = image alpha
     float                  centerX, centerY; // rrect only (physical px)
     float                  halfW, halfH;     // rrect only (physical px)
     float                  cornerRadius;     // rrect only (physical px)
@@ -263,6 +270,11 @@ struct ClipShapeParams {
     uint32_t               stripCount = 0;
     float                  stripMinY  = 0.0f;
     float                  invStripH  = 0.0f;
+    // Image alpha only.
+    VkDescriptorSet        maskDesc = VK_NULL_HANDLE;
+    float                  toMask[6] {};
+    float                  maskW = 0.0f, maskH = 0.0f;
+    uint32_t               maskNearest = 0;
 };
 
 struct EffectBlendParams {

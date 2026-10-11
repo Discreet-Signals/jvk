@@ -26,7 +26,7 @@ public:
         displayScale_ = displayScale;
         stateStack_.clear();
         stateStack_.push_back({});
-        pathClipShared_.clear();
+        stencilClips_.clear();
         auto& s = stateStack_.back();
         s.clipBounds = { 0, 0,
             static_cast<int>(renderer_.target().width()),
@@ -137,6 +137,7 @@ public:
 
     bool clipToRectangle(const juce::Rectangle<int>& r) override
     {
+        materializeMask();
         auto& s = state();
         auto tf = r.toFloat().transformedBy(s.transform);
         // Scale logical→pixel for the Vulkan scissor. floor/ceil (outward),
@@ -174,6 +175,7 @@ public:
     {
         auto& s = state();
         if (isClipEmpty()) return;
+        materializeMask();
         auto phys = r.toFloat().transformedBy(s.transform.scaled(displayScale_));
         auto clip = s.clipBounds.getIntersection(phys.getSmallestIntegerContainer());
         if (clip.isEmpty()) return;      // outside the clip — nothing to exclude
@@ -240,6 +242,7 @@ public:
         // wrappers on Drawables). Preserved transforms that stay axis-aligned
         // keep the rectangle axis-aligned, so we can route through the
         // scissor-based clipToRectangle and avoid the stencil altogether.
+        materializeMask();
         auto& s0 = state();
         auto combinedForRectCheck = t.followedBy(s0.transform);
         juce::Rectangle<float> rectLocal;
@@ -311,7 +314,7 @@ public:
         // the old per-RecordState vector was deep-copied on EVERY saveState
         // (JUCE brackets every component paint with one) — a heap alloc per
         // component per frame for data that is strictly stack-shaped.
-        pathClipShared_.push_back(params);
+        stencilClips_.push_back({ params, outerBounds, s.scopeDepth });
 
         renderer_.push(DrawOp::PushClipPath, outerBounds, s.stencilDepth, params);
 
@@ -320,21 +323,27 @@ public:
         s.scopeDepth++;
     }
 
-    // Alpha-mask clip. Full per-pixel masking of ARBITRARY subsequent draws
-    // would need a mask channel in every pipeline; what juce actually funnels
-    // through here is overwhelmingly one idiom — drawImage*(img, ..., true)
-    // = save / clipToImageAlpha / fillAll / restore — and THAT renders
-    // exactly: the fill is emitted as a single quad tinted with the brush
-    // and gated per-pixel by the mask image's alpha (shader shape type 5).
-    // Everything else under the mask is conservatively rect-clipped to the
-    // mask's bounds (alpha ignored — documented divergence). The mask lives
-    // in RecordState, so save/restore scopes it exactly like juce does.
+    // Alpha-mask clip. What juce funnels through here is mostly one idiom —
+    // drawImage*(img, ..., true) = save / clipToImageAlpha / fillAll /
+    // restore — and THAT renders exactly: the fill is one quad tinted with
+    // the brush and gated per pixel by the mask's alpha (shader shape type
+    // 5). Anything else drawn under the mask is clipped by a STENCIL clip
+    // of the mask (shape 3, clip_mask.frag: in where its alpha is at least
+    // one half — hard edges, like every stencil clip), which enters the
+    // stencil only when such a draw (or another clip) arrives — so the
+    // idiom never pays for it (materializeMask). Like juce, the clip uses
+    // the transform and resampling quality current when it is made, scopes
+    // with save/restore, and intersects every other clip, masks included.
     void clipToImageAlpha(const juce::Image& img, const juce::AffineTransform& t) override
     {
         if (!img.isValid()) return;
+        materializeMask();   // a mask still pending clips this one: both apply
         auto& s = state();
         s.alphaMask          = img;
         s.alphaMaskTransform = t.followedBy(s.transform);
+        s.maskNearest        = s.nearest;
+        s.maskPending        = true;
+        s.maskOwner          = static_cast<uint32_t>(stateStack_.size() - 1);
         // Nothing outside the image can pass an alpha clip: fold its
         // transformed bounds into the rect clip.
         auto phys = img.getBounds().toFloat()
@@ -394,9 +403,11 @@ public:
                            e.depth, ExcludeRectParams { e.rect });
             old.exclusions--;
         }
+        // Pop this scope's clips in reverse order of their pushes: a stencil
+        // clip is the latest when it was pushed at the scope depth just
+        // below the current one; any other push was a rect clip.
         while (old.scopeDepth > prev.scopeDepth) {
-            bool isPathClip = old.stencilDepth > prev.stencilDepth;
-            if (isPathClip) {
+            if (!stencilClips_.empty() && stencilClips_.back().scope == old.scopeDepth - 1) {
                 recordPopClip();
             } else {
                 // Rect clip — no GPU work, just a CPU-side scissor pop at
@@ -471,7 +482,7 @@ public:
         // Stage gradient LUT upload if this is a gradient fill
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::FillRect, s.clipBounds, s.stencilDepth,
+        record(DrawOp::FillRect, s.clipBounds,
             FillRectParams { r, fi, s.transform, s.opacity, displayScale_ });
     }
 
@@ -493,7 +504,7 @@ public:
         p.transform = s.transform;
         p.opacity   = s.opacity;
         p.scale     = displayScale_;
-        renderer_.push(DrawOp::FillRectList, s.clipBounds, s.stencilDepth, p);
+        record(DrawOp::FillRectList, s.clipBounds, p);
         renderer_.arena_align(4);
         // RectangleList's iterators walk a contiguous juce::Array — a span
         // over [begin, end) is valid.
@@ -755,7 +766,7 @@ public:
         p.fillIndex    = renderer_.captureFill(s.fill);
         p.tileSize     = tileW;
 
-        renderer_.push(DrawOp::FillPath, clipRect, s.stencilDepth, p);
+        record(DrawOp::FillPath, clipRect, p);
         renderer_.arena_align(4);
         renderer_.arena_pushSpan(std::span<const UIVertex>(
             scratchTileVerts_.data(), scratchTileVerts_.size()));
@@ -782,7 +793,7 @@ public:
 
         DrawImageParams p { desc, s.alphaMaskTransform, 1.0f, displayScale_,
                             s.alphaMask.getWidth(), s.alphaMask.getHeight(),
-                            s.nearest };
+                            s.maskNearest };
         if (s.fill.isGradient() && s.fill.gradient != nullptr)
         {
             // Gradient through the mask: replay rebuilds the gradient ctx
@@ -847,7 +858,7 @@ public:
         p.tint = { 1.0f, 1.0f, 1.0f,
                    s.fill.colour.getFloatAlpha() * s.opacity };
         p.nearest = s.nearest;
-        renderer_.push(DrawOp::FillTiledImage, clipRect, s.stencilDepth, p);
+        record(DrawOp::FillTiledImage, clipRect, p);
     }
 
     void drawImage(const juce::Image& img, const juce::AffineTransform& t) override
@@ -881,7 +892,7 @@ public:
         // (juce_RenderingHelpers.h renderImage). s.opacity is the
         // transparency-layer multiplier on top.
         const float alpha = s.opacity * s.fill.colour.getFloatAlpha();
-        renderer_.push(DrawOp::DrawImage, s.clipBounds, s.stencilDepth,
+        record(DrawOp::DrawImage, s.clipBounds,
             DrawImageParams { desc, t.followedBy(s.transform), alpha, displayScale_,
                               img.getWidth(), img.getHeight(), s.nearest });
     }
@@ -898,7 +909,7 @@ public:
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::DrawLine, s.clipBounds, s.stencilDepth,
+        record(DrawOp::DrawLine, s.clipBounds,
             DrawLineParams { line, lineThickness, fi, s.transform, s.opacity, displayScale_ });
     }
 
@@ -945,7 +956,7 @@ public:
         params.fillIndex = renderer_.captureFill(s.fill);
         params.opacity = s.opacity;
         params.scale = displayScale_;
-        renderer_.push(DrawOp::DrawGlyphs, s.clipBounds, s.stencilDepth, params);
+        record(DrawOp::DrawGlyphs, s.clipBounds, params);
         // Append glyph POD data to arena (align before float data)
         renderer_.arena_pushSpan(std::span<const uint16_t>(glyphs.data(), glyphs.size()));
         renderer_.arena_align(4); // Point<float> requires 4-byte alignment
@@ -959,7 +970,7 @@ public:
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::FillRoundedRect, s.clipBounds, s.stencilDepth,
+        record(DrawOp::FillRoundedRect, s.clipBounds,
             FillRoundedRectParams { r, cornerSize, fi, s.transform, s.opacity, displayScale_ });
     }
 
@@ -970,7 +981,7 @@ public:
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::FillEllipse, s.clipBounds, s.stencilDepth,
+        record(DrawOp::FillEllipse, s.clipBounds,
             FillEllipseParams { area, fi, s.transform, s.opacity, displayScale_ });
     }
 
@@ -982,7 +993,7 @@ public:
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::StrokeRoundedRect, s.clipBounds, s.stencilDepth,
+        record(DrawOp::StrokeRoundedRect, s.clipBounds,
             StrokeRoundedRectParams { rect, cornerSize, lineThickness, fi, s.transform,
                                       s.opacity, displayScale_ });
     }
@@ -1000,7 +1011,7 @@ public:
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
-        renderer_.push(DrawOp::StrokeEllipse, s.clipBounds, s.stencilDepth,
+        record(DrawOp::StrokeEllipse, s.clipBounds,
             StrokeEllipseParams { area, lineThickness, fi, s.transform, s.opacity, displayScale_ });
     }
 
@@ -1027,7 +1038,7 @@ public:
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
         float v = 1.0f - amount;
-        renderer_.push(DrawOp::EffectBlend, s.clipBounds, s.stencilDepth,
+        record(DrawOp::EffectBlend, s.clipBounds,
             EffectBlendParams { v, v, v, region, displayScale_ });
     }
 
@@ -1036,7 +1047,7 @@ public:
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
         float v = 1.0f + amount;
-        renderer_.push(DrawOp::EffectBlend, s.clipBounds, s.stencilDepth,
+        record(DrawOp::EffectBlend, s.clipBounds,
             EffectBlendParams { v, v, v, region, displayScale_ });
     }
 
@@ -1044,7 +1055,7 @@ public:
     {
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
-        renderer_.push(DrawOp::EffectBlend, s.clipBounds, s.stencilDepth,
+        record(DrawOp::EffectBlend, s.clipBounds,
             EffectBlendParams { c.getFloatRed(), c.getFloatGreen(), c.getFloatBlue(), region, displayScale_ });
     }
 
@@ -1052,7 +1063,7 @@ public:
     {
         if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
-        renderer_.push(DrawOp::EffectBlend, s.clipBounds, s.stencilDepth,
+        record(DrawOp::EffectBlend, s.clipBounds,
             EffectBlendParams { 1.0f + amount * 0.2f, 1.0f, 1.0f - amount * 0.1f, region, displayScale_ });
     }
 
@@ -1074,7 +1085,7 @@ public:
         const float timeOffset = staticHash
             ? 0.0f
             : static_cast<float>(juce::Time::getMillisecondCounter() & 0xFFFFu);
-        renderer_.push(DrawOp::EffectNoise, s.clipBounds, s.stencilDepth,
+        record(DrawOp::EffectNoise, s.clipBounds,
             NoiseParams { amount, timeOffset, physRegion, 1.0f });
     }
 
@@ -1089,7 +1100,7 @@ public:
         const juce::Rectangle<float> physRegion = region.isEmpty()
             ? s.clipBounds.toFloat()
             : region.transformedBy(s.transform.scaled(displayScale_));
-        renderer_.push(DrawOp::EffectKernel, s.clipBounds, s.stencilDepth,
+        record(DrawOp::EffectKernel, s.clipBounds,
             BlurParams { radius, physRegion, displayScale_ });
     }
 
@@ -1118,7 +1129,7 @@ public:
         const juce::Rectangle<float> physRegion = region.isEmpty()
             ? s.clipBounds.toFloat()
             : region.transformedBy(s.transform.scaled(displayScale_));
-        renderer_.push(DrawOp::EffectHSV, s.clipBounds, s.stencilDepth,
+        record(DrawOp::EffectHSV, s.clipBounds,
             HSVParams { scaleH, scaleS, scaleV, deltaH, deltaS, deltaV,
                         physRegion, displayScale_ });
     }
@@ -1304,7 +1315,7 @@ public:
         // (Renderer::noteTargetsRead).
         DrawShaderParams params { &shader, regionPx, displayScale_ };
         prepareShaderDraw(shader, params);
-        if (renderer_.push(DrawOp::DrawShader, s.clipBounds, s.stencilDepth, params))
+        if (record(DrawOp::DrawShader, s.clipBounds, params))
             renderer_.noteTargetsRead(params.targetsRead);
     }
 
@@ -1333,6 +1344,11 @@ private:
         // saveState; restore pops it like any other clip). Invalid = none.
         juce::Image           alphaMask;
         juce::AffineTransform alphaMaskTransform;
+        // Not yet in the stencil (materializeMask), and the scope it belongs
+        // to (stateStack_ index); the resampling it was made with.
+        bool                  maskPending = false;
+        bool                  maskNearest = false;
+        uint32_t              maskOwner = 0;
         // setInterpolationQuality(low) — point-sample every image draw.
         bool                  nearest = false;
         // Count of excludeClipRectangle parks taken in scopes at or below
@@ -1346,7 +1362,7 @@ private:
         // transform); invalidated by setOrigin/addTransform.
         mutable juce::AffineTransform pixelToLocal;
         mutable bool                  inverseValid = false;
-        // Path clips live in Graphics::pathClipShared_ (stack-shaped across
+        // Stencil clips live in Graphics::stencilClips_ (stack-shaped across
         // states); no per-state vector to deep-copy on every saveState.
 
         // Draw target (setTarget): colour attachment index (0 = main colour,
@@ -1362,20 +1378,65 @@ private:
     // The renderer stamps every recorded command with the current target.
     void syncTarget() { renderer_.setRecordTarget(state().target); }
 
-    // Record a PopClip — same ClipShapeParams as the paired PushClipPath so
-    // the DECR_WRAP at the GPU matches the INCR_WRAP exactly. Stencil
-    // reference at replay = stencilDepth BEFORE the pop (current depth),
-    // so the hardware decrements only the pixels the push incremented.
+    // Record a PopClip — same ClipShapeParams and scissor as the paired
+    // PushClipPath so the DECR_WRAP at the GPU matches the INCR_WRAP
+    // exactly. Stencil reference at replay = stencilDepth BEFORE the pop
+    // (current depth), so the hardware decrements only the pixels the push
+    // incremented.
     void recordPopClip()
     {
         auto& s = state();
-        if (!pathClipShared_.empty()) {
-            ClipShapeParams params = pathClipShared_.back();
-            renderer_.push(DrawOp::PopClipPath, s.clipBounds, s.stencilDepth, params);
-            pathClipShared_.pop_back();
-        }
+        const auto c = stencilClips_.back();
+        stencilClips_.pop_back();
+        renderer_.push(DrawOp::PopClipPath, c.bounds, s.stencilDepth, c.params);
         s.scopeDepth--;
         if (s.stencilDepth > 0) s.stencilDepth--;
+    }
+
+    // Records a draw. A pending clipToImageAlpha mask enters the stencil
+    // first: everything but a fill through the mask itself must be clipped
+    // by it.
+    template <typename Params>
+    bool record(DrawOp op, const juce::Rectangle<int>& bounds, const Params& params)
+    {
+        materializeMask();
+        return renderer_.push(op, bounds, state().stencilDepth, params);
+    }
+
+    // Pushes the pending mask as a stencil clip (shape 3) of the scope that
+    // made it: every state from that one up takes the push, so it pops when
+    // that scope restores. No clip was pushed since it was made (a clip
+    // materializes it first), so they all stand at the same depth.
+    void materializeMask()
+    {
+        auto& s = state();
+        if (!s.maskPending) return;
+        for (auto i = static_cast<size_t>(s.maskOwner); i < stateStack_.size(); ++i)
+            stateStack_[i].maskPending = false;
+        if (s.clipBounds.isEmpty()) return;   // nothing can draw in this scope
+        VkDescriptorSet desc = tryImageFastPath(s.alphaMask, renderer_);
+        if (desc == VK_NULL_HANDLE)
+            desc = renderer_.caches().getTexture(
+                ResourceCaches::hashImage(s.alphaMask), s.alphaMask, renderer_);
+        if (desc == VK_NULL_HANDLE) return;   // staging/descriptor OOM: its bounds still clip
+
+        const auto toMask = s.alphaMaskTransform.scaled(displayScale_).inverted();
+        ClipShapeParams params {};
+        params.shapeType   = 3u;
+        params.coverRect   = s.clipBounds.toFloat();
+        params.maskDesc    = desc;
+        params.toMask[0]   = toMask.mat00; params.toMask[1] = toMask.mat01;   // x row
+        params.toMask[2]   = toMask.mat10; params.toMask[3] = toMask.mat11;   // y row
+        params.toMask[4]   = toMask.mat02; params.toMask[5] = toMask.mat12;   // offset
+        params.maskW       = static_cast<float>(s.alphaMask.getWidth());
+        params.maskH       = static_cast<float>(s.alphaMask.getHeight());
+        params.maskNearest = s.maskNearest ? 1u : 0u;
+        stencilClips_.push_back({ params, s.clipBounds, s.scopeDepth });
+        renderer_.push(DrawOp::PushClipPath, s.clipBounds, s.stencilDepth, params);
+        for (auto i = static_cast<size_t>(s.maskOwner); i < stateStack_.size(); ++i) {
+            stateStack_[i].stencilDepth++;
+            stateStack_[i].scopeDepth++;
+        }
     }
 
     // Clamp the stroke thickness to one physical pixel. Anything thinner
@@ -1461,7 +1522,7 @@ private:
                            .transformedBy(s.transform.scaled(displayScale_));
         }
 
-        renderer_.push(DrawOp::BlurShape, s.clipBounds, s.stencilDepth, p);
+        record(DrawOp::BlurShape, s.clipBounds, p);
     }
 
     // Pack a BlurPath draw command. Flattens the path to line segments
@@ -1529,7 +1590,7 @@ private:
             p.region = pathBounds.transformedBy(combined)
                            .expanded(p.maxRadius + p.falloff + p.strokeHalfWidth + 2.0f);
 
-        renderer_.push(DrawOp::BlurPath, s.clipBounds, s.stencilDepth, p);
+        record(DrawOp::BlurPath, s.clipBounds, p);
     }
 
     // Flatten a path to a flat list of line segments in the supplied
@@ -1662,13 +1723,16 @@ private:
     uint64_t frameId_ = 0;
     juce::ValueTree values_ { "Frame" };   // values(): emptied every frame
 
-    // Active path-clip params, shared across the state stack (strictly
-    // stack-shaped: pushes in clipToPath, pops in recordPopClip; saveState
-    // copies nothing).
-    std::vector<ClipShapeParams> pathClipShared_;
+    // Active stencil clips (paths, masks), shared across the state stack
+    // (strictly stack-shaped: pushes in clipToPath / materializeMask, pops in
+    // recordPopClip; saveState copies nothing). Each keeps its push's
+    // scissor for its pop, and the scope depth it was pushed at (restoreState
+    // pops a scope's rect and stencil clips in reverse push order by it).
+    struct StencilClip { ClipShapeParams params; juce::Rectangle<int> bounds; uint32_t scope; };
+    std::vector<StencilClip> stencilClips_;
 
     // Active exclusion parks (excludeClipRectangle), strictly stack-shaped
-    // across the state stack like pathClipShared_.
+    // across the state stack like stencilClips_.
     struct Exclusion { juce::Rectangle<float> rect; uint8_t depth; };
     std::vector<Exclusion> exclusionShared_;
 

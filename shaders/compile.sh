@@ -23,6 +23,7 @@ $GLSLC -fshader-stage=frag path_sdf.frag   -o path_sdf.frag.spv
 $GLSLC -fshader-stage=frag path_blur.frag  -o path_blur.frag.spv
 $GLSLC -fshader-stage=vert clip.vert       -o clip.vert.spv
 $GLSLC -fshader-stage=frag clip.frag       -o clip.frag.spv
+$GLSLC -fshader-stage=frag clip_mask.frag  -o clip_mask.frag.spv
 $GLSLC -fshader-stage=frag copy.frag       -o copy.frag.spv
 
 echo "Generating UI2DShaders.h..."
@@ -50,6 +51,7 @@ shaders = [
     ('path_blur.frag.spv', 'path_blur_frag_spv'),
     ('clip.vert.spv', 'clip_vert_spv'),
     ('clip.frag.spv', 'clip_frag_spv'),
+    ('clip_mask.frag.spv', 'clip_mask_frag_spv'),
     ('copy.frag.spv', 'copy_frag_spv'),
 ]
 

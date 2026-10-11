@@ -32,6 +32,11 @@ namespace jvk {
 // Descriptor layout:
 //   set 0, binding 0   storage buffer (path segments, shared with PathPipeline)
 //
+// IMAGE-ALPHA clips (clipToImageAlpha, shape 3) run the same protocol through
+// their own pair, maskPushPipeline_ / maskPopPipeline_: clip_mask.frag on its
+// own layout (set 0 = the mask's texture, IMAGE_SAMPLER; MaskPushConstants),
+// so the rrect/path pipelines and their layout are untouched.
+//
 // The SSBO is bound at dispatch time from the PathPipeline's descriptor set —
 // no separate buffer, no duplicate upload. For rrect clips the SSBO isn't
 // read (shape is computed analytically from push constants), but the binding
@@ -54,6 +59,16 @@ public:
         float    invStripH  = 0.0f;      // 52..56
     };
 
+    // Image-alpha clips (clip_mask.frag). 48 bytes: clip.vert's block is
+    // declared that long, and must sit inside the range.
+    struct MaskPushConstants {
+        float    viewportW, viewportH;   // 0..8
+        float    toMask[6];              // 8..32   — physical px → mask texels: x row, y row, offset
+        float    maskW, maskH;           // 32..40
+        uint32_t nearest;                // 40..44
+        uint32_t pad = 0;                // 44..48
+    };
+
     ClipPipeline() = default;
     ~ClipPipeline() { destroy(); }
 
@@ -66,6 +81,7 @@ public:
               VkRenderPass sceneRenderPass,
               std::span<const uint32_t> vertSpv,
               std::span<const uint32_t> fragSpv,
+              std::span<const uint32_t> maskFragSpv,
               size_t targetCount = 0)
     {
         device_ = &device;
@@ -120,6 +136,23 @@ public:
         // deep are already pathological.
         excludePipeline_ = buildVariant(sceneRenderPass, vertSpv, fragSpv,
                                         VK_STENCIL_OP_REPLACE, 0x3Fu);
+
+        // Image-alpha pair: set 0 is the mask's own texture descriptor (the
+        // texture cache's IMAGE_SAMPLER sets), owned by Memory::M.
+        VkDescriptorSetLayout imageSampler = device.bindings().getLayout(Memory::M::IMAGE_SAMPLER);
+        VkPushConstantRange mpc { VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                  0, sizeof(MaskPushConstants) };
+        VkPipelineLayoutCreateInfo mli {};
+        mli.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        mli.setLayoutCount = 1;
+        mli.pSetLayouts = &imageSampler;
+        mli.pushConstantRangeCount = 1;
+        mli.pPushConstantRanges = &mpc;
+        vkCreatePipelineLayout(d, &mli, nullptr, &maskLayout_);
+        maskPushPipeline_ = buildVariant(sceneRenderPass, vertSpv, maskFragSpv,
+                                         VK_STENCIL_OP_INCREMENT_AND_WRAP, 0xFFu, maskLayout_);
+        maskPopPipeline_  = buildVariant(sceneRenderPass, vertSpv, maskFragSpv,
+                                         VK_STENCIL_OP_DECREMENT_AND_WRAP, 0xFFu, maskLayout_);
     }
 
     bool ready() const { return pushPipeline_ != VK_NULL_HANDLE; }
@@ -170,6 +203,22 @@ public:
                  ssboDesc, currentDepth, viewportW, viewportH);
     }
 
+    // Image-alpha clip push/pop (shape 3): the same references as pushClip /
+    // popClip, the shape the mask in `p`.
+    void pushMask(State& state, VkCommandBuffer cmd, const DrawCommand& drawCmd,
+                  const ClipShapeParams& p, uint32_t parentDepth,
+                  float viewportW, float viewportH)
+    {
+        dispatchMask(state, cmd, drawCmd, maskPushPipeline_, p, parentDepth, viewportW, viewportH);
+    }
+
+    void popMask(State& state, VkCommandBuffer cmd, const DrawCommand& drawCmd,
+                 const ClipShapeParams& p, uint32_t currentDepth,
+                 float viewportW, float viewportH)
+    {
+        dispatchMask(state, cmd, drawCmd, maskPopPipeline_, p, currentDepth, viewportW, viewportH);
+    }
+
 private:
     void dispatch(State& state, VkCommandBuffer cmd, Renderer& /*r*/,
                   const DrawCommand& drawCmd,
@@ -182,7 +231,54 @@ private:
     {
         if (!ready()) return;
 
-        state.setCustomPipeline(pipeline, layout_);
+        begin(state, cmd, drawCmd, pipeline, layout_, stencilRef, viewportW, viewportH);
+
+        // Bind the shared path-segment SSBO at set 0.
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            layout_, 0, 1, &ssboDesc, 0, nullptr);
+
+        // Push constants — viewport + shape geometry + (for paths) segment range.
+        PushConstants pc = pcData;
+        pc.viewportW = viewportW;
+        pc.viewportH = viewportH;
+        vkCmdPushConstants(cmd, layout_,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(pc), &pc);
+
+        cover(state, drawCmd, coverRect);
+    }
+
+    void dispatchMask(State& state, VkCommandBuffer cmd, const DrawCommand& drawCmd,
+                      VkPipeline pipeline, const ClipShapeParams& p, uint32_t stencilRef,
+                      float viewportW, float viewportH)
+    {
+        if (pipeline == VK_NULL_HANDLE || p.maskDesc == VK_NULL_HANDLE) return;
+
+        begin(state, cmd, drawCmd, pipeline, maskLayout_, stencilRef, viewportW, viewportH);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            maskLayout_, 0, 1, &p.maskDesc, 0, nullptr);
+
+        MaskPushConstants pc {};
+        pc.viewportW = viewportW;
+        pc.viewportH = viewportH;
+        std::copy(std::begin(p.toMask), std::end(p.toMask), pc.toMask);
+        pc.maskW   = p.maskW;
+        pc.maskH   = p.maskH;
+        pc.nearest = p.maskNearest;
+        vkCmdPushConstants(cmd, maskLayout_,
+            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(pc), &pc);
+
+        cover(state, drawCmd, p.coverRect);
+    }
+
+    // Binds `pipeline` with its scissor (the command's clip bounds), the
+    // viewport and the stencil reference.
+    void begin(State& state, VkCommandBuffer cmd, const DrawCommand& drawCmd,
+               VkPipeline pipeline, VkPipelineLayout layout, uint32_t stencilRef,
+               float viewportW, float viewportH)
+    {
+        state.setCustomPipeline(pipeline, layout);
 
         // Scissor — command's clipBounds (parent clip intersected with the
         // cover rect) was already computed on record side.
@@ -204,19 +300,10 @@ private:
 
         // Stencil reference — which clip depth we compare against.
         vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilRef);
+    }
 
-        // Bind the shared path-segment SSBO at set 0.
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            layout_, 0, 1, &ssboDesc, 0, nullptr);
-
-        // Push constants — viewport + shape geometry + (for paths) segment range.
-        PushConstants pc = pcData;
-        pc.viewportW = viewportW;
-        pc.viewportH = viewportH;
-        vkCmdPushConstants(cmd, layout_,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(pc), &pc);
-
+    void cover(State& state, const DrawCommand& drawCmd, const juce::Rectangle<float>& coverRect)
+    {
         // Emit a 6-vertex cover quad in physical pixels — populate only
         // `position`; the clip vertex shader ignores the other UIVertex
         // attribs so we leave them zero.
@@ -250,7 +337,8 @@ private:
                             std::span<const uint32_t> vertSpv,
                             std::span<const uint32_t> fragSpv,
                             VkStencilOp stencilPassOp,
-                            uint32_t compareMask = 0xFFu)
+                            uint32_t compareMask = 0xFFu,
+                            VkPipelineLayout layout = VK_NULL_HANDLE)
     {
         VkDevice d = device_->device();
 
@@ -365,7 +453,7 @@ private:
         pci.pDepthStencilState = &ds;
         pci.pColorBlendState = &cb;
         pci.pDynamicState = &dynState;
-        pci.layout = layout_;
+        pci.layout = layout != VK_NULL_HANDLE ? layout : layout_;
         pci.renderPass = renderPass;
 
         VkPipeline result = VK_NULL_HANDLE;
@@ -383,9 +471,14 @@ private:
         if (pushPipeline_    != VK_NULL_HANDLE) vkDestroyPipeline(d, pushPipeline_, nullptr);
         if (popPipeline_     != VK_NULL_HANDLE) vkDestroyPipeline(d, popPipeline_, nullptr);
         if (excludePipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(d, excludePipeline_, nullptr);
+        if (maskPushPipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(d, maskPushPipeline_, nullptr);
+        if (maskPopPipeline_  != VK_NULL_HANDLE) vkDestroyPipeline(d, maskPopPipeline_, nullptr);
+        if (maskLayout_       != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, maskLayout_, nullptr);
         if (layout_         != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
         if (ssboSetLayout_  != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(d, ssboSetLayout_, nullptr);
         pushPipeline_ = popPipeline_ = excludePipeline_ = VK_NULL_HANDLE;
+        maskPushPipeline_ = maskPopPipeline_ = VK_NULL_HANDLE;
+        maskLayout_ = VK_NULL_HANDLE;
         layout_ = VK_NULL_HANDLE;
         ssboSetLayout_ = VK_NULL_HANDLE;
         device_ = nullptr;
@@ -397,6 +490,9 @@ private:
     VkPipeline            pushPipeline_    = VK_NULL_HANDLE;
     VkPipeline            popPipeline_     = VK_NULL_HANDLE;
     VkPipeline            excludePipeline_ = VK_NULL_HANDLE;
+    VkPipelineLayout      maskLayout_       = VK_NULL_HANDLE;   // set 0 = IMAGE_SAMPLER (not ours)
+    VkPipeline            maskPushPipeline_ = VK_NULL_HANDLE;
+    VkPipeline            maskPopPipeline_  = VK_NULL_HANDLE;
     VkDescriptorSetLayout ssboSetLayout_ = VK_NULL_HANDLE;
 };
 

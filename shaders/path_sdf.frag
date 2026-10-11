@@ -201,8 +201,12 @@ void main()
                 // it, so decide it the way the fragment's own ray would: the
                 // fragment is below the corner, so the crossing counts iff it
                 // moves RIGHT as y grows, i.e. the segment descends rightward.
+                // A FLAT segment lying on the tile top is not one of these: it
+                // crosses nothing in (tileTop, p.y], and the corner's winding
+                // already counts the side below it. Read as a tie, a right-to-
+                // left one added -1 to every fragment of the tile row under it.
                 float below = bRight ? -cornerSide : cornerSide;
-                bool  onCorner = cornerSide == 0.0 && ((b.x > a.x) == (b.y > a.y));
+                bool  onCorner = cornerSide == 0.0 && b.y != a.y && ((b.x > a.x) == (b.y > a.y));
                 if ((below > 0.0 || onCorner) && yc <= fragPos.y)
                     winding += bRight ? 1 : -1;
             }
