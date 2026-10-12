@@ -177,6 +177,13 @@ private:
 // `AudioProcessorEditor::nextGlobalFrameTick()`.
 // =============================================================================
 
+// A cached value that can tell it is ORPHANED (`bool orphaned() const`): nothing
+// outside the cache holds what it was made from, so nobody can ask for it again.
+template <typename V, typename = void>
+struct CanBeOrphaned : std::false_type {};
+template <typename V>
+struct CanBeOrphaned<V, std::void_t<decltype(std::declval<const V&>().orphaned())>> : std::true_type {};
+
 template <typename K, typename V>
 class Cache {
 public:
@@ -254,6 +261,9 @@ public:
             // might add later), the `if constexpr` skips the pin check at
             // compile time.
             bool stale = (frame - it->second.lastUsedFrame) > maxAge_;
+            if constexpr (CanBeOrphaned<V>::value) {
+                stale = stale || (it->second.value && it->second.value->orphaned());
+            }
             bool pinned = false;
             if constexpr (std::is_base_of_v<FrameRetained, V>) {
                 pinned = it->second.value && it->second.value->isPinned();
@@ -308,6 +318,20 @@ struct CachedImage : public FrameRetained {
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
     Memory::M*      bindings      = nullptr;
 
+    // What its texels came from (ImageSource::image or ::owner), HELD while it is
+    // cached: its key is that memory's address, which nothing else can take while
+    // it is held.
+    juce::Image                 heldImage;
+    std::shared_ptr<const void> heldTexels;
+
+    // Nothing but this entry holds what it came from: nobody can draw it again,
+    // so the next sweep frees it (Cache::evict), once no frame pins it.
+    bool orphaned() const
+    {
+        if (heldImage.isValid()) return heldImage.getReferenceCount() <= 1;
+        return heldTexels != nullptr && heldTexels.use_count() <= 1;
+    }
+
     CachedImage() = default;
     ~CachedImage() override
     {
@@ -352,7 +376,16 @@ struct CachedBuffer {
 //
 // A juce::Image is one kind (of: RGBA8, premultiplied as juce stores it, keyed by
 // its pixel buffer); raw texels another (of: keyed by their address).
+//
+// A key is an ADDRESS, so the cache HOLDS the memory behind it while it keeps
+// the upload (CachedImage::heldImage / heldTexels): memory freed under a cached
+// key would hand it to the next buffer allocated there, of the same size, which
+// would then draw the old texels (a texture rebuilt at the same size, every
+// time). Once nothing else holds that memory, the upload goes (orphaned).
 // =============================================================================
+
+// jvk::ImageType's id: a jvk image holds the Device, which holds this cache.
+inline constexpr int imageTypeID = 0x6A766B31;   // 'jvk1'
 
 struct ImageSource
 {
@@ -361,6 +394,8 @@ struct ImageSource
     PixelFormat format = PixelFormat::RGBA8;
     const void* pixels = nullptr;
     void      (*fill)(const ImageSource& self, uint8_t* dst) = nullptr;
+    const juce::Image*          image = nullptr;   // a juce::Image's own (of), held while cached
+    std::shared_ptr<const void> owner;             // what keeps raw texels (of), held the same way
 
     bool isValid() const { return key != 0 && width > 0 && height > 0 && fill != nullptr; }
 
@@ -396,6 +431,7 @@ struct ImageSource
         s.height = static_cast<uint32_t>(img.getHeight());
         s.format = PixelFormat::RGBA8;
         s.pixels = &img;
+        s.image = &img;
         s.fill = [](const ImageSource& self, uint8_t* dst)
         {
             const auto& image = *static_cast<const juce::Image*>(self.pixels);
@@ -435,11 +471,15 @@ struct ImageSource
     static ImageSource of(const juce::Image& img) { return of(img, keyOf(img)); }
 
     // Texels already in `format`, tightly packed (`texels` alive while it resolves),
-    // keyed by their address: a buffer that keeps its texels keeps its key.
-    static ImageSource of(const void* texels, uint32_t width, uint32_t height, PixelFormat format)
+    // keyed by their address: a buffer that keeps its texels keeps its key. `owner`,
+    // what keeps them, is held while the upload is cached; without one, a buffer
+    // freed meanwhile can hand its key to the next one at its address.
+    static ImageSource of(const void* texels, uint32_t width, uint32_t height, PixelFormat format,
+                          std::shared_ptr<const void> owner = {})
     {
         ImageSource s;
         if (texels == nullptr || width == 0 || height == 0) return s;
+        s.owner = std::move(owner);
         s.key = reinterpret_cast<uint64_t>(texels) ^ ((static_cast<uint64_t>(width) << 32) | height)
               ^ (static_cast<uint64_t>(format) + 1) * 0x9e3779b97f4a7c15ULL;
         s.width = width;
@@ -559,6 +599,12 @@ public:
 
         Memory::M::writeImage(device_.device(), ci->descriptorSet, 0,
             ci->image.view(), ci->image.sampler());
+
+        // Hold what it came from (ImageSource): never a jvk image, which would
+        // hold the Device, and so this cache, forever (its own texture tracks it).
+        if (src.image != nullptr && src.image->getPixelData()->createType()->getTypeID() != imageTypeID)
+            ci->heldImage = *src.image;
+        ci->heldTexels = src.owner;
 
         // Snapshot the VkImage handle from the freshly-created Image while
         // `ci` still owns it. We need this handle for the upload queue entry

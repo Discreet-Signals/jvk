@@ -268,7 +268,7 @@ public:
         return *new PixelData(fmt, w, h, clear);
     }
 
-    int getTypeID() const override { return 0x6A766B31; }   // 'jvk1'
+    int getTypeID() const override { return imageTypeID; }   // 'jvk1'
 };
 
 inline std::unique_ptr<juce::ImageType> PixelData::createType() const
