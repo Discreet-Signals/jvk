@@ -277,6 +277,10 @@ struct CachedImage : public FrameRetained {
     Image           image;
     VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
     Memory::M*      bindings      = nullptr;
+    // What owns the texels this entry was uploaded from (ImageSource::keepAlive).
+    // Keys are pixel addresses, so the entry holds that memory for as long as the
+    // key can be found: nothing else can be allocated there and hit this texture.
+    std::shared_ptr<const void> source;
 
     CachedImage() = default;
     ~CachedImage() override
@@ -322,6 +326,12 @@ struct CachedBuffer {
 //
 // A juce::Image is one kind (of: RGBA8, premultiplied as juce stores it, keyed by
 // its pixel buffer); raw texels another (of: keyed by their address).
+//
+// ADDRESS KEYS AND REUSE: a key is only unique while its memory is alive. Once an
+// image is freed, the allocator may hand the same address to a new image of the
+// same size, which would then hit the old texture and draw the wrong picture. So
+// the cache entry keeps the source's owner alive (keepAlive): a juce::Image keeps
+// its own pixel data; raw texels keep the `owner` their caller passes, if any.
 // =============================================================================
 
 struct ImageSource
@@ -331,8 +341,15 @@ struct ImageSource
     PixelFormat format = PixelFormat::RGBA8;
     const void* pixels = nullptr;
     void      (*fill)(const ImageSource& self, uint8_t* dst) = nullptr;
+    std::shared_ptr<const void> owner;   // raw texels: what keeps them alive (optional)
+    std::shared_ptr<const void> (*hold)(const ImageSource& self) = nullptr;   // a juce::Image: a reference to it
 
     bool isValid() const { return key != 0 && width > 0 && height > 0 && fill != nullptr; }
+
+    // What a cache entry made from this source keeps alive, so that no other
+    // image can take its address (and with it, its key) while the entry exists.
+    // Called only on a cache miss, so a hit costs nothing.
+    std::shared_ptr<const void> keepAlive() const { return hold != nullptr ? hold(*this) : owner; }
 
     // A juce::Image's key: the address of its top-left pixel plus its size and
     // line stride. Stable across the ephemeral SubsectionPixelData wrappers JUCE
@@ -400,12 +417,29 @@ struct ImageSource
                     }
             }
         };
+        // A juce::Image is reference counted: a copy shares (and keeps) its pixel data.
+        s.hold = [](const ImageSource& self) -> std::shared_ptr<const void>
+        {
+            return std::make_shared<const juce::Image>(*static_cast<const juce::Image*>(self.pixels));
+        };
         return s;
     }
     static ImageSource of(const juce::Image& img) { return of(img, keyOf(img)); }
 
     // Texels already in `format`, tightly packed (`texels` alive while it resolves),
-    // keyed by their address: a buffer that keeps its texels keeps its key.
+    // keyed by their address: a buffer that keeps its texels keeps its key. Pass
+    // the `owner` of the texels when they can be freed while their texture is still
+    // cached; without one, freed texels whose address is reused by a new buffer of
+    // the same size and format draw the old texture.
+    static ImageSource of(const void* texels, uint32_t width, uint32_t height, PixelFormat format,
+                          std::shared_ptr<const void> owner)
+    {
+        auto s = of(texels, width, height, format);
+        if (s.isValid())
+            s.owner = std::move(owner);
+        return s;
+    }
+
     static ImageSource of(const void* texels, uint32_t width, uint32_t height, PixelFormat format)
     {
         ImageSource s;
@@ -526,6 +560,7 @@ public:
         ci->descriptorSet = device_.bindings().alloc();
         if (ci->descriptorSet == VK_NULL_HANDLE) return VK_NULL_HANDLE;
         ci->bindings = &device_.bindings();
+        ci->source = src.keepAlive();   // its address stays its own while the key can be found
 
         Memory::M::writeImage(device_.device(), ci->descriptorSet, 0,
             ci->image.view(), ci->image.sampler());
