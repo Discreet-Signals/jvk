@@ -56,6 +56,8 @@ public:
               std::span<const uint32_t> fragSpv)
     {
         device_ = &device;
+        vertSpv_ = vertSpv;
+        fragSpv_ = fragSpv;
         VkDevice d = device.device();
 
         VkDescriptorSetLayout setLayout =
@@ -73,7 +75,86 @@ public:
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pcRange;
         vkCreatePipelineLayout(d, &pli, nullptr, &layout_);
+        pipelines_.push_back({ compatibleRenderPass, build(compatibleRenderPass) });
+    }
 
+    // Its pipeline for `renderPass`, built the first time it draws in that pass shape:
+    // the main colour's effect pass, a target's (Renderer). Render worker only.
+    VkPipeline pipelineFor(VkRenderPass renderPass)
+    {
+        for (auto& [rp, p] : pipelines_)
+            if (rp == renderPass) return p;
+        pipelines_.push_back({ renderPass, build(renderPass) });
+        return pipelines_.back().second;
+    }
+
+    // One HSV pass. Samples `srcDesc`, writes the transformed result into
+    // `dstFramebuffer`. Caller is responsible for the ping-pong pair so
+    // the final result lands back in "current".
+    // `scissor` (optional): ROI sub-rect from Renderer::execute's walk —
+    // render area + scissor shrink together; viewport stays full-extent so
+    // gl_FragCoord remains screen-space. Null = full extent.
+    void applyPass(VkCommandBuffer cmd,
+                   VkDescriptorSet srcDesc,
+                   VkFramebuffer   dstFramebuffer,
+                   VkRenderPass    dstRenderPass,
+                   VkExtent2D      extent,
+                   const PushConstants& pcData,
+                   uint32_t        stencilRef = 0,
+                   const VkRect2D* scissor = nullptr)
+    {
+        const VkPipeline pipeline = pipelineFor(dstRenderPass);
+        if (pipeline == VK_NULL_HANDLE) return;
+        VkRect2D sc = scissor ? *scissor : VkRect2D { {0, 0}, extent };
+        if (sc.extent.width == 0 || sc.extent.height == 0) return;
+
+        VkRenderPassBeginInfo rpbi {};
+        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rpbi.renderPass = dstRenderPass;
+        rpbi.framebuffer = dstFramebuffer;
+        rpbi.renderArea = sc;
+        rpbi.clearValueCount = 0;
+        rpbi.pClearValues = nullptr;
+        vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+
+        VkViewport vp {};
+        vp.width    = static_cast<float>(extent.width);
+        vp.height   = static_cast<float>(extent.height);
+        vp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            layout_, 0, 1, &srcDesc, 0, nullptr);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilRef);
+
+        PushConstants pc = pcData;
+        pc.viewportW = static_cast<float>(extent.width);
+        pc.viewportH = static_cast<float>(extent.height);
+        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(pc), &pc);
+
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(cmd);
+    }
+
+    // Returns an identity-transform PushConstants (scales=1, deltas=0).
+    // Used by the replay-time "pass 2" that copies B→A without modification.
+    static PushConstants identity()
+    {
+        return PushConstants { 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f };
+    }
+
+    bool ready() const { return ! pipelines_.empty() && pipelines_.front().second != VK_NULL_HANDLE; }
+
+private:
+    // Its pipeline for `compatibleRenderPass` (pipelineFor): the same shaders, layout and
+    // state, for that pass's attachments.
+    VkPipeline build(VkRenderPass compatibleRenderPass) const
+    {
+        VkDevice d = device_->device();
         auto makeModule = [&](std::span<const uint32_t> code) {
             VkShaderModuleCreateInfo ci {};
             ci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -83,8 +164,8 @@ public:
             vkCreateShaderModule(d, &ci, nullptr, &m);
             return m;
         };
-        VkShaderModule vertMod = makeModule(vertSpv);
-        VkShaderModule fragMod = makeModule(fragSpv);
+        VkShaderModule vertMod = makeModule(vertSpv_);
+        VkShaderModule fragMod = makeModule(fragSpv_);
 
         VkPipelineShaderStageCreateInfo stages[2] {};
         stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -169,85 +250,29 @@ public:
         pci.layout = layout_;
         pci.renderPass = compatibleRenderPass;
 
-        vkCreateGraphicsPipelines(d, device_->pipelineCache(), 1, &pci, nullptr, &pipeline_);
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        vkCreateGraphicsPipelines(d, device_->pipelineCache(), 1, &pci, nullptr, &pipeline);
 
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);
+        return pipeline;
     }
 
-    // One HSV pass. Samples `srcDesc`, writes the transformed result into
-    // `dstFramebuffer`. Caller is responsible for the ping-pong pair so
-    // the final result lands back in "current".
-    // `scissor` (optional): ROI sub-rect from Renderer::execute's walk —
-    // render area + scissor shrink together; viewport stays full-extent so
-    // gl_FragCoord remains screen-space. Null = full extent.
-    void applyPass(VkCommandBuffer cmd,
-                   VkDescriptorSet srcDesc,
-                   VkFramebuffer   dstFramebuffer,
-                   VkRenderPass    dstRenderPass,
-                   VkExtent2D      extent,
-                   const PushConstants& pcData,
-                   uint32_t        stencilRef = 0,
-                   const VkRect2D* scissor = nullptr)
-    {
-        VkRect2D sc = scissor ? *scissor : VkRect2D { {0, 0}, extent };
-        if (sc.extent.width == 0 || sc.extent.height == 0) return;
-
-        VkRenderPassBeginInfo rpbi {};
-        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rpbi.renderPass = dstRenderPass;
-        rpbi.framebuffer = dstFramebuffer;
-        rpbi.renderArea = sc;
-        rpbi.clearValueCount = 0;
-        rpbi.pClearValues = nullptr;
-        vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-
-        VkViewport vp {};
-        vp.width    = static_cast<float>(extent.width);
-        vp.height   = static_cast<float>(extent.height);
-        vp.maxDepth = 1.0f;
-        vkCmdSetViewport(cmd, 0, 1, &vp);
-
-        vkCmdSetScissor(cmd, 0, 1, &sc);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            layout_, 0, 1, &srcDesc, 0, nullptr);
-        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilRef);
-
-        PushConstants pc = pcData;
-        pc.viewportW = static_cast<float>(extent.width);
-        pc.viewportH = static_cast<float>(extent.height);
-        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(pc), &pc);
-
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-        vkCmdEndRenderPass(cmd);
-    }
-
-    // Returns an identity-transform PushConstants (scales=1, deltas=0).
-    // Used by the replay-time "pass 2" that copies B→A without modification.
-    static PushConstants identity()
-    {
-        return PushConstants { 0.0f, 0.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f };
-    }
-
-    bool ready() const { return pipeline_ != VK_NULL_HANDLE; }
-
-private:
     void destroy()
     {
         if (!device_) return;
         VkDevice d = device_->device();
-        if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_, nullptr);
+        for (auto& [rp, p] : pipelines_)
+            if (p != VK_NULL_HANDLE) vkDestroyPipeline(d, p, nullptr);
+        pipelines_.clear();
         if (layout_   != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
-        pipeline_ = VK_NULL_HANDLE;
         layout_   = VK_NULL_HANDLE;
     }
 
     Device*          device_   = nullptr;
     VkPipelineLayout layout_   = VK_NULL_HANDLE;
-    VkPipeline       pipeline_ = VK_NULL_HANDLE;
+    std::span<const uint32_t> vertSpv_, fragSpv_;                 // its shaders (static SPIR-V): every variant is built from them
+    std::vector<std::pair<VkRenderPass, VkPipeline>> pipelines_;   // one per render pass it draws in (pipelineFor)
 };
 
 } // namespace jvk

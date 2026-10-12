@@ -224,6 +224,12 @@ public:
             }
     }
 
+    // An allocation that will never be queued (its upload was abandoned):
+    // the bytes are wasted, but the block's park hold clears, so it can
+    // recycle. Without this a failed getTexture pinned its 4 MB block for
+    // the Renderer's life.
+    void discard(const Allocation& a) { commit(a); }
+
     // Move every parkable active block into `out`: not the current write
     // target (activeBlocks.back()), and no uncommitted allocations. Called
     // by the worker's flushUploads in the same lock hold as the queue swap;

@@ -82,11 +82,13 @@ inline glm::vec4 gradientAt(const GradientCtx& c, float px, float py)
 
 // Effective color attribute: for solid, carries the colour + opacity; for
 // gradient, white with opacity (the LUT sample already supplies RGB, opacity
-// multiplies in the shader).
+// multiplies in the shader). `solid` is the fill's colour either way: juce's
+// FillType::setOpacity writes its alpha, for a gradient fill too, so a
+// gradient under g.setOpacity(0.3f) renders at 30% (it used to render opaque).
 inline glm::vec4 fillColorAttr(const GradientCtx& grad, juce::Colour solid, float opacity)
 {
     if (grad.active())
-        return glm::vec4(1.0f, 1.0f, 1.0f, opacity);
+        return glm::vec4(1.0f, 1.0f, 1.0f, solid.getFloatAlpha() * opacity);
     return { solid.getFloatRed(), solid.getFloatGreen(),
              solid.getFloatBlue(), solid.getFloatAlpha() * opacity };
 }
@@ -140,6 +142,39 @@ inline void emitQuadUV(State& state, const DrawCommand& cmd,
         { {x + w, y + h}, color, {u1, v1}, shape, gi(x + w, y + h) },
         { {x,     y + h}, color, {u0, v1}, shape, gi(x,     y + h) },
     };
+    state.draw(cmd, verts, 6);
+}
+
+// An axis-aligned rectangle as the rounded-rect SDF with no radius (shape type
+// 1), padded a pixel for the coverage ramp: a fractional edge takes juce's
+// anti-aliasing (for an axis-aligned edge the ramp IS the pixel's covered
+// share), an integer edge whole pixels, exactly as a flat quad took them. UVs
+// anchor to the unpadded rect (the shader's halfSize). Six vertices.
+template <typename GradientAt>
+inline void rectSdfVertices(UIVertex* v, const juce::Rectangle<float>& phys,
+                            glm::vec4 color, GradientAt&& gi)
+{
+    const float x = phys.getX(), y = phys.getY(), w = phys.getWidth(), h = phys.getHeight();
+    const glm::vec4 shape(1.0f, w * 0.5f, h * 0.5f, 0.0f);
+    const float pad = 1.0f, uPad = pad / w, vPad = pad / h;
+    const float x0 = x - pad, y0 = y - pad, x1 = x + w + pad, y1 = y + h + pad;
+    const float u0 = -uPad, v0 = -vPad, u1 = 1.0f + uPad, v1 = 1.0f + vPad;
+    v[0] = { {x0, y0}, color, {u0, v0}, shape, gi(x0, y0) };
+    v[1] = { {x1, y0}, color, {u1, v0}, shape, gi(x1, y0) };
+    v[2] = { {x1, y1}, color, {u1, v1}, shape, gi(x1, y1) };
+    v[3] = { {x0, y0}, color, {u0, v0}, shape, gi(x0, y0) };
+    v[4] = { {x1, y1}, color, {u1, v1}, shape, gi(x1, y1) };
+    v[5] = { {x0, y1}, color, {u0, v1}, shape, gi(x0, y1) };
+}
+
+inline void emitRectSdf(State& state, const DrawCommand& cmd, const juce::Rectangle<float>& phys,
+                        glm::vec4 color, const GradientCtx* grad = nullptr)
+{
+    if (phys.getWidth() <= 0.0f || phys.getHeight() <= 0.0f) return;   // juce fills nothing
+    UIVertex verts[6];
+    rectSdfVertices(verts, phys, color, [&](float px, float py) {
+        return (grad && grad->active()) ? gradientAt(*grad, px, py) : glm::vec4(0.0f);
+    });
     state.draw(cmd, verts, 6);
 }
 
@@ -206,19 +241,10 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
 
             state.setResources(colorDescFor(grad, r), def);
             auto color = fillColorAttr(grad, fill.colour, p.opacity);
-            glm::vec4 shape(0.0f); // flat fill — no SDF
-
-            if (tx.isOnlyTranslation()) {
-                auto phys = toPixels(p.rect, p.transform, p.scale);
-                emitQuad(state, cmd, phys.getX(), phys.getY(),
-                         phys.getWidth(), phys.getHeight(), color, shape, &grad);
-            } else {
-                auto p00 = juce::Point<float>(p.rect.getX(),     p.rect.getY()   ).transformedBy(tx);
-                auto p10 = juce::Point<float>(p.rect.getRight(), p.rect.getY()   ).transformedBy(tx);
-                auto p11 = juce::Point<float>(p.rect.getRight(), p.rect.getBottom()).transformedBy(tx);
-                auto p01 = juce::Point<float>(p.rect.getX(),     p.rect.getBottom()).transformedBy(tx);
-                emitTransformedQuad(state, cmd, p00, p10, p11, p01, color, shape, &grad);
-            }
+            // Axis-aligned by construction: Graphics::fillRect takes a rotated or
+            // sheared rectangle as a path. The SDF rect gives fractional edges
+            // juce's anti-aliasing (a flat quad snapped them to whole pixels).
+            emitRectSdf(state, cmd, toPixels(p.rect, p.transform, p.scale), color, &grad);
             break;
         }
 
@@ -236,7 +262,6 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             GradientCtx grad = makeGradientCtx(r, fill, tx);
             state.setResources(colorDescFor(grad, r), def);
             auto color = fillColorAttr(grad, fill.colour, p.opacity);
-            glm::vec4 shape(0.0f); // flat fill — no SDF
 
             auto gi = [&](float px, float py) {
                 return grad.active() ? gradientAt(grad, px, py) : glm::vec4(0.0f);
@@ -251,28 +276,13 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
                 batched = 0;
             };
 
+            // Axis-aligned by construction (a rotated list is a path, Graphics::
+            // fillRectList); each rect an SDF rect like FillRect's.
             for (auto& rect : rects) {
-                juce::Point<float> p00, p10, p11, p01;
-                if (tx.isOnlyTranslation()) {
-                    auto phys = toPixels(rect, p.transform, p.scale);
-                    p00 = { phys.getX(),      phys.getY() };
-                    p10 = { phys.getRight(),  phys.getY() };
-                    p11 = { phys.getRight(),  phys.getBottom() };
-                    p01 = { phys.getX(),      phys.getBottom() };
-                } else {
-                    p00 = juce::Point<float>(rect.getX(),     rect.getY()     ).transformedBy(tx);
-                    p10 = juce::Point<float>(rect.getRight(), rect.getY()     ).transformedBy(tx);
-                    p11 = juce::Point<float>(rect.getRight(), rect.getBottom()).transformedBy(tx);
-                    p01 = juce::Point<float>(rect.getX(),     rect.getBottom()).transformedBy(tx);
-                }
+                const auto phys = toPixels(rect, p.transform, p.scale);
+                if (phys.getWidth() <= 0.0f || phys.getHeight() <= 0.0f) continue;
                 if (batched == kMaxBatchRects) flush();
-                UIVertex* v = batch + batched * 6;
-                v[0] = { {p00.x, p00.y}, color, {0, 0}, shape, gi(p00.x, p00.y) };
-                v[1] = { {p10.x, p10.y}, color, {1, 0}, shape, gi(p10.x, p10.y) };
-                v[2] = { {p11.x, p11.y}, color, {1, 1}, shape, gi(p11.x, p11.y) };
-                v[3] = { {p00.x, p00.y}, color, {0, 0}, shape, gi(p00.x, p00.y) };
-                v[4] = { {p11.x, p11.y}, color, {1, 1}, shape, gi(p11.x, p11.y) };
-                v[5] = { {p01.x, p01.y}, color, {0, 1}, shape, gi(p01.x, p01.y) };
+                rectSdfVertices(batch + batched * 6, phys, color, gi);
                 batched++;
             }
             flush();
@@ -494,8 +504,10 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
 
             auto color = fillColorAttr(grad, fill.colour, p.opacity);
 
-            float physFontH = font.getHeight() * tx.getScaleFactor();
-            float hScale = font.getHorizontalScale();
+            const float fontH   = font.getHeight();   // logical: the quad is built there, then transformed
+            const float hScale  = font.getHorizontalScale();
+            const float txScale = tx.getScaleFactor();
+            const bool  rotated = tx.mat01 != 0.0f || tx.mat10 != 0.0f;
             constexpr int PAD = GlyphAtlas::GLYPH_PADDING;
 
             // Hoisted out of the loop: getTypefacePtr() is an atomic
@@ -537,33 +549,47 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
                     batchDesc = glyphDesc;
                 }
 
-                auto glyphPos = positions[i].transformedBy(tx);
-                float innerW = entry->boundsW * physFontH * hScale;
-                float innerH = entry->boundsH * physFontH;
-                int innerTexW = entry->w - PAD * 2;
-                int innerTexH = entry->h - PAD * 2;
+                // The atlas tile (its padding included) placed in the paint's
+                // LOGICAL space by the glyph's bounds at the font's height...
+                const int innerTexW = entry->w - PAD * 2, innerTexH = entry->h - PAD * 2;
+                const float innerW = entry->boundsW * fontH * hScale, innerH = entry->boundsH * fontH;
+                const float lw = static_cast<float>(entry->w) * innerW / static_cast<float>(innerTexW);
+                const float lh = static_cast<float>(entry->h) * innerH / static_cast<float>(innerTexH);
+                const float lx = positions[i].x + entry->boundsX * fontH * hScale - PAD * innerW / static_cast<float>(innerTexW);
+                const float ly = positions[i].y + entry->boundsY * fontH - PAD * innerH / static_cast<float>(innerTexH);
+                // ...then every corner through the whole transform, so rotated or
+                // sheared text draws rotated or sheared (juce rasterizes the glyph
+                // transformed; upright quads along a slanted baseline it was).
+                // Unrotated, the baseline lands on a whole pixel row, as juce's
+                // software renderer puts it (fractional baselines blurred text).
+                float dy = 0.0f;
+                if (!rotated) {
+                    const float baseline = positions[i].transformedBy(tx).y;
+                    dy = std::round(baseline) - baseline;
+                }
+                auto corner = [&](float cx, float cy) {
+                    auto q = juce::Point<float>(cx, cy).transformedBy(tx);
+                    q.y += dy;
+                    return q;
+                };
+                const auto p00 = corner(lx, ly),      p10 = corner(lx + lw, ly);
+                const auto p11 = corner(lx + lw, ly + lh), p01 = corner(lx, ly + lh);
 
-                float gw = static_cast<float>(entry->w) * innerW / static_cast<float>(innerTexW);
-                float gh = static_cast<float>(entry->h) * innerH / static_cast<float>(innerTexH);
-                float padScreenX = PAD * (innerW / static_cast<float>(innerTexW));
-                float padScreenY = PAD * (innerH / static_cast<float>(innerTexH));
-                float gx = glyphPos.x + entry->boundsX * physFontH * hScale - padScreenX;
-                float gy = glyphPos.y + entry->boundsY * physFontH - padScreenY;
-
+                const float gwPhys = lw * txScale;   // the tile's width on screen
                 float screenPxRange = std::max(1.0f,
-                    static_cast<float>(GlyphAtlas::MSDF_PIXEL_RANGE) * (gw / static_cast<float>(entry->w)));
+                    static_cast<float>(GlyphAtlas::MSDF_PIXEL_RANGE) * (gwPhys / static_cast<float>(entry->w)));
                 glm::vec4 shape(4.0f, screenPxRange, 0, 0);
 
-                auto gi = [&](float px, float py) {
-                    return grad.active() ? gradientAt(grad, px, py) : glm::vec4(0.0f);
+                auto gi = [&](juce::Point<float> q) {
+                    return grad.active() ? gradientAt(grad, q.x, q.y) : glm::vec4(0.0f);
                 };
                 UIVertex* v = batch + batched * 6;
-                v[0] = { {gx,      gy     }, color, {entry->u0, entry->v0}, shape, gi(gx,      gy     ) };
-                v[1] = { {gx + gw, gy     }, color, {entry->u1, entry->v0}, shape, gi(gx + gw, gy     ) };
-                v[2] = { {gx + gw, gy + gh}, color, {entry->u1, entry->v1}, shape, gi(gx + gw, gy + gh) };
-                v[3] = { {gx,      gy     }, color, {entry->u0, entry->v0}, shape, gi(gx,      gy     ) };
-                v[4] = { {gx + gw, gy + gh}, color, {entry->u1, entry->v1}, shape, gi(gx + gw, gy + gh) };
-                v[5] = { {gx,      gy + gh}, color, {entry->u0, entry->v1}, shape, gi(gx,      gy + gh) };
+                v[0] = { {p00.x, p00.y}, color, {entry->u0, entry->v0}, shape, gi(p00) };
+                v[1] = { {p10.x, p10.y}, color, {entry->u1, entry->v0}, shape, gi(p10) };
+                v[2] = { {p11.x, p11.y}, color, {entry->u1, entry->v1}, shape, gi(p11) };
+                v[3] = { {p00.x, p00.y}, color, {entry->u0, entry->v0}, shape, gi(p00) };
+                v[4] = { {p11.x, p11.y}, color, {entry->u1, entry->v1}, shape, gi(p11) };
+                v[5] = { {p01.x, p01.y}, color, {entry->u0, entry->v1}, shape, gi(p01) };
                 batched++;
             }
             flushBatch();
@@ -588,11 +614,13 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             float len = std::sqrt(dx * dx + dy * dy);
             if (len < 0.001f) break;
 
-            // Capsule (rounded line): quad oriented along the line direction.
-            // Local axes: along = +X, perp = +Y (in the shader's local frame).
+            // A box the line's length and thickness (butt caps: juce's
+            // Path::addLineSegment is a rectangle, so a dash ends where it ends
+            // and a polyline's joints don't double up as capsules did), as a quad
+            // oriented along the line. Local axes: along = +X, perp = +Y.
             float halfLen = len * 0.5f;
             float radius  = p.lineWidth * tx.getScaleFactor() * 0.5f;
-            float pad     = 1.0f; // AA fringe only; quad already contains the caps
+            float pad     = 1.0f; // AA fringe only
 
             float ax = dx / len,  ay = dy / len;    // along
             float px = -ay,       py = ax;          // perpendicular
@@ -609,8 +637,8 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             auto p11 = at(+ah, +rh);
             auto p01 = at(-ah, +rh);
 
-            // Type 10 = capsule. Shader: length(vec2(max(abs(p.x)-halfLen, 0), p.y)) - radius
-            // shapeInfo.yz = (halfLen, radius) in the capsule's local frame. UV is
+            // Type 10 = line box. Shader: the box SDF of half sizes (halfLen, radius).
+            // shapeInfo.yz = (halfLen, radius) in the line's local frame. UV is
             // anchored to the unpadded extents — uPad = pad / (2*halfLen) — so the
             // shader's localP = (UV-0.5)*halfSize*2 reaches ±(halfLen+pad, radius+pad)
             // exactly at the quad corners.

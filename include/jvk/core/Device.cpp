@@ -204,7 +204,10 @@ std::shared_ptr<Device> Device::acquire()
     // but the cost is negligible and keeps the singleton invariant rigorous.
     const juce::ScopedLock lk(g_deviceAcquireLock);
     auto d = g_device.lock();
-    if (d) return d;
+    // A LOST device never renders again (the latch is sticky): editors still
+    // holding it fall back to the JUCE renderer, and the next one to acquire
+    // starts a fresh Device instead of inheriting the dead one.
+    if (d && !d->isLost()) return d;
     d = std::shared_ptr<Device>(new Device());
     g_device = d;
     return d;

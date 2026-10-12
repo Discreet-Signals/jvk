@@ -24,13 +24,15 @@ RenderTarget::~RenderTarget()
         vkDestroyCommandPool(device_.device(), commandPool_, nullptr);
 }
 
-std::vector<Target> RenderTarget::validTargets(std::vector<Target> requested) const
+std::vector<Target> RenderTarget::validTargets(std::vector<Target> requested)
 {
+    droppedTargets_.clear();
     if (requested.empty())
         return requested;
 
     if (!device_.supportsIndependentBlend()) {
         diag::log("render targets unavailable: the device lacks independentBlend");
+        for (auto& c : requested) droppedTargets_.push_back(c.name);
         return {};
     }
 
@@ -57,20 +59,25 @@ std::vector<Target> RenderTarget::validTargets(std::vector<Target> requested) co
         if (info.integer || info.compressed || (fp.optimalTilingFeatures & needed) != needed) {
             diag::log("render target '" + c.name.toString()
                       + "' dropped: its format cannot be rendered, sampled and blended");
+            droppedTargets_.push_back(c.name);
             continue;
         }
         if (kept.size() == kMaxTargets) {
             diag::log("render target '" + c.name.toString() + "' dropped: more than "
                       + juce::String((int) kMaxTargets) + " targets");
+            jassertfalse;   // the application declares more than jvk carries: a programming error
+            droppedTargets_.push_back(c.name);
             continue;
         }
         if (!c.isScaled() && kept.size() >= sceneLimit) {
             diag::log("render target '" + c.name.toString() + "' dropped: a target at scale 1 must be among the first "
                       + juce::String((int) sceneLimit));
+            droppedTargets_.push_back(c.name);
             continue;
         }
         if (!(c.scale > 0.0f) || c.height < 0) {
             diag::log("render target '" + c.name.toString() + "' dropped: its size is not positive");
+            droppedTargets_.push_back(c.name);
             continue;
         }
         if (c.isScaled() && c.clearedByMain) {
@@ -149,6 +156,10 @@ SwapchainTarget::~SwapchainTarget()
         if (rp != VK_NULL_HANDLE) vkDestroyRenderPass(d, rp, nullptr);
     for (auto& [key, rp] : targetPasses_)
         if (rp != VK_NULL_HANDLE) vkDestroyRenderPass(d, rp, nullptr);
+    for (auto& [key, rp] : mainPasses_)
+        if (rp != VK_NULL_HANDLE) vkDestroyRenderPass(d, rp, nullptr);
+    for (auto& [key, rp] : effectPasses_)
+        if (rp != VK_NULL_HANDLE) vkDestroyRenderPass(d, rp, nullptr);
     if (effectRP_     != VK_NULL_HANDLE) vkDestroyRenderPass(d, effectRP_,     nullptr);
     vkDestroySurfaceKHR(device_.instance(), surface_, nullptr);
 }
@@ -210,6 +221,10 @@ void SwapchainTarget::createSwapchain()
         ext.width  = std::clamp(width_,  caps.minImageExtent.width,  caps.maxImageExtent.width);
         ext.height = std::clamp(height_, caps.minImageExtent.height, caps.maxImageExtent.height);
     }
+    // A minimised window has no extent: no swapchain until it comes back
+    // (revive retries; the sizes keep their last real values).
+    if (ext.width == 0 || ext.height == 0)
+        return;
     width_ = ext.width;
     height_ = ext.height;
 
@@ -346,20 +361,146 @@ VkRenderPass SwapchainTarget::targetPass(TargetSlots slots, TargetMask clears)
     return rp;
 }
 
-VkFramebuffer SwapchainTarget::targetFramebuffer(TargetSlots slots)
+VkRenderPass SwapchainTarget::shaderPass(TargetSlots slots, TargetMask clears, bool main)
 {
-    for (auto& [k, fb] : targetFramebuffers_)
-        if (k == slots) return fb;
+    if (!main)
+        return targetPass(slots, clears);
+    const std::pair key { slots, TargetMask(0) };
+    for (auto& [k, rp] : mainPasses_)
+        if (k == key) return rp;
+
+    // The main colour at attachment 0 (location 0), the targets (at scale 1, so never
+    // cleared here: the scene pass clears them) at the locations their shader writes them
+    // at, the rest unused, then the shared depth/stencil. Every colour attachment loads
+    // what it holds and sits in SHADER_READ_ONLY_OPTIMAL between passes, as in the effect
+    // pass; the stencil is read for the clip and kept for the next scene pass.
+    std::vector<VkAttachmentDescription> atts;
+    std::vector<VkAttachmentReference> refs(std::max(1u, slotCount(slots)), { VK_ATTACHMENT_UNUSED, VK_IMAGE_LAYOUT_UNDEFINED });
+    auto colour = [&atts](VkFormat format) {
+        VkAttachmentDescription a {};
+        a.format         = format;
+        a.samples        = VK_SAMPLE_COUNT_1_BIT;
+        a.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
+        a.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+        a.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        a.initialLayout  = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        a.finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        atts.push_back(a);
+        return VkAttachmentReference { static_cast<uint32_t>(atts.size() - 1), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+    };
+    refs[0] = colour(format_);
+    for (uint32_t l = 1; l < refs.size(); ++l)
+        if (const int i = slotTarget(slots, l); i >= 0 && static_cast<size_t>(i) < targets_.size())
+            refs[l] = colour(toVkFormat(targets_[static_cast<size_t>(i)].format));
+
+    VkAttachmentDescription ds {};
+    ds.format         = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    ds.samples        = VK_SAMPLE_COUNT_1_BIT;
+    ds.loadOp         = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ds.storeOp        = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    ds.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_LOAD;
+    ds.stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ds.initialLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    ds.finalLayout    = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    atts.push_back(ds);
+    const VkAttachmentReference dsRef { static_cast<uint32_t>(atts.size() - 1), VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
+
+    VkSubpassDescription sub {};
+    sub.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount    = static_cast<uint32_t>(refs.size());
+    sub.pColorAttachments       = refs.data();
+    sub.pDepthStencilAttachment = &dsRef;
+
+    // As the effect pass's: after every earlier write and read of these images and the
+    // stencil, before whatever samples, loads or blits them next.
+    VkSubpassDependency deps[2] {};
+    deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass    = 0;
+    deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                          | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT
+                          | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                          | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                          | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+    deps[1].srcSubpass    = 0;
+    deps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                          | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                          | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                          | VK_ACCESS_TRANSFER_READ_BIT;
+
+    VkRenderPassCreateInfo rpci {};
+    rpci.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpci.attachmentCount = static_cast<uint32_t>(atts.size());
+    rpci.pAttachments    = atts.data();
+    rpci.subpassCount    = 1;
+    rpci.pSubpasses      = &sub;
+    rpci.dependencyCount = 2;
+    rpci.pDependencies   = deps;
+    VkRenderPass rp = VK_NULL_HANDLE;
+    vkCreateRenderPass(device_.device(), &rpci, nullptr, &rp);
+    mainPasses_.push_back({ key, rp });
+    return rp;
+}
+
+const Image* SwapchainTarget::scratch(size_t i, VkCommandBuffer cmd)
+{
+    if (i >= targets_.size()) return nullptr;
+    if (scratches_.size() != targets_.size()) scratches_.resize(targets_.size());
+    auto& image = scratches_[i];
+    if (image.image() == VK_NULL_HANDLE) {
+        const auto e = targetExtent(i);
+        image = Image(device_.pool(), device_.device(), e.width, e.height, toVkFormat(targets_[i].format),
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        // Into the layout every target keeps between passes. Its contents are undefined:
+        // whatever reads it draws into it first (Renderer).
+        VkImageMemoryBarrier b {};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image.image();
+        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &b);
+    }
+    return &image;
+}
+
+VkFramebuffer SwapchainTarget::shaderFramebuffer(int frameSlot, int half, TargetSlots slots, TargetMask scratchMask, VkCommandBuffer cmd)
+{
+    // A target-only framebuffer is the same in every frame slot (targets are shared by them).
+    const FramebufferKey key { half >= 0 ? frameSlot : 0, half, slots, scratchMask };
+    for (auto& [k, fb] : shaderFramebuffers_)
+        if (k == key) return fb;
+    if (half >= 0 && (frameSlot < 0 || frameSlot >= MAX_FRAMES)) return VK_NULL_HANDLE;
+
+    // In attachment order: the main colour's half, the targets by location, the stencil.
     std::vector<VkImageView> views;
+    if (half >= 0)
+        views.push_back(half == 0 ? sceneBuffers_[frameSlot].colorA.view() : sceneBuffers_[frameSlot].colorB.view());
     size_t first = targets_.size();
     for (uint32_t l = 1; l < 8; ++l)
         if (const int i = slotTarget(slots, l); i >= 0 && static_cast<size_t>(i) < targetImages_.size()) {
-            views.push_back(targetImages_[static_cast<size_t>(i)].view());
-            if (first == targets_.size()) first = static_cast<size_t>(i);
+            const auto t = static_cast<size_t>(i);
+            const Image* image = (scratchMask & (1u << t)) != 0 ? scratch(t, cmd) : &targetImages_[t];
+            if (image == nullptr) return VK_NULL_HANDLE;
+            views.push_back(image->view());
+            if (first == targets_.size()) first = t;
         }
-    VkRenderPass rp = targetPass(slots, 0);   // compatible with every clear variant
+    if (half >= 0)
+        views.push_back(sceneBuffers_[frameSlot].depthStencil.view());
+    VkRenderPass rp = shaderPass(slots, 0, half >= 0);   // compatible with every clear variant
     if (views.empty() || rp == VK_NULL_HANDLE) return VK_NULL_HANDLE;
-    const auto e = targetExtent(first);
+    const auto e = half >= 0 ? VkExtent2D { width_, height_ } : targetExtent(first);
     VkFramebufferCreateInfo fci {};
     fci.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
     fci.renderPass      = rp;
@@ -370,8 +511,106 @@ VkFramebuffer SwapchainTarget::targetFramebuffer(TargetSlots slots)
     fci.layers          = 1;
     VkFramebuffer fb = VK_NULL_HANDLE;
     vkCreateFramebuffer(device_.device(), &fci, nullptr, &fb);
-    targetFramebuffers_.push_back({ slots, fb });
+    shaderFramebuffers_.push_back({ key, fb });
     return fb;
+}
+
+VkRenderPass SwapchainTarget::targetEffectPass(size_t i)
+{
+    if (i >= targets_.size()) return VK_NULL_HANDLE;
+    const auto format = targets_[i].format;
+    for (auto& [f, rp] : effectPasses_)
+        if (f == format) return rp;
+
+    // One colour attachment at location 0 (where the effect shaders write), loading and
+    // storing, in SHADER_READ_ONLY_OPTIMAL between passes like every target; no stencil.
+    VkAttachmentDescription a {};
+    a.format         = toVkFormat(format);
+    a.samples        = VK_SAMPLE_COUNT_1_BIT;
+    a.loadOp         = VK_ATTACHMENT_LOAD_OP_LOAD;
+    a.storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
+    a.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    a.initialLayout  = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    a.finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    const VkAttachmentReference ref { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+
+    VkSubpassDescription sub {};
+    sub.pipelineBindPoint    = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments    = &ref;
+
+    // As a target pass's.
+    VkSubpassDependency deps[2] {};
+    deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
+    deps[0].dstSubpass    = 0;
+    deps[0].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                          | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    deps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT
+                          | VK_ACCESS_TRANSFER_WRITE_BIT;
+    deps[0].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                          | VK_ACCESS_SHADER_READ_BIT;
+    deps[1].srcSubpass    = 0;
+    deps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
+    deps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    deps[1].dstStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    deps[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                          | VK_ACCESS_SHADER_READ_BIT;
+
+    VkRenderPassCreateInfo rpci {};
+    rpci.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    rpci.attachmentCount = 1;
+    rpci.pAttachments    = &a;
+    rpci.subpassCount    = 1;
+    rpci.pSubpasses      = &sub;
+    rpci.dependencyCount = 2;
+    rpci.pDependencies   = deps;
+    VkRenderPass rp = VK_NULL_HANDLE;
+    vkCreateRenderPass(device_.device(), &rpci, nullptr, &rp);
+    effectPasses_.push_back({ format, rp });
+    return rp;
+}
+
+VkFramebuffer SwapchainTarget::targetEffectFramebuffer(size_t i, bool useScratch, VkCommandBuffer cmd)
+{
+    const std::pair key { i, useScratch };
+    for (auto& [k, fb] : effectFramebuffers_)
+        if (k == key) return fb;
+    if (i >= targetImages_.size()) return VK_NULL_HANDLE;
+    const Image* image = useScratch ? scratch(i, cmd) : &targetImages_[i];
+    VkRenderPass rp = targetEffectPass(i);
+    if (image == nullptr || rp == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+    const VkImageView view = image->view();
+    const auto e = targetExtent(i);
+    VkFramebufferCreateInfo fci {};
+    fci.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+    fci.renderPass      = rp;
+    fci.attachmentCount = 1;
+    fci.pAttachments    = &view;
+    fci.width           = e.width;
+    fci.height          = e.height;
+    fci.layers          = 1;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    vkCreateFramebuffer(device_.device(), &fci, nullptr, &fb);
+    effectFramebuffers_.push_back({ key, fb });
+    return fb;
+}
+
+VkDescriptorSet SwapchainTarget::targetSampler(size_t i, bool useScratch, VkCommandBuffer cmd)
+{
+    if (i >= targetImages_.size()) return VK_NULL_HANDLE;
+    auto& sets = samplers_[useScratch ? 1 : 0];
+    if (sets.size() != targets_.size()) sets.resize(targets_.size(), VK_NULL_HANDLE);
+    if (sets[i] == VK_NULL_HANDLE) {
+        const Image* image = useScratch ? scratch(i, cmd) : &targetImages_[i];
+        if (image == nullptr) return VK_NULL_HANDLE;
+        sets[i] = device_.bindings().alloc();
+        if (sets[i] != VK_NULL_HANDLE)
+            Memory::M::writeImage(device_.device(), sets[i], 0, image->view(), image->sampler());
+    }
+    return sets[i];
 }
 
 VkRenderPass SwapchainTarget::createSceneRenderPass(bool clear, TargetMask liveTargets) const
@@ -705,8 +944,10 @@ void SwapchainTarget::createSceneBuffers()
         // Sampler descriptors for reading A and B.
         sb.samplerA = device_.bindings().alloc();
         sb.samplerB = device_.bindings().alloc();
-        Memory::M::writeImage(d, sb.samplerA, 0, sb.colorA.view(), sb.colorA.sampler());
-        Memory::M::writeImage(d, sb.samplerB, 0, sb.colorB.view(), sb.colorB.sampler());
+        if (sb.samplerA != VK_NULL_HANDLE)
+            Memory::M::writeImage(d, sb.samplerA, 0, sb.colorA.view(), sb.colorA.sampler());
+        if (sb.samplerB != VK_NULL_HANDLE)
+            Memory::M::writeImage(d, sb.samplerB, 0, sb.colorB.view(), sb.colorB.sampler());
     }
 
     // colorA always enters the frame through sceneRPClear_ (initialLayout
@@ -741,6 +982,19 @@ void SwapchainTarget::createSceneBuffers()
 void SwapchainTarget::destroySceneBuffers()
 {
     VkDevice d = device_.device();
+    // The passes of their own first: their framebuffers name the images below.
+    for (auto& [k, fb] : shaderFramebuffers_)
+        if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(d, fb, nullptr);
+    shaderFramebuffers_.clear();
+    for (auto& [k, fb] : effectFramebuffers_)
+        if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(d, fb, nullptr);
+    effectFramebuffers_.clear();
+    for (auto& sets : samplers_) {
+        for (auto set : sets)
+            if (set != VK_NULL_HANDLE) device_.bindings().free(set);
+        sets.clear();
+    }
+    scratches_.clear();
     for (int i = 0; i < MAX_FRAMES; i++) {
         auto& sb = sceneBuffers_[i];
         if (sb.framebufferA != VK_NULL_HANDLE) vkDestroyFramebuffer(d, sb.framebufferA, nullptr);
@@ -751,9 +1005,6 @@ void SwapchainTarget::destroySceneBuffers()
         if (sb.samplerB     != VK_NULL_HANDLE) device_.bindings().free(sb.samplerB);
         sb = {};
     }
-    for (auto& [k, fb] : targetFramebuffers_)
-        if (fb != VK_NULL_HANDLE) vkDestroyFramebuffer(d, fb, nullptr);
-    targetFramebuffers_.clear();
     targetImages_.clear();   // after the framebuffers that referenced them
 }
 
@@ -807,14 +1058,20 @@ RenderTarget::Frame SwapchainTarget::beginFrame()
     // signals) or the driver hangs, an infinite wait wedges the worker
     // forever — the message thread then spins in waitForIdle and teardown
     // force-kills the thread mid-Vulkan-call. 2 s is far beyond any real
-    // frame; on timeout treat the device as unusable and bail gracefully.
+    // frame, but ONE such stall is not a dead device: a DAW holding the GPU
+    // at 100%, a debugger, a suspended process. A timeout skips this frame
+    // (the fence stays pending, the next tick waits again); only
+    // kMaxFenceTimeouts in a row — ten seconds with nothing retiring — mark
+    // the device lost, which is sticky for every editor sharing it.
     VkResult waitResult = vkWaitForFences(d, 1, &inFlightFence_[currentFrame_],
                                           VK_TRUE, 2'000'000'000ull);
     if (waitResult != VK_SUCCESS) {
-        if (waitResult == VK_ERROR_DEVICE_LOST || waitResult == VK_TIMEOUT)
+        if (waitResult == VK_ERROR_DEVICE_LOST
+            || (waitResult == VK_TIMEOUT && ++fenceTimeouts_ >= kMaxFenceTimeouts))
             device_.markLost();
         return {};
     }
+    fenceTimeouts_ = 0;
 
     uint32_t imageIndex = 0;
     VkResult result = vkAcquireNextImageKHR(d, swapchain_, UINT64_MAX,
@@ -953,6 +1210,10 @@ void SwapchainTarget::resize(uint32_t w, uint32_t h)
     renderFinished_.clear();
 
     createSwapchain();
+    // No swapchain (a minimised window, a failed create): nothing to size the
+    // scene buffers to. revive() comes back here when the window does.
+    if (swapchain_ == VK_NULL_HANDLE)
+        return;
     createSceneBuffers();
 
     VkSemaphoreCreateInfo sci {};
@@ -960,6 +1221,12 @@ void SwapchainTarget::resize(uint32_t w, uint32_t h)
     renderFinished_.resize(swapImages_.size(), VK_NULL_HANDLE);
     for (auto& sem : renderFinished_)
         vkCreateSemaphore(d, &sci, nullptr, &sem);
+}
+
+void SwapchainTarget::revive()
+{
+    if (swapchain_ == VK_NULL_HANDLE && !device_.isLost())
+        resize(width_, height_);
 }
 
 

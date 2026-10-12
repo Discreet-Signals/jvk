@@ -94,21 +94,29 @@ public:
         vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 
-    // Draws `shader` in a TARGET PASS the caller has begun (`renderPass`: the targets it
-    // writes, at `slots`, Renderer), over `region` in those targets' pixels (the viewport
-    // is their size), scissored to `clip` within it. The pass has no stencil, so no path
+    // Draws `shader` in a pass of its own the caller has begun (`renderPass`: what it
+    // writes, the targets at `slots` and, when that pass carries it, the main colour:
+    // Renderer), over `region` in that pass's pixels (the viewport is their size),
+    // scissored to `clip` within it. `sceneSet`: for a scene reader, the half of the main
+    // colour it reads, bound as its set 1. `stencilDepth`: the clip, where the pass carries
+    // the stencil (it writes the main colour); a target-only pass has none, so no path
     // clips. Such a shader is built against that pass on first use and is only ever drawn
     // this way.
     void dispatchTarget(VkCommandBuffer cmd, Shader& shader, VkRenderPass renderPass, TargetSlots slots,
                         juce::Rectangle<float> region, float viewportW, float viewportH,
                         const juce::Rectangle<int>& clip, float frameTime, int frameSlot,
                         std::span<const float> drawConstants = {},
-                        std::span<const VkDescriptorSet> drawImages = {})
+                        std::span<const VkDescriptorSet> drawImages = {},
+                        VkDescriptorSet sceneSet = VK_NULL_HANDLE, uint8_t stencilDepth = 0)
     {
         if (!device_) return;
         shader.ensureCreated(*device_, renderPass, VK_SAMPLE_COUNT_1_BIT, targets_, slots);
         if (!shader.isReady()) return;
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shader.pipeline());
+        if (shader.readsScene() && sceneSet == VK_NULL_HANDLE) return;   // nothing to read: no draw
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          stencilDepth > 0 ? shader.clipPipeline() : shader.pipeline());
+        if (stencilDepth > 0)
+            vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilDepth);
 
         const auto c = clip.getIntersection(region.getSmallestIntegerContainer());
         const int x0 = std::max(0, c.getX()), y0 = std::max(0, c.getY());
@@ -129,7 +137,7 @@ public:
         vkCmdPushConstants(cmd, shader.layout(),
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push), push);
         pushDrawConstants(cmd, shader, drawConstants);
-        bindSets(cmd, shader, frameSlot, drawImages);
+        bindSets(cmd, shader, frameSlot, drawImages, sceneSet);
         vkCmdDraw(cmd, 3, 1, 0, 0);
     }
 

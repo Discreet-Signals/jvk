@@ -12,7 +12,7 @@ Pipeline::Pipeline(Pipeline&& o) noexcept
       variants_(std::move(o.variants_)),
       layout_(o.layout_), renderPass_(o.renderPass_), targets_(std::move(o.targets_)),
       vertSpirv_(std::move(o.vertSpirv_)), fragSpirv_(std::move(o.fragSpirv_)),
-      built_(o.built_), hasClip_(o.hasClip_)
+      built_(o.built_), buildFailed_(o.buildFailed_), hasClip_(o.hasClip_)
 {
     o.layout_ = VK_NULL_HANDLE;
     o.built_  = false;
@@ -41,7 +41,11 @@ void Pipeline::loadFragmentShader(std::span<const uint32_t> spirv)
 
 void Pipeline::build(VkRenderPass renderPass, const std::vector<Target>& targets)
 {
-    if (built_) return;
+    // A failed build is remembered: retried every frame, it leaked a layout
+    // and a duplicate default variant per attempt (the destructor frees what
+    // the one attempt made).
+    if (built_ || buildFailed_) return;
+    buildFailed_ = true;   // cleared below when every step succeeds
     VkDevice d = device_.device();
     renderPass_ = renderPass;
     targets_    = targets;
@@ -86,6 +90,7 @@ void Pipeline::build(VkRenderPass renderPass, const std::vector<Target>& targets
     }
 
     built_ = true;
+    buildFailed_ = false;
 }
 
 VkPipeline Pipeline::buildVariant(const PipelineConfig& cfg, VkRenderPass renderPass,

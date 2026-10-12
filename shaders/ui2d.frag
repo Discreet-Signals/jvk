@@ -31,6 +31,27 @@ float roundedRectSDF(vec2 p, vec2 b, float r) {
     return length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - r;
 }
 
+// Signed distance to an axis-aligned ellipse of half sizes r, centred at the
+// origin: the gradient-normalised approximation, exact for a circle and to
+// first order at the boundary, so a stroke or an AA band keeps ONE width all
+// round. The (k - 1) * min(r) it replaces read four times too wide at the
+// ends of a 4:1 ellipse.
+float ellipseSDF(vec2 p, vec2 r) {
+    r = max(r, vec2(0.001));
+    float k = length(p / r);
+    float m = length(p / (r * r));
+    return m > 0.0 ? k * (k - 1.0) / m : -min(r.x, r.y);
+}
+
+// Coverage from a signed distance in pixels: for a straight edge through the
+// pixel, the share of it inside (juce's anti-aliasing), a one-pixel ramp with
+// no derivative. The fwidth smoothstep it replaces was a two-pixel ramp that
+// left an integer-aligned edge's own pixels at 84% and every rounded rectangle
+// and ellipse a little soft.
+float coverage(float dist) {
+    return clamp(0.5 - dist, 0.0, 1.0);
+}
+
 // Median of three values — core of MSDF rendering
 float median(float r, float g, float b) {
     return max(min(r, g), min(max(r, g), b));
@@ -168,49 +189,33 @@ vec4 sampleShape() {
         float strokeW    = packed.y;
         vec2 p = (fragUV - 0.5) * halfSize * 2.0;
 
-        float filled;
-        if (type == 8) {
-            filled = roundedRectSDF(p, halfSize, cornerSize);
-        } else {
-            float k = length(p / max(halfSize, vec2(0.001)));
-            filled = (k - 1.0) * min(halfSize.x, halfSize.y);
-        }
-        float dist = abs(filled) - strokeW * 0.5;
-        float aa = fwidth(dist);
-        float alpha = 1.0 - smoothstep(-aa, aa, dist);
-        return vec4(alpha);
+        float filled = type == 8 ? roundedRectSDF(p, halfSize, cornerSize)
+                                 : ellipseSDF(p, halfSize);
+        return vec4(coverage(abs(filled) - strokeW * 0.5));
     }
 
-    // Capsule line (type 10) — quad is oriented along the line direction on CPU.
+    // Line (type 10) — a BOX the line's length and thickness (butt caps, as
+    // juce's Path::addLineSegment), quad oriented along the line on the CPU.
     // Local frame: +x along the segment, +y perpendicular. shapeInfo.yz holds
-    // the unpadded (halfLen, radius); fragUV is offset to map 0..1 across the
-    // padded quad so localP reaches slightly beyond (halfLen, radius) for AA.
+    // the unpadded (halfLen, halfThickness); fragUV is offset to map 0..1
+    // across the padded quad so localP reaches a pixel beyond for AA.
     if (type == 10) {
-        vec2 halfSize = fragShapeInfo.yz; // (halfLen, radius)
+        vec2 halfSize = fragShapeInfo.yz; // (halfLen, halfThickness)
         vec2 p = (fragUV - 0.5) * halfSize * 2.0;
-        vec2 q = vec2(max(abs(p.x) - halfSize.x, 0.0), p.y);
-        float dist = length(q) - halfSize.y;
-        float aa = fwidth(dist);
-        float alpha = 1.0 - smoothstep(-aa, aa, dist);
-        return vec4(alpha);
+        vec2 q = abs(p) - halfSize;
+        float dist = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0);
+        return vec4(coverage(dist));
     }
 
-    // Analytical SDF shapes (rounded rect, ellipse)
+    // Analytical SDF shapes (rounded rect — a plain rect is one with no
+    // radius, type 1 from FillRect — and ellipse)
     vec2 halfSize = fragShapeInfo.yz;
     float param = fragShapeInfo.w;
     vec2 p = (fragUV - 0.5) * halfSize * 2.0;
 
-    float dist;
-    if (type == 1) {
-        dist = roundedRectSDF(p, halfSize, param);
-    } else {
-        float k = length(p / max(halfSize, vec2(0.001)));
-        dist = (k - 1.0) * min(halfSize.x, halfSize.y);
-    }
-
-    float aa = fwidth(dist);
-    float alpha = 1.0 - smoothstep(-aa, aa, dist);
-    return vec4(alpha);
+    float dist = type == 1 ? roundedRectSDF(p, halfSize, param)
+                           : ellipseSDF(p, halfSize);
+    return vec4(coverage(dist));
 }
 
 // PAINT INTO THE MAIN COLOUR also sets the render targets declared

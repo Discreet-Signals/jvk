@@ -79,7 +79,9 @@ public:
     uint32_t push(const T& data)
     {
         static_assert(std::is_trivially_copyable_v<T>, "Arena is POD-only. Use Renderer side vectors for non-POD types.");
-        uint32_t offset = head_;
+        // At T's alignment: read<T>() hands out a reference into the buffer.
+        constexpr uint32_t a = static_cast<uint32_t>(alignof(T));
+        uint32_t offset = (head_ + a - 1u) & ~(a - 1u);
         uint32_t needed = static_cast<uint32_t>(sizeof(T));
         ensureCapacity(offset + needed);
         memcpy(buffer_.data() + offset, &data, sizeof(T));
@@ -208,6 +210,9 @@ public:
         if (!recordsInTarget(op)) return false;
         uint32_t offset = arena_.push(params);
         commands_.push_back({ op, stencilDepth, offset, clip, recordTarget_ });
+        // An effect on a target reads it: the target lives up to here.
+        if (recordTarget_ > 0 && isPassEffect(op))
+            noteTargetsRead(static_cast<TargetMask>(1u << (recordTarget_ - 1)));
         return true;
     }
 
@@ -226,9 +231,9 @@ public:
     // ---- Target lifetimes --------------------------------------------------
     //
     // Targets are cleared at the start of every frame and their only readers
-    // are shaders drawn later in the same frame (the final blit reads the
-    // main colour alone), so a target is LIVE up to and including its last
-    // reader and DEAD after it: nothing written to it then is ever read. The
+    // are shaders and effects drawn later in the same frame (the final blit
+    // reads the main colour alone), so a target is LIVE up to and including its
+    // last reader and DEAD after it: nothing written to it then is ever read. The
     // replay drops that work: draws into a dead target, the clear-under-paint
     // of main-colour draws (Target::clearedByMain), and the load and store of
     // its image at every scene-pass boundary. A frame pays for its targets up
@@ -236,7 +241,7 @@ public:
     // Masks: bit i = target i.
     //
     // The command just recorded samples `targets` (jvk::Graphics::drawShader,
-    // for a shader that reads them).
+    // for a shader that reads them; push, for an effect on a target).
     void noteTargetsRead(TargetMask targets)
     {
         for (uint32_t i = 0; i < kMaxTargets; ++i)
@@ -621,6 +626,7 @@ private:
     Arena                    arena_;
 
     uint8_t recordTarget_ = 0;
+    TargetMask scaledTargets_ = 0;   // the frame's scaled targets (RenderTarget::scaledTargets), taken at reset
     std::vector<VkClearValue> clearScratch_;   // worker-only: scene pass clear values (capacity kept)
 
     // Target lifetimes (noteTargetsRead): per target, the index of its last
@@ -641,21 +647,30 @@ private:
         }
     }
 
+    // Effects that run as passes of their own: on the main colour or on any target.
+    static bool isPassEffect(DrawOp op)
+    {
+        return op == DrawOp::EffectKernel || op == DrawOp::EffectHSV
+            || op == DrawOp::BlurShape || op == DrawOp::BlurPath;
+    }
+
     // Clip ops always record (they keep the stencil balanced whatever the
-    // target). Effects read and write the main colour, so they record only
-    // while the main colour is the target. Nothing else records into a
-    // missing target.
+    // target). Nothing else records into a missing target. Pass effects run
+    // on the main colour or any target; a shader writes what it declares,
+    // whatever the target; the blend-mode draws land on the main colour; and
+    // ordinary paint on the main colour or a target at scale 1 (a scaled one
+    // isn't attached to the scene pass).
     bool recordsInTarget(DrawOp op) const
     {
         if (isClipOp(op))
             return true;
-        switch (op) {
-            case DrawOp::EffectBlend: case DrawOp::EffectNoise: case DrawOp::EffectKernel:
-            case DrawOp::EffectHSV: case DrawOp::BlurShape: case DrawOp::BlurPath:
-                return recordTarget_ == 0;
-            default:
-                return recordTarget_ != kNoTarget;
-        }
+        if (recordTarget_ == kNoTarget)
+            return false;
+        if (isPassEffect(op) || op == DrawOp::DrawShader)
+            return true;
+        if (op == DrawOp::EffectBlend || op == DrawOp::EffectNoise)
+            return recordTarget_ == 0;
+        return recordTarget_ == 0 || (scaledTargets_ & (1u << (recordTarget_ - 1))) == 0;
     }
 
     // Non-POD captures (proper RAII, cleared each frame)

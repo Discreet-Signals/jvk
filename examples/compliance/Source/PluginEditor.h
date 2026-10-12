@@ -72,6 +72,7 @@ private:
     static void sceneTransparencyLayer(juce::Graphics&, juce::Rectangle<float>);
     static void sceneOpacityContract  (juce::Graphics&, juce::Rectangle<float>);
     static void sceneExcludeClip      (juce::Graphics&, juce::Rectangle<float>);
+    static void sceneCompliance2026   (juce::Graphics&, juce::Rectangle<float>);
 
     static juce::Image makeTestImage(int w, int h);
 

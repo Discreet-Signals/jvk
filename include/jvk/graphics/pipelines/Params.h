@@ -178,17 +178,19 @@ struct DrawShaderParams {
     void*                  shader; // Shader*
     juce::Rectangle<float> region;
     float                  scale;
-    // What the shader does with the frame's targets (bit i = target i),
-    // captured at record: reads them (a reader runs as its own pass, and sets
-    // their lifetimes: Renderer::noteTargetsRead), writes them (at the output
-    // locations of targetSlots), writes the main colour (location 0).
+    // What the shader reads and writes, captured at record: the targets it
+    // samples (bit i = target i; they live up to here: Renderer::noteTargetsRead),
+    // the ones it writes (at the output locations of targetSlots), the main
+    // colour (location 0).
     TargetMask             targetsRead    = 0;
     TargetMask             targetsWritten = 0;
     TargetSlots            targetSlots    = 0;
     bool                   writesMain     = true;
-    // A TARGET PASS: it writes targets but not the main colour, and reads targets or
-    // writes scaled ones (Target::scale), so it runs as its own pass on what it writes.
-    bool                   targetPass     = false;
+    // Where it draws (Renderer::execute, the render graph): INSIDE THE SCENE PASS
+    // when everything it writes is attached there (the main colour, targets at
+    // scale 1) and nothing it reads is (it reads neither the scene nor a target at
+    // scale 1; scaled targets it may), else as a pass of its own.
+    bool                   inScene        = true;
     uint32_t               constantCount = 0;
     float                  constants[kShaderDrawConstants] {};
     // The draw's own images (Shader::setDrawImage), resolved through the texture

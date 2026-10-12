@@ -49,6 +49,16 @@ public:
     virtual void  endFrame(const Frame& frame) = 0;
     virtual void  resize(uint32_t w, uint32_t h) = 0;
 
+    // Whether beginFrame can produce a frame right now: the device isn't lost
+    // and there is something to present to. The editor asks on the message
+    // thread (the render worker idle) before recording a frame: one that
+    // can't begin would only queue uploads and pins that no submission ever
+    // releases. `revive` tries to make the target presentable again (a
+    // swapchain the window lost while minimised, a create that failed); the
+    // worker must be idle.
+    virtual bool canBegin() const { return !device_.isLost(); }
+    virtual void revive() {}
+
     virtual uint32_t width()  const = 0;
     virtual uint32_t height() const = 0;
     virtual VkFormat format() const = 0;
@@ -97,6 +107,11 @@ public:
             if (targets_[i].name == name) return static_cast<int>(i);
         return -1;
     }
+    // The names of the targets declared but DROPPED (validTargets: over the
+    // limit, a format the device can't render). A shader whose output is
+    // named after one draws nothing (Shader::resolveTargets) rather than
+    // falling back to the target at its location.
+    const std::vector<juce::Identifier>& droppedTargets() const { return droppedTargets_; }
     // The scaled targets (Target::scale, Target::height), bit i = target i: not scene-pass attachments.
     TargetMask scaledTargets() const
     {
@@ -121,12 +136,45 @@ public:
                                               : static_cast<uint32_t>(std::ceil(static_cast<float>(height()) * s));
         return { std::max(1u, static_cast<uint32_t>(std::ceil(static_cast<float>(width()) * s))), std::max(1u, h) };
     }
-    // A TARGET PASS (Renderer): a jvk::Shader drawing into the targets of `slots` (one size)
-    // outside the scene pass. Its render pass, those targets as attachments at the output
-    // locations their shader writes them at (the rest unused), clearing the ones in `clears`
-    // first and loading the rest; and its framebuffer. Null where this target can't run one.
-    virtual VkRenderPass  targetPass(TargetSlots slots, TargetMask clears) { juce::ignoreUnused(slots, clears); return VK_NULL_HANDLE; }
-    virtual VkFramebuffer targetFramebuffer(TargetSlots slots) { juce::ignoreUnused(slots); return VK_NULL_HANDLE; }
+    // ---- Passes of their own (Renderer::execute: the render graph) ----------
+    //
+    // A draw runs inside the scene pass when everything it writes is attached
+    // there and nothing it reads is; otherwise as a pass of its own, whose
+    // attachments are exactly what it writes. These are those passes. Null
+    // where this target can't run one (it is skipped). Render passes live as
+    // long as the target; framebuffers, scratches and samplers until its
+    // images are made again (a resize).
+    //
+    // A TARGET PASS: a jvk::Shader drawing into the targets of `slots` (one
+    // size) and not the main colour. Its render pass, those targets as
+    // attachments at the output locations their shader writes them at (the
+    // rest unused), clearing the ones in `clears` first and loading the rest.
+    virtual VkRenderPass targetPass(TargetSlots slots, TargetMask clears) { juce::ignoreUnused(slots, clears); return VK_NULL_HANDLE; }
+    // The same, or with `main` also the main colour: its current half at
+    // location 0, beside targets at scale 1, with the shared stencil so the
+    // clip applies.
+    virtual VkRenderPass shaderPass(TargetSlots slots, TargetMask clears, bool main)
+    {
+        return main ? VK_NULL_HANDLE : targetPass(slots, clears);
+    }
+    // Its framebuffer: `half` (0 = A, 1 = B; -1 = none) of frame slot
+    // `frameSlot`'s main colour, then the targets of `slots`, each one in
+    // `scratch` drawn into through its SCRATCH instead (an image of its size
+    // and format: how a pass writes a target it also reads, Renderer).
+    // Render worker, outside any render pass: `cmd` takes the first-use
+    // transition of a scratch made by this call.
+    virtual VkFramebuffer shaderFramebuffer(int frameSlot, int half, TargetSlots slots, TargetMask scratch, VkCommandBuffer cmd)
+    {
+        juce::ignoreUnused(frameSlot, half, slots, scratch, cmd);
+        return VK_NULL_HANDLE;
+    }
+    // EFFECTS ON A TARGET (Graphics::setTarget, then a blur or an HSV
+    // transform): target i's single-colour render pass (by its format:
+    // loading, storing, no stencil), and a framebuffer and a sampler for it
+    // or for its scratch. Render worker, outside any render pass.
+    virtual VkRenderPass    targetEffectPass(size_t i) { juce::ignoreUnused(i); return VK_NULL_HANDLE; }
+    virtual VkFramebuffer   targetEffectFramebuffer(size_t i, bool scratch, VkCommandBuffer cmd) { juce::ignoreUnused(i, scratch, cmd); return VK_NULL_HANDLE; }
+    virtual VkDescriptorSet targetSampler(size_t i, bool scratch, VkCommandBuffer cmd) { juce::ignoreUnused(i, scratch, cmd); return VK_NULL_HANDLE; }
 
     // Each RenderTarget owns a dedicated VkCommandPool. Vulkan command pools
     // are externally synchronized — every vkCmd* recording call on any
@@ -145,12 +193,14 @@ protected:
     std::vector<Target> targets_;
     std::vector<Image>   targetImages_;
     uint64_t             targetsGeneration_ = 0;
+    std::vector<juce::Identifier> droppedTargets_;   // validTargets: the names it dropped
 
     // The targets this device can carry: independentBlend is required (a
     // draw writes one attachment and leaves the rest), and the main colour
     // plus the targets must fit the device's colour-attachment limit and the
-    // built-in shaders' 8 outputs. The rest are dropped, with a log line.
-    std::vector<Target> validTargets(std::vector<Target> requested) const;
+    // built-in shaders' 8 outputs. The rest are dropped, with a log line,
+    // their names kept (droppedTargets).
+    std::vector<Target> validTargets(std::vector<Target> requested);
 };
 
 
@@ -178,6 +228,12 @@ public:
     Frame    beginFrame() override;
     void     endFrame(const Frame& frame) override;
     void     resize(uint32_t w, uint32_t h) override;
+    // Presentable: a swapchain exists (its creation fails while the window is
+    // minimised: a zero extent) on a device that isn't lost. Message thread
+    // with the worker idle, or the worker: both are the only writers of the
+    // swapchain handle and never run at once.
+    bool     canBegin() const override { return swapchain_ != VK_NULL_HANDLE && !device_.isLost(); }
+    void     revive() override;
     uint32_t width()  const override { return width_; }
     uint32_t height() const override { return height_; }
     VkFormat format() const override { return format_; }
@@ -194,8 +250,12 @@ public:
     VkRenderPass sceneRenderPassLoad()  const override { return sceneRPLoad_;  }
     VkRenderPass sceneRenderPass(bool clear, TargetMask liveTargets) override;
     VkRenderPass effectRenderPass()     const override { return effectRP_;     }
-    VkRenderPass  targetPass(TargetSlots slots, TargetMask clears) override;
-    VkFramebuffer targetFramebuffer(TargetSlots slots) override;
+    VkRenderPass    targetPass(TargetSlots slots, TargetMask clears) override;
+    VkRenderPass    shaderPass(TargetSlots slots, TargetMask clears, bool main) override;
+    VkFramebuffer   shaderFramebuffer(int frameSlot, int half, TargetSlots slots, TargetMask scratch, VkCommandBuffer cmd) override;
+    VkRenderPass    targetEffectPass(size_t i) override;
+    VkFramebuffer   targetEffectFramebuffer(size_t i, bool scratch, VkCommandBuffer cmd) override;
+    VkDescriptorSet targetSampler(size_t i, bool scratch, VkCommandBuffer cmd) override;
 
     const SceneBuffers& sceneBuffers(int frameSlot) const override
     {
@@ -210,6 +270,8 @@ private:
     void createSyncObjects();
     void destroySwapchain();
     void destroySceneBuffers();
+    // Target i's scratch, made on first use (its first-use transition recorded into `cmd`).
+    const Image* scratch(size_t i, VkCommandBuffer cmd);
 
     VkSurfaceKHR   surface_;
     void*          nativeWindow_ = nullptr; // Win32 HWND behind surface_ (DPI-context pinning)
@@ -218,6 +280,10 @@ private:
     VkPresentModeKHR presentMode_;
     uint32_t       width_  = 0;
     uint32_t       height_ = 0;
+    // Consecutive fence waits that timed out (beginFrame): one stall is a
+    // skipped frame, kMaxFenceTimeouts in a row a lost device.
+    int            fenceTimeouts_ = 0;
+    static constexpr int kMaxFenceTimeouts = 5;
 
     std::vector<VkImage> swapImages_;
 
@@ -232,11 +298,24 @@ private:
     // the render worker (at most two per distinct live set a frame passes
     // through). Keyed clear << 16 | live.
     std::vector<std::pair<uint32_t, VkRenderPass>> sceneRPVariants_;
-    // Target passes, made on first use by the render worker: render passes keyed by their
-    // slots and clears (they outlive resizes), framebuffers by their slots (remade with the
-    // target images).
-    std::vector<std::pair<std::pair<TargetSlots, TargetMask>, VkRenderPass>> targetPasses_;
-    std::vector<std::pair<TargetSlots, VkFramebuffer>>                       targetFramebuffers_;
+    // Passes of their own, made on first use by the render worker: render passes keyed by
+    // their slots and clears (with the main colour or not), and the effect pass of each
+    // target format (they outlive resizes); framebuffers, scratches and samplers (remade
+    // with the target images).
+    std::vector<std::pair<std::pair<TargetSlots, TargetMask>, VkRenderPass>> targetPasses_, mainPasses_;
+    std::vector<std::pair<PixelFormat, VkRenderPass>>                        effectPasses_;
+    struct FramebufferKey
+    {
+        int frameSlot, half; TargetSlots slots; TargetMask scratch;
+        bool operator== (const FramebufferKey& o) const
+        {
+            return frameSlot == o.frameSlot && half == o.half && slots == o.slots && scratch == o.scratch;
+        }
+    };
+    std::vector<std::pair<FramebufferKey, VkFramebuffer>>                    shaderFramebuffers_;
+    std::vector<std::pair<std::pair<size_t, bool>, VkFramebuffer>>          effectFramebuffers_;
+    std::vector<Image>                                                       scratches_;     // by target, made on first use
+    std::vector<VkDescriptorSet>                                             samplers_[2];   // by target: [0] its own, [1] its scratch's
 
     static constexpr int MAX_FRAMES = 2;
     SceneBuffers sceneBuffers_[MAX_FRAMES];

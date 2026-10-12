@@ -82,11 +82,17 @@ public:
     //
     // A target the frame doesn't have (one that was never declared, or
     // was dropped) records NO draws until the target changes, so they never
-    // land in the main colour by mistake. Effects (blur, saturate, darken,
-    // noise) work on the main colour only and are skipped while a target is
-    // the target. jvk::Shader draws write the locations their shader declares,
-    // whatever the target. Returns false if `name` isn't a target here, or is
-    // a scaled one (Target::scale: only shaders write those).
+    // land in the main colour by mistake. Effects that run as passes (blur,
+    // the blurred shapes and paths, saturate and every hsv transform) work on
+    // whatever the target is, a scaled one included, in its own pixels and
+    // within the clip's bounds (a target has no stencil); noise and the blend
+    // modes work on the main colour only. An hsv transform expects a DISPLAY
+    // colour (0..1, sRGB-encoded: it decodes, clamps lightness and re-encodes),
+    // so on a linear HDR target it crushes and double-encodes; blur on any
+    // format. A SCALED target (Target::scale) takes no ordinary draws: it
+    // isn't attached to the scene pass. jvk::Shader draws write the locations
+    // their shader declares, whatever the target.
+    // Returns false if `name` isn't a target here.
     static inline const juce::Identifier mainTarget { "main" };
 
     bool setTarget(const juce::Identifier& name)
@@ -97,8 +103,7 @@ public:
         } else {
             const auto& rt = renderer_.target();
             const int i = rt.targetIndex(name);
-            s.target = i < 0 || rt.targets()[static_cast<size_t>(i)].isScaled() ? Renderer::kNoTarget
-                                                                                 : static_cast<uint8_t>(i + 1);
+            s.target = i < 0 ? Renderer::kNoTarget : static_cast<uint8_t>(i + 1);
         }
         s.targetName = name;
         syncTarget();
@@ -133,12 +138,33 @@ public:
         s.inverseValid = false;
     }
 
-    float getPhysicalPixelScaleFactor() const override { return displayScale_; }
+    // Logical to physical, the transform included (juce: the root of the
+    // transform's determinant): what sizes a buffered or effect-filtered
+    // component's image, so one under Component::setTransform(scale) renders
+    // at its drawn size rather than at 1x upscaled.
+    float getPhysicalPixelScaleFactor() const override
+    {
+        return displayScale_ * std::sqrt(std::abs(state().transform.getDeterminant()));
+    }
+
+    // A transform that rotates or shears (juce's TranslationOrTransform::isRotated):
+    // rectangles through it are no longer axis-aligned, so juce takes them as paths.
+    static bool isRotated(const juce::AffineTransform& t)
+    {
+        return t.mat01 != 0.0f || t.mat10 != 0.0f;
+    }
 
     bool clipToRectangle(const juce::Rectangle<int>& r) override
     {
         materializeMask();
         auto& s = state();
+        if (isRotated(s.transform)) {
+            // As juce: a rotated rectangle clips as a path, not as its bounding box.
+            juce::Path p;
+            p.addRectangle(r.toFloat());
+            clipToPath(p, {});
+            return !state().clipBounds.isEmpty();
+        }
         auto tf = r.toFloat().transformedBy(s.transform);
         // Scale logical→pixel for the Vulkan scissor. floor/ceil (outward),
         // NOT truncation: at fractional DPI (125%/150% Windows) truncating
@@ -159,7 +185,13 @@ public:
 
     bool clipToRectangleList(const juce::RectangleList<int>& list) override
     {
-        return clipToRectangle(list.getBounds());
+        if (list.getNumRectangles() <= 1)
+            return clipToRectangle(list.getBounds());
+        // The exact union, as juce (a TabbedComponent's outline is the content
+        // minus its page): the rectangles as one path into the stencil. The
+        // bounding box let the whole content area paint.
+        clipToPath(list.toPath(), {});
+        return !state().clipBounds.isEmpty();
     }
 
     // Excluded rects are stencil-PARKED: their drawable pixels (== current
@@ -176,6 +208,16 @@ public:
         auto& s = state();
         if (isClipEmpty()) return;
         materializeMask();
+        if (isRotated(s.transform)) {
+            // As juce: the clip's bounds minus the rotated rectangle, as an
+            // even-odd path clip (it unwinds with the state like the park would).
+            juce::Path p;
+            p.addRectangle(r.toFloat());
+            p.addRectangle(getClipBounds().toFloat());
+            p.setUsingNonZeroWinding(false);
+            clipToPath(p, {});
+            return;
+        }
         auto phys = r.toFloat().transformedBy(s.transform.scaled(displayScale_));
         auto clip = s.clipBounds.getIntersection(phys.getSmallestIntegerContainer());
         if (clip.isEmpty()) return;      // outside the clip — nothing to exclude
@@ -478,6 +520,15 @@ public:
             fillWithTiledImage(r);
             return;
         }
+        if (isRotated(s.transform))
+        {
+            // As juce (fillRectAsPath): a rotated rectangle is a path, with a
+            // path's anti-aliased edges, not a quad with jagged ones.
+            juce::Path p;
+            p.addRectangle(r);
+            fillPath(p, {});
+            return;
+        }
         auto fi = renderer_.captureFill(s.fill);
         // Stage gradient LUT upload if this is a gradient fill
         if (s.fill.isGradient() && s.fill.gradient)
@@ -491,10 +542,12 @@ public:
         if (isClipEmpty() || list.isEmpty()) return;
         if (list.getNumRectangles() == 1) { fillRect(*list.begin()); return; }
 
+        auto& s = state();
+        if (isRotated(s.transform)) { fillPath(list.toPath(), {}); return; }   // as fillRect
+
         // ONE command + one arena span for the whole list. The old loop
         // exploded an N-rect list (common from JUCE text/clip internals)
         // into N commands + N FillType captures + N draw calls.
-        auto& s = state();
         auto fi = renderer_.captureFill(s.fill);
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
@@ -797,9 +850,10 @@ public:
         if (s.fill.isGradient() && s.fill.gradient != nullptr)
         {
             // Gradient through the mask: replay rebuilds the gradient ctx
-            // (sampleColor shades the quad, the mask alpha gates it).
+            // (sampleColor shades the quad, the mask alpha gates it). The
+            // fill's opacity (FillType::setOpacity) rides the colour's alpha.
             renderer_.registerGradient(*s.fill.gradient);
-            p.tint              = { 1.0f, 1.0f, 1.0f, s.opacity };
+            p.tint              = { 1.0f, 1.0f, 1.0f, s.fill.colour.getFloatAlpha() * s.opacity };
             p.alphaMaskFill     = 2;
             p.fillIndex         = renderer_.captureFill(s.fill);
             p.gradientTransform = s.transform;
@@ -963,6 +1017,13 @@ public:
         renderer_.arena_pushSpan(std::span<const juce::Point<float>>(positions.data(), positions.size()));
     }
 
+    // A corner no bigger than half a side, as juce's Path::addRoundedRectangle
+    // clamps it: a thin bar at a large radius is a pill, not a pinched one.
+    static float clampedCorner(const juce::Rectangle<float>& r, float cornerSize)
+    {
+        return juce::jmax(0.0f, juce::jmin(cornerSize, r.getWidth() * 0.5f, r.getHeight() * 0.5f));
+    }
+
     void fillRoundedRectangle(const juce::Rectangle<float>& r, float cornerSize) override
     {
         if (isClipEmpty()) return;
@@ -971,7 +1032,7 @@ public:
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
         record(DrawOp::FillRoundedRect, s.clipBounds,
-            FillRoundedRectParams { r, cornerSize, fi, s.transform, s.opacity, displayScale_ });
+            FillRoundedRectParams { r, clampedCorner(r, cornerSize), fi, s.transform, s.opacity, displayScale_ });
     }
 
     void fillEllipse(const juce::Rectangle<float>& area) override
@@ -994,15 +1055,13 @@ public:
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
         record(DrawOp::StrokeRoundedRect, s.clipBounds,
-            StrokeRoundedRectParams { rect, cornerSize, lineThickness, fi, s.transform,
+            StrokeRoundedRectParams { rect, clampedCorner(rect, cornerSize), lineThickness, fi, s.transform,
                                       s.opacity, displayScale_ });
     }
 
-    // Outline rectangle — stroked rounded rect with cornerSize = 0
-    void drawRect(const juce::Rectangle<float>& rect, float lineThickness) override
-    {
-        drawRoundedRectangle(rect, 0.0f, lineThickness);
-    }
+    // drawRect is NOT overridden: juce's default fills four rectangles INSIDE
+    // the bounds (fillRectList). The stroke centred on the edge it used to be
+    // drew every 1 px component border half outside its clip, at half alpha.
 
     void drawEllipse(const juce::Rectangle<float>& area, float lineThickness) override
     {
@@ -1033,38 +1092,50 @@ public:
     uint64_t getFrameId() const override { return frameId_; }
 
     // ===== GPU Effects =====
+    //
+    // An effect's region in PHYSICAL pixels: the clip's bounds (already
+    // physical) when none is given, else the caller's rect in its own logical
+    // space through the transform and the display scale. Recorded with scale
+    // 1, so the pipeline scales nothing again: the blend effects used to
+    // record the physical clip bounds WITH the display scale, which drew
+    // them at twice their place and size at 2x — the top-left of any
+    // component not at the origin stayed untouched — and ignored
+    // setOrigin/addTransform on explicit regions.
+    juce::Rectangle<float> physicalRegion(juce::Rectangle<float> region) const
+    {
+        auto& s = state();
+        return region.isEmpty() ? s.clipBounds.toFloat()
+                                : region.transformedBy(s.transform.scaled(displayScale_));
+    }
+
     void darken(float amount, juce::Rectangle<float> region = {})
     {
-        if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
         float v = 1.0f - amount;
         record(DrawOp::EffectBlend, s.clipBounds,
-            EffectBlendParams { v, v, v, region, displayScale_ });
+            EffectBlendParams { v, v, v, physicalRegion(region), 1.0f });
     }
 
     void brighten(float amount, juce::Rectangle<float> region = {})
     {
-        if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
         float v = 1.0f + amount;
         record(DrawOp::EffectBlend, s.clipBounds,
-            EffectBlendParams { v, v, v, region, displayScale_ });
+            EffectBlendParams { v, v, v, physicalRegion(region), 1.0f });
     }
 
     void tint(juce::Colour c, juce::Rectangle<float> region = {})
     {
-        if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
         record(DrawOp::EffectBlend, s.clipBounds,
-            EffectBlendParams { c.getFloatRed(), c.getFloatGreen(), c.getFloatBlue(), region, displayScale_ });
+            EffectBlendParams { c.getFloatRed(), c.getFloatGreen(), c.getFloatBlue(), physicalRegion(region), 1.0f });
     }
 
     void warmth(float amount, juce::Rectangle<float> region = {})
     {
-        if (region.isEmpty()) region = state().clipBounds.toFloat();
         auto& s = state();
         record(DrawOp::EffectBlend, s.clipBounds,
-            EffectBlendParams { 1.0f + amount * 0.2f, 1.0f, 1.0f - amount * 0.1f, region, displayScale_ });
+            EffectBlendParams { 1.0f + amount * 0.2f, 1.0f, 1.0f - amount * 0.1f, physicalRegion(region), 1.0f });
     }
 
     // Procedural white-noise overlay — GPU, pixel-perfect (a per-pixel hash of
@@ -1089,19 +1160,16 @@ public:
             NoiseParams { amount, timeOffset, physRegion, 1.0f });
     }
 
+    // `radius` is in the caller's LOGICAL pixels, like every other distance
+    // here (the blurred shapes fold the same factor into their step): it
+    // reaches the shader in physical pixels, so a blur reads the same at 1x
+    // and 2x. The replay-side ROI walk scissors every pass of the blur chain
+    // to the region (padded per pass by the kernel's read margin).
     void blur(float radius, juce::Rectangle<float> region = {})
     {
         auto& s = state();
-        // Default region = current clip bounds (already physical). An
-        // explicit region is in the caller's LOGICAL space — resolve to
-        // physical (transform + displayScale), same convention as drawNoise.
-        // The replay-side ROI walk scissors every pass of the blur chain to
-        // this rect (padded per pass by the kernel's read margin).
-        const juce::Rectangle<float> physRegion = region.isEmpty()
-            ? s.clipBounds.toFloat()
-            : region.transformedBy(s.transform.scaled(displayScale_));
         record(DrawOp::EffectKernel, s.clipBounds,
-            BlurParams { radius, physRegion, displayScale_ });
+            BlurParams { radius * s.transform.getScaleFactor() * displayScale_, physicalRegion(region), 1.0f });
     }
 
     // =========================================================================

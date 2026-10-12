@@ -59,6 +59,8 @@ public:
               StencilMode mode = StencilMode::Inside)
     {
         device_ = &device;
+        vertSpv_ = vertSpv;
+        fragSpv_ = fragSpv;
         stencilMode_ = mode;
         VkDevice d = device.device();
 
@@ -78,19 +80,106 @@ public:
         pli.pushConstantRangeCount = 1;
         pli.pPushConstantRanges = &pcRange;
         vkCreatePipelineLayout(d, &pli, nullptr, &layout_);
+        pipelines_.push_back({ compatibleRenderPass, build(compatibleRenderPass) });
+    }
 
+    // Its pipeline for `renderPass`, built the first time it draws in that pass shape:
+    // the main colour's effect pass, a target's (Renderer). Render worker only.
+    VkPipeline pipelineFor(VkRenderPass renderPass)
+    {
+        for (auto& [rp, p] : pipelines_)
+            if (rp == renderPass) return p;
+        pipelines_.push_back({ renderPass, build(renderPass) });
+        return pipelines_.back().second;
+    }
+
+    // Record one effect pass. Begins + ends its own render pass. The caller
+    // is responsible for pre-copying the source into `dstFramebuffer`'s
+    // color image before a clipped pass (so outside-clip pixels retain the
+    // source contents once the stencil test discards them).
+    //
+    // `stencilRef` selects which clip depth this pass writes at. Pass 0
+    // for unclipped effects (stencil buffer starts at 0 everywhere and the
+    // pre-copy step is skipped anyway).
+    // `scissor` (optional) confines the pass to a sub-rect — the ROI walk in
+    // Renderer::execute computes it per pass from the effect's region + each
+    // pass's kernel read margin. Null = full extent (legacy behavior). The
+    // render area shrinks with it: pixels outside the render area are
+    // untouched by LOAD/STORE, which on tile GPUs skips their tiles
+    // entirely. The viewport stays full-extent so gl_FragCoord remains
+    // screen-space.
+    void applyPass(VkCommandBuffer cmd,
+                   VkDescriptorSet srcDesc,
+                   VkFramebuffer   dstFramebuffer,
+                   VkRenderPass    dstRenderPass,
+                   VkExtent2D      extent,
+                   float           dirX, float dirY,
+                   float           radius,
+                   uint32_t        stencilRef = 0,
+                   const VkRect2D* scissor = nullptr)
+    {
+        const VkPipeline pipeline = pipelineFor(dstRenderPass);
+        if (pipeline == VK_NULL_HANDLE) return;
+        // Every pass this draws in loads what its attachments hold (the main
+        // colour's effect pass: colour + depth/stencil; a target's: its colour
+        // alone), so no clear values are needed at begin time.
+        VkRect2D sc = scissor ? *scissor : VkRect2D { {0, 0}, extent };
+        if (sc.extent.width == 0 || sc.extent.height == 0) return;
+
+        VkRenderPassBeginInfo rpbi {};
+        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        rpbi.renderPass = dstRenderPass;
+        rpbi.framebuffer = dstFramebuffer;
+        rpbi.renderArea = sc;
+        rpbi.clearValueCount = 0;
+        rpbi.pClearValues = nullptr;
+        vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+
+        VkViewport vp {};
+        vp.width  = static_cast<float>(extent.width);
+        vp.height = static_cast<float>(extent.height);
+        vp.maxDepth = 1.0f;
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            layout_, 0, 1, &srcDesc, 0, nullptr);
+        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilRef);
+
+        PushConstants pc {
+            static_cast<float>(extent.width),
+            static_cast<float>(extent.height),
+            dirX, dirY, radius, 0.0f
+        };
+        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
+            0, sizeof(pc), &pc);
+
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(cmd);
+    }
+
+    bool ready() const { return ! pipelines_.empty() && pipelines_.front().second != VK_NULL_HANDLE; }
+
+private:
+    // Its pipeline for `compatibleRenderPass` (pipelineFor): the same shaders, layout and
+    // state, for that pass's attachments.
+    VkPipeline build(VkRenderPass compatibleRenderPass) const
+    {
+        VkDevice d = device_->device();
         // ---- Shader modules
         VkShaderModuleCreateInfo vci {};
         vci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        vci.codeSize = vertSpv.size() * 4;
-        vci.pCode = vertSpv.data();
+        vci.codeSize = vertSpv_.size() * 4;
+        vci.pCode = vertSpv_.data();
         VkShaderModule vertMod;
         vkCreateShaderModule(d, &vci, nullptr, &vertMod);
 
         VkShaderModuleCreateInfo fci {};
         fci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-        fci.codeSize = fragSpv.size() * 4;
-        fci.pCode = fragSpv.data();
+        fci.codeSize = fragSpv_.size() * 4;
+        fci.pCode = fragSpv_.data();
         VkShaderModule fragMod;
         vkCreateShaderModule(d, &fci, nullptr, &fragMod);
 
@@ -137,7 +226,7 @@ public:
         so.failOp      = VK_STENCIL_OP_KEEP;
         so.passOp      = VK_STENCIL_OP_KEEP;
         so.depthFailOp = VK_STENCIL_OP_KEEP;
-        so.compareOp   = (mode == StencilMode::Inside)
+        so.compareOp   = (stencilMode_ == StencilMode::Inside)
                             ? VK_COMPARE_OP_EQUAL
                             : VK_COMPARE_OP_NOT_EQUAL;
         so.compareMask = 0xFF;
@@ -181,93 +270,29 @@ public:
         pci.layout = layout_;
         pci.renderPass = compatibleRenderPass;
 
-        vkCreateGraphicsPipelines(d, device_->pipelineCache(), 1, &pci, nullptr, &pipeline_);
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        vkCreateGraphicsPipelines(d, device_->pipelineCache(), 1, &pci, nullptr, &pipeline);
 
         vkDestroyShaderModule(d, vertMod, nullptr);
         vkDestroyShaderModule(d, fragMod, nullptr);
+        return pipeline;
     }
 
-    // Record one effect pass. Begins + ends its own render pass. The caller
-    // is responsible for pre-copying the source into `dstFramebuffer`'s
-    // color image before a clipped pass (so outside-clip pixels retain the
-    // source contents once the stencil test discards them).
-    //
-    // `stencilRef` selects which clip depth this pass writes at. Pass 0
-    // for unclipped effects (stencil buffer starts at 0 everywhere and the
-    // pre-copy step is skipped anyway).
-    // `scissor` (optional) confines the pass to a sub-rect — the ROI walk in
-    // Renderer::execute computes it per pass from the effect's region + each
-    // pass's kernel read margin. Null = full extent (legacy behavior). The
-    // render area shrinks with it: pixels outside the render area are
-    // untouched by LOAD/STORE, which on tile GPUs skips their tiles
-    // entirely. The viewport stays full-extent so gl_FragCoord remains
-    // screen-space.
-    void applyPass(VkCommandBuffer cmd,
-                   VkDescriptorSet srcDesc,
-                   VkFramebuffer   dstFramebuffer,
-                   VkRenderPass    dstRenderPass,
-                   VkExtent2D      extent,
-                   float           dirX, float dirY,
-                   float           radius,
-                   uint32_t        stencilRef = 0,
-                   const VkRect2D* scissor = nullptr)
-    {
-        // The effect RP has two attachments (color + depth/stencil), but
-        // both have LOAD_OP_LOAD / LOAD_OP_DONT_CARE on the relevant aspects,
-        // so no clear values are required at begin time.
-        VkRect2D sc = scissor ? *scissor : VkRect2D { {0, 0}, extent };
-        if (sc.extent.width == 0 || sc.extent.height == 0) return;
-
-        VkRenderPassBeginInfo rpbi {};
-        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rpbi.renderPass = dstRenderPass;
-        rpbi.framebuffer = dstFramebuffer;
-        rpbi.renderArea = sc;
-        rpbi.clearValueCount = 0;
-        rpbi.pClearValues = nullptr;
-        vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-
-        VkViewport vp {};
-        vp.width  = static_cast<float>(extent.width);
-        vp.height = static_cast<float>(extent.height);
-        vp.maxDepth = 1.0f;
-        vkCmdSetViewport(cmd, 0, 1, &vp);
-
-        vkCmdSetScissor(cmd, 0, 1, &sc);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            layout_, 0, 1, &srcDesc, 0, nullptr);
-        vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, stencilRef);
-
-        PushConstants pc {
-            static_cast<float>(extent.width),
-            static_cast<float>(extent.height),
-            dirX, dirY, radius, 0.0f
-        };
-        vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(pc), &pc);
-
-        vkCmdDraw(cmd, 3, 1, 0, 0);
-        vkCmdEndRenderPass(cmd);
-    }
-
-    bool ready() const { return pipeline_ != VK_NULL_HANDLE; }
-
-private:
     void destroy()
     {
         if (!device_) return;
         VkDevice d = device_->device();
-        if (pipeline_ != VK_NULL_HANDLE) vkDestroyPipeline(d, pipeline_, nullptr);
+        for (auto& [rp, p] : pipelines_)
+            if (p != VK_NULL_HANDLE) vkDestroyPipeline(d, p, nullptr);
+        pipelines_.clear();
         if (layout_   != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, layout_, nullptr);
-        pipeline_ = VK_NULL_HANDLE;
         layout_   = VK_NULL_HANDLE;
     }
 
     Device*          device_      = nullptr;
     VkPipelineLayout layout_      = VK_NULL_HANDLE;
-    VkPipeline       pipeline_    = VK_NULL_HANDLE;
+    std::span<const uint32_t> vertSpv_, fragSpv_;                 // its shaders (static SPIR-V): every variant is built from them
+    std::vector<std::pair<VkRenderPass, VkPipeline>> pipelines_;   // one per render pass it draws in (pipelineFor)
     StencilMode      stencilMode_ = StencilMode::Inside;
 };
 

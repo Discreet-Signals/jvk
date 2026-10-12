@@ -236,6 +236,7 @@ public:
                   float tileSize)
     {
         if (!ready() || vertexCount == 0) return;
+        if (storageBuffer_[currentFrameSlot_] == VK_NULL_HANDLE) return;   // no segments on the GPU this slot
 
         // Inside a stencil clip (clipToPath / rrect), bind the variant that
         // tests it. Keyed off State's depth, not the command's: State is what
@@ -323,7 +324,8 @@ private:
     // flushToGPU happens, by which time its fence has been waited on).
     void growStorageBuffer(int frameSlot, size_t neededBytes)
     {
-        VkDeviceSize newCap = bufferCapacity_[frameSlot];
+        // From the initial size when the slot has none (its allocation failed).
+        VkDeviceSize newCap = std::max(bufferCapacity_[frameSlot], INITIAL_BUFFER_BYTES);
         while (static_cast<size_t>(newCap) < neededBytes) newCap *= 2;
 
         VkDevice d = device_->device();
@@ -346,12 +348,26 @@ private:
     {
         VkDevice d = device_->device();
 
+        // Every step checked: a slot whose allocation fails has no buffer,
+        // no mapping and no capacity, so flushToGPU writes nothing, dispatch
+        // draws nothing and the next grow starts over (a null buffer/memory
+        // bound or mapped here was UB).
+        auto fail = [&] {
+            if (mappedPtrs_[frameSlot] != nullptr)             vkUnmapMemory(d, storageMemory_[frameSlot]);
+            if (storageBuffer_[frameSlot] != VK_NULL_HANDLE)   vkDestroyBuffer(d, storageBuffer_[frameSlot], nullptr);
+            if (storageMemory_[frameSlot] != VK_NULL_HANDLE)   vkFreeMemory(d, storageMemory_[frameSlot], nullptr);
+            storageBuffer_[frameSlot]  = VK_NULL_HANDLE;
+            storageMemory_[frameSlot]  = VK_NULL_HANDLE;
+            mappedPtrs_[frameSlot]     = nullptr;
+            bufferCapacity_[frameSlot] = 0;
+        };
         VkBufferCreateInfo bci {};
         bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bci.size = capacityBytes;
         bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        vkCreateBuffer(d, &bci, nullptr, &storageBuffer_[frameSlot]);
+        if (vkCreateBuffer(d, &bci, nullptr, &storageBuffer_[frameSlot]) != VK_SUCCESS)
+            { storageBuffer_[frameSlot] = VK_NULL_HANDLE; fail(); return; }
 
         VkMemoryRequirements mr;
         vkGetBufferMemoryRequirements(d, storageBuffer_[frameSlot], &mr);
@@ -364,15 +380,19 @@ private:
         mi.memoryTypeIndex = Memory::findMemoryType(device_->physicalDevice(),
             mr.memoryTypeBits,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        vkAllocateMemory(d, &mi, nullptr, &storageMemory_[frameSlot]);
-        vkBindBufferMemory(d, storageBuffer_[frameSlot], storageMemory_[frameSlot], 0);
-        vkMapMemory(d, storageMemory_[frameSlot], 0, VK_WHOLE_SIZE, 0,
-                    &mappedPtrs_[frameSlot]);
+        if (mi.memoryTypeIndex == Memory::kNoMemoryType
+            || vkAllocateMemory(d, &mi, nullptr, &storageMemory_[frameSlot]) != VK_SUCCESS)
+            { storageMemory_[frameSlot] = VK_NULL_HANDLE; fail(); return; }
+        if (vkBindBufferMemory(d, storageBuffer_[frameSlot], storageMemory_[frameSlot], 0) != VK_SUCCESS
+            || vkMapMemory(d, storageMemory_[frameSlot], 0, VK_WHOLE_SIZE, 0, &mappedPtrs_[frameSlot]) != VK_SUCCESS)
+            { mappedPtrs_[frameSlot] = nullptr; fail(); return; }
         bufferCapacity_[frameSlot] = capacityBytes;
     }
 
     void writeDescriptor(int frameSlot)
     {
+        if (storageBuffer_[frameSlot] == VK_NULL_HANDLE || ssboDescSets_[frameSlot] == VK_NULL_HANDLE)
+            return;   // the slot has no buffer (allocateBuffer failed): nothing to point at
         VkDevice d = device_->device();
 
         // (Re)wire the slot's storage buffer into its own descriptor set.

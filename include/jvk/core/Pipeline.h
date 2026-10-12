@@ -104,6 +104,7 @@ private:
     std::vector<uint32_t> vertSpirv_;
     std::vector<uint32_t> fragSpirv_;
     bool built_ = false;
+    bool buildFailed_ = false;   // build() tried and failed: never retried
     bool hasClip_ = false;
 
     VkPipeline variant(uint8_t attachment, bool clip, TargetMask live);

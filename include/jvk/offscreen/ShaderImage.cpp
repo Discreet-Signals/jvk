@@ -386,7 +386,11 @@ void ShaderImage::loadTexture(int binding, const juce::Image& image)
         return;
     }
 
-    vkDeviceWaitIdle(dev);
+    {
+        // Device-idle is queue use: serialize against every editor's worker mid-submit.
+        const juce::ScopedLock queueSync(Renderer::queueLock());
+        vkDeviceWaitIdle(dev);
+    }
 
     if (slot->sampler) { vkDestroySampler(dev, slot->sampler, nullptr); slot->sampler = VK_NULL_HANDLE; }
     if (slot->view)    { vkDestroyImageView(dev, slot->view, nullptr); slot->view = VK_NULL_HANDLE; }

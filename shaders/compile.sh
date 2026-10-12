@@ -78,7 +78,8 @@ namespace jvk::shaders::ui2d
 for spv_file, var_name in shaders:
     size, array_data = spv_to_c_array(spv_file)
     out += f'static inline const int {var_name}Size = {size};\n'
-    out += f'static inline const unsigned char __{var_name}[] = {{\n{array_data}\n}};\n'
+    # alignas(4): the words are handed to vkCreateShaderModule as uint32_t.
+    out += f'alignas(4) static inline const unsigned char __{var_name}[] = {{\n{array_data}\n}};\n'
     out += f'static inline const char* {var_name} = reinterpret_cast<const char*>(__{var_name});\n\n'
 
 out += '} // jvk::shaders::ui2d\n'

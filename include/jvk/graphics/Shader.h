@@ -240,21 +240,28 @@ public:
     // How many descriptor sets its layout has (ShaderPipeline::bindSets).
     uint32_t descriptorSetCount() const { return setCount_; }
 
-    // ===== Reading targets ===================================================
+    // ===== Reading and writing anything ======================================
     //
     // A shader reads a target by declaring a sampler2D with the target's name
-    // (`layout(binding = n) uniform sampler2D normal;`). Drawn inline with
-    // Graphics::drawShader, such a shader runs as ITS OWN PASS at that point
-    // in paint order: it sees everything drawn into the targets before it,
-    // and writes the main colour only (location 0, blended Over; the clip
-    // still applies). jvk binds the targets when the draw is recorded and
-    // rebinds them when the window resizes; nothing to set by hand.
-    // A shader reads THE SCENE, the main colour as painted so far, by declaring
-    // `layout(set = 1, binding = 0) uniform sampler2D scene;`. It then runs as
-    // its own pass too and REPLACES the main colour inside its region with
-    // what it outputs: it has the scene to blend with itself, so a scene
-    // reader that changes nothing outputs texture(scene, ...) (a lighting
-    // pass, a colour grade, a distortion). The clip still applies.
+    // (`layout(binding = n) uniform sampler2D normal;`), THE SCENE (the main
+    // colour as painted so far) by declaring
+    // `layout(set = 1, binding = 0) uniform sampler2D scene;`, and writes the
+    // main colour at location 0 and targets at theirs (or, for a scaled
+    // target, at an output named after it). Any reads with any writes of one
+    // size; jvk works out the passes (Renderer::execute, the render graph):
+    //   - INSIDE THE SCENE PASS when everything it writes is attached there
+    //     (the main colour, targets at scale 1) and nothing it reads is
+    //     (scaled targets it may read): the cheapest, no pass boundary;
+    //   - else as ITS OWN PASS at that point in paint order, attached to
+    //     exactly what it writes, seeing everything drawn before it. Writing
+    //     the main colour, the clip still applies; a scene reader REPLACES the
+    //     main colour inside its region with what it outputs (it has the scene
+    //     to blend with itself: a lighting pass, a grade, a distortion), any
+    //     other blends Over. A target it both reads and writes is versioned:
+    //     it draws into the target's scratch while sampling the target, and
+    //     the result is copied back over its region.
+    // jvk binds the targets when the draw is recorded and rebinds them when
+    // the window resizes; nothing to set by hand.
     bool readsScene() const { return readsScene_; }
 
     // The targets of `rt` this shader samples, by sampler name (bit i =
@@ -275,6 +282,12 @@ public:
 
     // Whether it writes the main colour: location 0, or no declared output.
     bool writesMain() const { return writesLocation(0) || outputLocations_.empty(); }
+
+    // Whether an output is named after a target the frame declared but DROPPED
+    // (RenderTarget::droppedTargets): such a draw is invalid and draws nothing.
+    // Falling back to the location would land it in another target — a blur
+    // meant for a 64-row composite smeared into the emission target.
+    bool writesDroppedTarget() const { return writesDropped_; }
 
     // Message thread, while recording (the render worker is idle): points each
     // sampler named after a target at that target's current image whenever
@@ -311,7 +324,13 @@ public:
     void ensureCreated(Device& device, VkRenderPass renderPass, VkSampleCountFlagBits msaa,
                        const std::vector<Target>& targets = {}, TargetSlots slots = 0)
     {
-        if (created_) return;
+        if (created_ || failed_) return;
+        // A build that fails is never retried: retried on every dispatch, it
+        // registered another layout, allocated more descriptor sets and a fresh
+        // uniform buffer with its own vkAllocateMemory per draw per frame, and
+        // ~Shader freed only the last of each. The handles of the one attempt
+        // stay for the destructor.
+        failed_ = true;   // cleared at the end, once everything is made
         device_ = &device;
         VkDevice d = device.device();
 
@@ -374,7 +393,8 @@ public:
                 bci.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
                           | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
                 bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-                vkCreateBuffer(d, &bci, nullptr, &uniformBuffer_);
+                if (vkCreateBuffer(d, &bci, nullptr, &uniformBuffer_) != VK_SUCCESS)
+                    { uniformBuffer_ = VK_NULL_HANDLE; return; }
 
                 VkMemoryRequirements req;
                 vkGetBufferMemoryRequirements(d, uniformBuffer_, &req);
@@ -385,9 +405,13 @@ public:
                     req.memoryTypeBits,
                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                   | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                vkAllocateMemory(d, &ai, nullptr, &uniformMemory_);
-                vkBindBufferMemory(d, uniformBuffer_, uniformMemory_, 0);
-                vkMapMemory(d, uniformMemory_, 0, bufferSize, 0, &uniformMapped_);
+                if (ai.memoryTypeIndex == Memory::kNoMemoryType
+                    || vkAllocateMemory(d, &ai, nullptr, &uniformMemory_) != VK_SUCCESS)
+                    { uniformMemory_ = VK_NULL_HANDLE; return; }
+                if (vkBindBufferMemory(d, uniformBuffer_, uniformMemory_, 0) != VK_SUCCESS)
+                    return;
+                if (vkMapMemory(d, uniformMemory_, 0, bufferSize, 0, &uniformMapped_) != VK_SUCCESS)
+                    { uniformMapped_ = nullptr; return; }
 
                 // Initial copy so any set() calls made before ensureCreated
                 // are visible on the GPU's first read, whichever slot it is.
@@ -614,6 +638,7 @@ public:
         // reported isReady() and dispatch bound VK_NULL_HANDLE.
         created_ = (layout_ != VK_NULL_HANDLE && pipeline_ != VK_NULL_HANDLE
                     && clipPipeline_ != VK_NULL_HANDLE);
+        failed_  = !created_;
     }
 
     bool isReady() const { return created_; }
@@ -849,9 +874,13 @@ private:
                     readMask_ |= static_cast<TargetMask>(1u << i);
         }
         slots_ = 0;
+        writesDropped_ = false;
         for (size_t k = 0; k < outputLocations_.size(); ++k) {
             const uint32_t l = outputLocations_[k];
             if (l < 1 || l > 7) continue;
+            for (const auto& dropped : rt.droppedTargets())
+                if (outputNames_[k].isNotEmpty() && dropped.toString() == outputNames_[k])
+                    writesDropped_ = true;
             int t = -1;
             for (size_t i = 0; i < targets.size() && outputNames_[k].isNotEmpty(); ++i)
                 if (targets[i].isScaled() && targets[i].name.toString() == outputNames_[k]) t = static_cast<int>(i);
@@ -905,6 +934,7 @@ private:
     uint64_t                  readMaskGeneration_ = ~uint64_t(0);   // resolveTargets: the targets readMask_ and slots_ are for
     TargetMask                readMask_ = 0;
     TargetSlots               slots_ = 0;
+    bool                      writesDropped_ = false;         // resolveTargets: an output named after a dropped target
     bool                      readsScene_ = false;            // set 1, binding 0: the scene (readsScene)
 
     Device*          device_        = nullptr;
@@ -929,6 +959,7 @@ private:
     VkDeviceSize   slotStride_    = 0;
 
     bool   created_   = false;
+    bool   failed_    = false;   // ensureCreated tried and failed: never retried
 };
 
 inline void Graphics::prepareShaderDraw(Shader& shader, DrawShaderParams& params)
@@ -938,15 +969,17 @@ inline void Graphics::prepareShaderDraw(Shader& shader, DrawShaderParams& params
     params.targetSlots    = shader.targetSlots(rt);
     params.targetsWritten = slotTargets(params.targetSlots);
     params.writesMain     = shader.writesMain();
-    const TargetMask scaled = rt.scaledTargets();
-    params.targetPass     = !params.writesMain && params.targetsWritten != 0
-                         && (params.targetsRead != 0 || (params.targetsWritten & scaled) != 0);
-    // A pass's attachments are one size, and only a pass writes a scaled target: a shader
-    // writing the main colour and a scaled target, or targets of two sizes, draws nothing.
-    bool valid = !(params.writesMain && (params.targetsWritten & scaled) != 0);
+    const TargetMask scaled = rt.scaledTargets(), full = static_cast<TargetMask>(~scaled);
+    params.inScene        = !shader.readsScene() && (params.targetsRead & full) == 0
+                         && (params.targetsWritten & scaled) == 0;
+    // A pass's attachments are one size: a shader writing the main colour or a target at
+    // scale 1 together with a scaled target, or scaled targets of two sizes, draws nothing.
+    // So does one writing an output named after a target the frame dropped.
+    const bool fullSize = params.writesMain || (params.targetsWritten & full) != 0;
+    bool valid = !(fullSize && (params.targetsWritten & scaled) != 0) && !shader.writesDroppedTarget();
     const Target* passSize = nullptr;
-    for (size_t i = 0; params.targetPass && i < rt.targets().size(); ++i)
-        if ((params.targetsWritten & (1u << i)) != 0) {
+    for (size_t i = 0; i < rt.targets().size(); ++i)
+        if ((params.targetsWritten & scaled & (1u << i)) != 0) {
             valid = valid && (passSize == nullptr || rt.targets()[i].sameSize(*passSize));
             passSize = &rt.targets()[i];
         }

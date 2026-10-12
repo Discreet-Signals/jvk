@@ -144,9 +144,10 @@ struct Target
 
     // Its size relative to the frame's, per side (ceil(frame x scale)). At 1 it is an
     // attachment of the scene passes, as above. A SCALED target (down- or upsampled) is
-    // not: only jvk::Shader draws write it (by output location, or by an output named
-    // after it), each as its own TARGET PASS with it as the attachment (Renderer), in its
-    // own pixels and without path clips; ordinary draws can't select it and clearedByMain
+    // not: jvk::Shader draws write it (by output location, or by an output named after
+    // it), each as its own TARGET PASS with it as the attachment, and effects run on it
+    // (Graphics::setTarget, then a blur or an hsv transform), both in its own pixels and
+    // without path clips (Renderer); ordinary paint doesn't land on it and clearedByMain
     // doesn't apply. It holds its clear value until its first write in a frame.
     float             scale = 1.0f;
 

@@ -102,7 +102,7 @@ public:
     // native renderer and not attempt to enable Vulkan. Result is cached so
     // it stays accurate even after setVulkanEnabled(false) has released our
     // Device reference.
-    bool isVulkanAvailable() const { return vulkanAvailable_; }
+    bool isVulkanAvailable() const { return vulkanAvailable_ && !(device_ && device_->isLost()); }
     Device& getDevice() { return *device_; }
 
     // Block until the renderer is fully quiescent: worker thread idle, GPU
@@ -125,7 +125,11 @@ public:
     {
         if (renderer_) renderer_->waitForIdle();
         if (device_ && device_->device() != VK_NULL_HANDLE)
+        {
+            // Device-idle is queue use: never race a sibling editor's worker mid-submit.
+            const juce::ScopedLock queueSync(Renderer::queueLock());
             vkDeviceWaitIdle(device_->device());
+        }
         if (renderer_) renderer_->flushRetains();
     }
 
@@ -421,6 +425,21 @@ private:
         // doesn't drop a frame each time it lands on a busy worker.
         if (renderer_->isBusy()) { missedTick_ = true; return; }
         missedTick_ = false;
+
+        // A lost device never renders again: hand this editor to JUCE's renderer
+        // (the next editor to acquire a Device gets a fresh one). Without a
+        // swapchain — the window minimised, a create that failed — try to make
+        // one now; until there is one, record NOTHING: a frame that can't begin
+        // would only queue uploads and pins that no submission ever releases.
+        if (device_->isLost()) {
+            diag::log("device lost: this editor falls back to the JUCE renderer");
+            setVulkanEnabled(false);
+            return;
+        }
+        if (!target_->canBegin()) {
+            target_->revive();   // the worker is idle: the swapchain is ours to rebuild
+            if (!target_->canBegin()) return;
+        }
 
         renderer_->reset();
         // Process-wide monotonic tick. Every editor advances the SAME

@@ -507,6 +507,104 @@ void ComplianceEditor::sceneExcludeClip(juce::Graphics& g, juce::Rectangle<float
 }
 
 // =============================================================================
+// Scene: the 2026-10 compliance fixes, one per cell; both panes must match.
+//   0  drawRect borders fill INSIDE their bounds (integer and fractional rects)
+//   1  fractional fillRect edges anti-alias (eighth-pixel steps)
+//   2  a gradient fill honours setOpacity (30% over a solid bar)
+//   3  rotated and sheared text is drawn rotated and sheared
+//   4  a 4:1 ellipse strokes and anti-aliases one width all round
+//   5  thick lines end square (butt caps); dashes stay apart
+//   6  a rectangle-list clip is the exact list (a frame round a hole)
+//   7  a rotated rect clip is the rotated rect, not its bounding box
+// =============================================================================
+void ComplianceEditor::sceneCompliance2026(juce::Graphics& g, juce::Rectangle<float> area)
+{
+    const float cw = area.getWidth() / 4.0f, ch = area.getHeight() / 2.0f;
+    auto cell = [&](int i) {
+        const int col = i % 4, row = i / 4;
+        return juce::Rectangle<float>((float) col * cw, (float) row * ch, cw, ch).reduced(12.0f);
+    };
+
+    {   // 0: borders
+        auto c = cell(0);
+        g.setColour(juce::Colours::white);
+        g.drawRect(c.getSmallestIntegerContainer(), 1);
+        g.drawRect(c.reduced(10.5f, 10.5f), 1.0f);
+        g.drawRect(c.reduced(24.25f, 24.25f), 3.0f);
+    }
+    {   // 1: fractional fills
+        auto c = cell(1);
+        g.setColour(juce::Colour(0xFFE0B040));
+        for (int i = 0; i < 8; ++i)
+            g.fillRect(juce::Rectangle<float>(c.getX() + (float) i * 0.125f,
+                                              c.getY() + (float) i * (ch / 10.0f),
+                                              c.getWidth() * 0.6f, 6.0f));
+        g.fillRect(juce::Rectangle<float>(c.getRight() - 20.5f, c.getY() + 0.5f, 10.3f, c.getHeight() - 1.0f));
+    }
+    {   // 2: gradient at 30%
+        auto c = cell(2);
+        g.setColour(juce::Colour(0xFF2A9D8F));
+        g.fillRect(c.withHeight(c.getHeight() * 0.5f));
+        g.setGradientFill(juce::ColourGradient(juce::Colours::red,  c.getX(),     c.getY(),
+                                               juce::Colours::blue, c.getRight(), c.getY(), false));
+        g.setOpacity(0.3f);
+        g.fillRect(c);
+        g.setOpacity(1.0f);
+    }
+    {   // 3: rotated / sheared text
+        auto c = cell(3);
+        g.setColour(juce::Colours::white);
+        g.setFont(juce::FontOptions(18.0f));
+        {
+            juce::Graphics::ScopedSaveState ss(g);
+            g.addTransform(juce::AffineTransform::rotation(-juce::MathConstants<float>::halfPi,
+                                                           c.getX() + 20.0f, c.getBottom() - 8.0f));
+            g.drawText("ROTATED 90", juce::Rectangle<float>(c.getX() + 20.0f, c.getBottom() - 30.0f,
+                                                            c.getHeight() - 16.0f, 22.0f),
+                       juce::Justification::centredLeft);
+        }
+        {
+            juce::Graphics::ScopedSaveState ss(g);
+            g.addTransform(juce::AffineTransform::shear(0.4f, 0.0f).translated(c.getX() + 40.0f, c.getY() + 40.0f));
+            g.drawText("sheared", juce::Rectangle<float>(0.0f, 0.0f, 120.0f, 22.0f), juce::Justification::centredLeft);
+        }
+    }
+    {   // 4: a 4:1 ellipse
+        auto c = cell(4);
+        g.setColour(juce::Colours::white);
+        const float w = c.getWidth() - 8.0f;
+        g.drawEllipse(c.withSizeKeepingCentre(w, w * 0.25f).translated(0.0f, -ch * 0.2f), 3.0f);
+        g.fillEllipse(c.withSizeKeepingCentre(w * 0.6f, w * 0.15f).translated(0.0f, ch * 0.2f));
+    }
+    {   // 5: butt caps, dashes
+        auto c = cell(5);
+        g.setColour(juce::Colours::white);
+        g.drawLine(juce::Line<float>(c.getX() + 10.0f, c.getY() + 20.0f, c.getRight() - 10.0f, c.getY() + 20.0f), 8.0f);
+        g.drawLine(juce::Line<float>(c.getX() + 10.0f, c.getY() + 40.0f, c.getRight() - 10.0f, c.getBottom() - 24.0f), 6.0f);
+        const float dashes[] = { 6.0f, 4.0f };
+        g.drawDashedLine(juce::Line<float>(c.getX() + 10.0f, c.getBottom() - 10.0f, c.getRight() - 10.0f, c.getBottom() - 10.0f),
+                         dashes, 2, 3.0f);
+    }
+    {   // 6: rectangle-list clip
+        auto c = cell(6);
+        juce::Graphics::ScopedSaveState ss(g);
+        juce::RectangleList<int> frame(c.getSmallestIntegerContainer());
+        frame.subtract(c.reduced(24.0f).getSmallestIntegerContainer());
+        g.reduceClipRegion(frame);
+        g.setColour(juce::Colour(0xFFB05070));
+        g.fillAll();
+    }
+    {   // 7: rotated rect clip
+        auto c = cell(7);
+        juce::Graphics::ScopedSaveState ss(g);
+        g.addTransform(juce::AffineTransform::rotation(0.4f, c.getCentreX(), c.getCentreY()));
+        g.reduceClipRegion(c.reduced(20.0f).getSmallestIntegerContainer());
+        g.setColour(juce::Colour(0xFF5070B0));
+        g.fillAll();
+    }
+}
+
+// =============================================================================
 // Scene registry
 // =============================================================================
 
@@ -517,18 +615,19 @@ const std::vector<ComplianceEditor::Scene>& ComplianceEditor::scenes()
         { "Blend effect inside path clip",      &sceneBlendInClip,
           "noise is jvk-only: appears on LIVE pane only; clip SHAPE must match" },
         { "Paths (fill / gradient / stroke)",   &scenePaths,             nullptr },
-        { "Text (sizes + rotated/sheared)",     &sceneText,
-          "rotated/sheared runs render upright until the transformed-text fix lands" },
+        { "Text (sizes + rotated/sheared)",     &sceneText,              nullptr },
         { "Gradients (linear / radial)",        &sceneGradients,         nullptr },
         { "Rect lists / shapes / lines",        &sceneRectsAndLists,     nullptr },
         { "Images (draw / transform / alpha / tiled)", &sceneImages,
           "tiled fills may show a 1-texel seam blend at tile edges (CLAMP sampler + fract)" },
         { "Effects with regions",               &sceneEffectsRegion,
-          "jvk-only ops: LIVE pane only; regions take effect once ROI scissoring lands" },
+          "jvk-only ops: LIVE pane only" },
         { "Transparency layer",                 &sceneTransparencyLayer,
           "overlap darkens until true layers land (Phase 6)" },
         { "Opacity contract (setOpacity/fill alpha)", &sceneOpacityContract, nullptr },
         { "Exclude clip region",                &sceneExcludeClip, nullptr },
+        { "Compliance fixes 2026-10 (borders, AA, gradient opacity, text, lines, clips)",
+          &sceneCompliance2026, nullptr },
     };
     return s;
 }

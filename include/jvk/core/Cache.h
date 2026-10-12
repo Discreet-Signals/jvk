@@ -35,8 +35,9 @@ public:
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
 
         descriptorSet_ = device.bindings().alloc();
-        Memory::M::writeImage(device.device(), descriptorSet_, 0,
-            image_.view(), image_.sampler());
+        if (descriptorSet_ != VK_NULL_HANDLE && image_.valid())
+            Memory::M::writeImage(device.device(), descriptorSet_, 0,
+                image_.view(), image_.sampler());
 
         cpuBuffer_.resize(static_cast<size_t>(WIDTH) * HEIGHT * 4);
         hashToRow_.reserve(HEIGHT);
@@ -98,11 +99,18 @@ public:
         memcpy(staging.mappedPtr,
                cpuBuffer_.data() + static_cast<size_t>(first) * WIDTH * 4,
                static_cast<size_t>(byteSize));
-        if (first == 0)
+        // The first upload ever takes the fresh-image path (UNDEFINED, no
+        // wait: nothing has read the image). Every later one — a new band,
+        // or the restart from row 0 after an overflow reset — is a RECT
+        // upload: it keeps the image's layout and waits for the frames still
+        // sampling the atlas, where a second fresh-image upload would discard
+        // and race them.
+        if (!everUploaded_)
             r.upload(staging, image_.image(), WIDTH, count);
         else
             r.uploadRect(staging, image_.image(), 0, static_cast<int32_t>(first),
                          WIDTH, count);
+        everUploaded_ = true;
         uploadedRows_ = cursor_;
     }
 
@@ -110,12 +118,33 @@ public:
     uint32_t        activeRows()    const { return cursor_; }
 
 private:
+    // As juce's ColourGradient::createLookupTable: between two stops the
+    // STRAIGHT (non-premultiplied) components interpolate linearly and the
+    // result is premultiplied afterwards (here by ui2d.frag, which samples
+    // the row straight). Colour::interpolatedWith tweens PREMULTIPLIED
+    // pixels instead, so a red@1 → blue@0 gradient read red at its middle
+    // where juce paints purple at half alpha.
     void rasterizeRow(const juce::ColourGradient& g, uint32_t row)
     {
         uint8_t* dst = cpuBuffer_.data() + static_cast<size_t>(row) * WIDTH * 4;
+        const int stops = g.getNumColours();
+        int j = 0;   // the stop at or before t
         for (uint32_t i = 0; i < WIDTH; i++) {
-            double t = static_cast<double>(i) / static_cast<double>(WIDTH - 1);
-            auto c = g.getColourAtPosition(t);
+            const double t = static_cast<double>(i) / static_cast<double>(WIDTH - 1);
+            while (j + 1 < stops && g.getColourPosition(j + 1) <= t) ++j;
+            juce::Colour c;
+            if (stops <= 0)          c = juce::Colours::transparentBlack;
+            else if (j + 1 >= stops) c = g.getColour(j);
+            else {
+                const auto p0 = g.getColourPosition(j), p1 = g.getColourPosition(j + 1);
+                const auto a = g.getColour(j), b = g.getColour(j + 1);
+                const float f = p1 > p0 ? static_cast<float>((t - p0) / (p1 - p0)) : 0.0f;
+                auto lerp8 = [f](juce::uint8 x, juce::uint8 y) {
+                    return static_cast<juce::uint8>(juce::roundToInt(x + (static_cast<float>(y) - x) * f));
+                };
+                c = juce::Colour(lerp8(a.getRed(), b.getRed()), lerp8(a.getGreen(), b.getGreen()),
+                                 lerp8(a.getBlue(), b.getBlue()), lerp8(a.getAlpha(), b.getAlpha()));
+            }
             dst[i * 4 + 0] = c.getRed();
             dst[i * 4 + 1] = c.getGreen();
             dst[i * 4 + 2] = c.getBlue();
@@ -130,6 +159,7 @@ private:
     std::unordered_map<uint64_t, uint32_t> hashToRow_;
     uint32_t        cursor_ = 0;
     uint32_t        uploadedRows_ = 0;   // rows already on the GPU
+    bool            everUploaded_ = false;   // the image left UNDEFINED (stageUploads)
 };
 
 // =============================================================================
@@ -522,9 +552,9 @@ public:
 
         auto ci = std::make_unique<CachedImage>();
         ci->image = Image(device_.pool(), device_.device(), w, h, src.format, Image::Shape {});
-        if (!ci->image.valid()) return VK_NULL_HANDLE;
+        if (!ci->image.valid()) { r.staging().discard(staging); return VK_NULL_HANDLE; }
         ci->descriptorSet = device_.bindings().alloc();
-        if (ci->descriptorSet == VK_NULL_HANDLE) return VK_NULL_HANDLE;
+        if (ci->descriptorSet == VK_NULL_HANDLE) { r.staging().discard(staging); return VK_NULL_HANDLE; }
         ci->bindings = &device_.bindings();
 
         Memory::M::writeImage(device_.device(), ci->descriptorSet, 0,
