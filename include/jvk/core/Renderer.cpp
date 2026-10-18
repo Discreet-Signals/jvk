@@ -73,6 +73,7 @@ void Renderer::reset()
     arena_.reset();
     fonts_.clear();
     fills_.clear();
+    fillTextures_.clear();
     recordTarget_ = 0;   // every frame starts drawing into the main colour
     scaledTargets_ = target_.scaledTargets();
     std::fill(std::begin(targetReadEnd_), std::end(targetReadEnd_), 0u);   // no target read yet
@@ -1221,10 +1222,13 @@ void Renderer::execute()
                     (cmd.dataOffset + static_cast<uint32_t>(sizeof(FillPathParams)) + 3u) & ~3u;
                 auto verts = arena_.readSpan<UIVertex>(vertsOff, p.vertexCount);
                 // Colour source descriptor — matches the ColorPipeline pattern
-                // (gradient atlas row for gradient fills, 1x1 default for
-                // solids). path_sdf.frag samples it iff gradientInfo.z > 0.
+                // (a tiled image fill's texture, the gradient atlas row for
+                // gradient fills, 1x1 default for solids). path_sdf.frag
+                // samples it iff gradientInfo.z > 0.
+                const auto& texture = getFillTexture(p.fillIndex);
                 VkDescriptorSet colorDesc =
-                    (fill.isGradient() && fill.gradient)
+                    texture.desc != VK_NULL_HANDLE ? texture.desc
+                    : (fill.isGradient() && fill.gradient)
                         ? gradientDescriptor()
                         : caches().defaultDescriptor();
                 pathPipeline_->dispatch(state_, frame.cmd, *this, cmd,

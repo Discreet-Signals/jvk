@@ -6,27 +6,35 @@ namespace jvk::pipelines {
 // Unified fill model — "shape × color" composition
 //
 // Every draw op is the product of two independent sources:
-//   - A color source: solid vertex color, or a 256x1 gradient LUT sampled by a
-//     per-vertex `gradientT`. Gradient LUTs are built at record time from
+//   - A color source: solid vertex color, a 256x1 gradient LUT sampled by a
+//     per-vertex `gradientT`, or a tiled image fill's texture sampled at a
+//     per-vertex UV. Gradient LUTs are built at record time from
 //     juce::ColourGradient via getColourAtPosition(t), so N-stop gradients
-//     (start, middle colours added via addColour, end) work natively.
+//     (start, middle colours added via addColour, end) work natively. As juce,
+//     a fill is placed by the paint's transform and its own, never by the
+//     transform of the thing drawn (a path's, a glyph run's).
 //   - A shape source: analytical SDF (rect / rounded rect / ellipse), MSDF
 //     atlas (text), or sampled image.
 //
-// Descriptor set 0 holds the colour LUT (or the 1x1 default for solid fills —
-// unused when gradientInfo.z == 0), set 1 holds the shape texture. Each op
+// Descriptor set 0 holds the colour LUT, the fill's image, or the 1x1 default
+// for solid fills — unused when gradientInfo.z == 0), set 1 holds the shape texture. Each op
 // computes per-vertex gradientT on CPU so radial/linear behave correctly under
 // arbitrary transforms.
 // =============================================================================
 
 struct GradientCtx {
-    float mode    = 0.0f;         // 0 = solid, 1 = linear, 2 = radial
+    float mode    = 0.0f;         // 0 = solid, 1 = linear, 2 = radial, 3 = tiled image
     float rowNorm = 0.0f;         // normalised y into the GradientAtlas (row center)
     float gx1 = 0, gy1 = 0;       // gradient origin in physical pixels
     // linear projection
     float dx = 0, dy = 0, invLen2 = 0;
     // radial normalization
     float invRadius = 0;
+    // tiled image: physical px -> image px, over the image's size; its texture and point sampling
+    juce::AffineTransform toImage;
+    float invW = 0, invH = 0, nearest = 0;
+    VkDescriptorSet image = VK_NULL_HANDLE;
+    bool invisible = false;       // an image fill with no image to draw: nothing, as juce
 
     bool active() const { return mode > 0.0f; }
 };
@@ -64,11 +72,36 @@ inline GradientCtx makeGradientCtx(Renderer& r, const juce::FillType& fill,
     return c;
 }
 
-// Produces the vertex gradientInfo: (t.x, t.y, mode, rowNorm).
+// The colour source of captured fill `fillIndex`: a tiled image fill (its texture
+// resolved at record time, Graphics::captureFill) as mode 3, any other as
+// makeGradientCtx. `physical` places the fill: the paint's transform, scaled.
+inline GradientCtx makeFillCtx(Renderer& r, uint32_t fillIndex, const juce::AffineTransform& physical)
+{
+    const auto& fill = r.getFill(fillIndex);
+    if (!fill.isTiledImage()) return makeGradientCtx(r, fill, physical);
+
+    GradientCtx c;
+    const auto& texture = r.getFillTexture(fillIndex);
+    if (texture.desc == VK_NULL_HANDLE) { c.invisible = true; return c; }
+    c.mode    = 3.0f;
+    c.image   = texture.desc;
+    c.nearest = texture.nearest ? 1.0f : 0.0f;
+    c.toImage = fill.transform.followedBy(physical).inverted();
+    c.invW    = 1.0f / static_cast<float>(fill.image.getWidth());
+    c.invH    = 1.0f / static_cast<float>(fill.image.getHeight());
+    return c;
+}
+
+// Produces the vertex gradientInfo: (t.x, t.y, mode, rowNorm); a tiled image's
+// (u, v, 3, nearest), the UV unbounded (the shader wraps it).
 // Shader reads t.x for linear, length(t.xy) for radial; samples the colour
 // atlas at (t, rowNorm).
 inline glm::vec4 gradientAt(const GradientCtx& c, float px, float py)
 {
+    if (c.mode == 3.0f) {
+        const auto q = juce::Point<float>(px, py).transformedBy(c.toImage);
+        return glm::vec4(q.x * c.invW, q.y * c.invH, 3.0f, c.nearest);
+    }
     if (c.mode == 2.0f) {
         return glm::vec4((px - c.gx1) * c.invRadius,
                          (py - c.gy1) * c.invRadius, 2.0f, c.rowNorm);
@@ -87,6 +120,8 @@ inline glm::vec4 gradientAt(const GradientCtx& c, float px, float py)
 // gradient under g.setOpacity(0.3f) renders at 30% (it used to render opaque).
 inline glm::vec4 fillColorAttr(const GradientCtx& grad, juce::Colour solid, float opacity)
 {
+    if (grad.invisible)
+        return glm::vec4(0.0f);
     if (grad.active())
         return glm::vec4(1.0f, 1.0f, 1.0f, solid.getFloatAlpha() * opacity);
     return { solid.getFloatRed(), solid.getFloatGreen(),
@@ -95,8 +130,10 @@ inline glm::vec4 fillColorAttr(const GradientCtx& grad, juce::Colour solid, floa
 
 inline VkDescriptorSet colorDescFor(const GradientCtx& grad, Renderer& r)
 {
-    // All active gradients share the atlas; solids get the 1x1 default which
-    // the shader doesn't sample when gradientInfo.z == 0.
+    // A tiled image samples its own texture. All active gradients share the
+    // atlas; solids get the 1x1 default which the shader doesn't sample when
+    // gradientInfo.z == 0.
+    if (grad.mode == 3.0f) return grad.image;
     return grad.active() ? r.gradientDescriptor()
                          : r.caches().defaultDescriptor();
 }
@@ -237,7 +274,7 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             auto& p    = arena.read<FillRectParams>(cmd.dataOffset);
             auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
-            GradientCtx grad = makeGradientCtx(r, fill, tx);
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
             auto color = fillColorAttr(grad, fill.colour, p.opacity);
@@ -259,7 +296,7 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
 
             auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
-            GradientCtx grad = makeGradientCtx(r, fill, tx);
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
             state.setResources(colorDescFor(grad, r), def);
             auto color = fillColorAttr(grad, fill.colour, p.opacity);
 
@@ -300,7 +337,7 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             // covers displayScale and leaves corners under-sized whenever
             // the caller set a scale > 1 on Graphics::addTransform.
             float cs   = p.cornerSize * tx.getScaleFactor();
-            GradientCtx grad = makeGradientCtx(r, fill, tx);
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
             auto color = fillColorAttr(grad, fill.colour, p.opacity);
@@ -325,7 +362,7 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             auto  phys = toPixels(p.area, p.transform, p.scale);
-            GradientCtx grad = makeGradientCtx(r, fill, tx);
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
             auto color = fillColorAttr(grad, fill.colour, p.opacity);
@@ -350,7 +387,7 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             // the composed transform so they track the rect under zoom.
             float cs   = p.cornerSize * tx.getScaleFactor();
             float sw   = p.lineWidth  * tx.getScaleFactor();
-            GradientCtx grad = makeGradientCtx(r, fill, tx);
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
             auto color = fillColorAttr(grad, fill.colour, p.opacity);
@@ -379,7 +416,7 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             // lineWidth is in logical pixels — use the composed transform
             // scale (matches DrawLine's convention).
             float sw   = p.lineWidth * tx.getScaleFactor();
-            GradientCtx grad = makeGradientCtx(r, fill, tx);
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
             auto color = fillColorAttr(grad, fill.colour, p.opacity);
@@ -496,7 +533,9 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             auto& font = r.getFont(p.fontIndex);
             auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
-            GradientCtx grad = makeGradientCtx(r, fill, tx);
+            // The fill by the paint's transform alone: the run's own (drawText's
+            // translation to its area) places the glyphs, never the fill.
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, toPhysical(p.fillTransform, p.scale));
 
             // Color LUT is shared across every glyph of this draw; shape
             // descriptor varies per glyph (atlas page).
@@ -600,7 +639,7 @@ inline void ColorPipeline::execute(Renderer& r, const Arena& arena, const DrawCo
             auto& p    = arena.read<DrawLineParams>(cmd.dataOffset);
             auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
-            GradientCtx grad = makeGradientCtx(r, fill, tx);
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
             auto color = fillColorAttr(grad, fill.colour, p.opacity);

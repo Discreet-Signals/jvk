@@ -529,7 +529,7 @@ public:
             fillPath(p, {});
             return;
         }
-        auto fi = renderer_.captureFill(s.fill);
+        auto fi = captureFill();
         // Stage gradient LUT upload if this is a gradient fill
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
@@ -548,7 +548,7 @@ public:
         // ONE command + one arena span for the whole list. The old loop
         // exploded an N-rect list (common from JUCE text/clip internals)
         // into N commands + N FillType captures + N draw calls.
-        auto fi = renderer_.captureFill(s.fill);
+        auto fi = captureFill();
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
         FillRectListParams p {};
@@ -745,8 +745,11 @@ public:
 
         // Per-vertex colour source, same as ColorDraw's primitive ops:
         // solid colour folded into the vertex attribute, or gradient
-        // mode/row packed into gradientInfo via gradientAt().
-        pipelines::GradientCtx grad = pipelines::makeGradientCtx(renderer_, s.fill, combined);
+        // mode/row (or a tiled image's UV) packed into gradientInfo via
+        // gradientAt(). Placed by the paint's transform: `t` moves the path,
+        // never its fill (juce's fillShape).
+        const auto fillIndex = captureFill();
+        pipelines::GradientCtx grad = pipelines::makeFillCtx(renderer_, fillIndex, s.transform.scaled(displayScale_));
         glm::vec4 color = pipelines::fillColorAttr(grad, s.fill.colour, s.opacity);
 
         auto gi = [&](float px, float py) -> glm::vec4 {
@@ -816,7 +819,7 @@ public:
         p.vertexCount  = static_cast<uint32_t>(scratchTileVerts_.size());
         p.segmentStart = segStart;
         p.fillRule     = fillRule;
-        p.fillIndex    = renderer_.captureFill(s.fill);
+        p.fillIndex    = fillIndex;
         p.tileSize     = tileW;
 
         record(DrawOp::FillPath, clipRect, p);
@@ -855,7 +858,7 @@ public:
             renderer_.registerGradient(*s.fill.gradient);
             p.tint              = { 1.0f, 1.0f, 1.0f, s.fill.colour.getFloatAlpha() * s.opacity };
             p.alphaMaskFill     = 2;
-            p.fillIndex         = renderer_.captureFill(s.fill);
+            p.fillIndex         = captureFill();
             p.gradientTransform = s.transform;
         }
         else
@@ -868,6 +871,27 @@ public:
         renderer_.push(DrawOp::DrawImage, clipRect, s.stencilDepth, p);
     }
 
+    // The state's fill, captured for the frame. A tiled image fill takes its
+    // texture with it, resolved now on the message thread, so every colour
+    // pipeline draw can sample it (colour mode 3: ColorDraw makeFillCtx).
+    uint32_t captureFill()
+    {
+        auto& s = state();
+        return renderer_.captureFill(s.fill, s.fill.isTiledImage() ? tiledFillTexture() : VK_NULL_HANDLE, s.nearest);
+    }
+
+    // A tiled image fill's texture: null for no image or a singular placement,
+    // which juce draws as nothing.
+    VkDescriptorSet tiledFillTexture()
+    {
+        auto& s = state();
+        if (!s.fill.image.isValid() || s.fill.transform.isSingularity())
+            return VK_NULL_HANDLE;
+        if (auto desc = tryImageFastPath(s.fill.image, renderer_); desc != VK_NULL_HANDLE)
+            return desc;
+        return renderer_.caches().getTexture(ResourceCaches::hashImage(s.fill.image), s.fill.image, renderer_);
+    }
+
     // Tiled image fill: one quad over the fill rect, UVs mapped through the
     // inverse of the fill's image-placement transform, wrapped by fract()
     // in the shader (shape type 6). Exact for affine placements (UVs
@@ -876,12 +900,7 @@ public:
     void fillWithTiledImage(const juce::Rectangle<float>& r)
     {
         auto& s = state();
-        if (s.fill.transform.isSingularity())
-            return;
-        VkDescriptorSet desc = tryImageFastPath(s.fill.image, renderer_);
-        if (desc == VK_NULL_HANDLE)
-            desc = renderer_.caches().getTexture(
-                ResourceCaches::hashImage(s.fill.image), s.fill.image, renderer_);
+        VkDescriptorSet desc = tiledFillTexture();
         if (desc == VK_NULL_HANDLE) return;
 
         auto physRect = r.transformedBy(s.transform.scaled(displayScale_))
@@ -960,7 +979,7 @@ public:
     {
         if (isClipEmpty()) return;
         auto& s = state();
-        auto fi = renderer_.captureFill(s.fill);
+        auto fi = captureFill();
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
         record(DrawOp::DrawLine, s.clipBounds,
@@ -1003,11 +1022,12 @@ public:
             }
         }
 
-        DrawGlyphsParams params;
+        DrawGlyphsParams params {};
         params.glyphCount = static_cast<uint32_t>(glyphs.size());
         params.transform = t.followedBy(s.transform);
+        params.fillTransform = s.transform;   // juce fills glyphs in user space: `t` moves the glyphs only
         params.fontIndex = renderer_.captureFont(s.font);
-        params.fillIndex = renderer_.captureFill(s.fill);
+        params.fillIndex = captureFill();
         params.opacity = s.opacity;
         params.scale = displayScale_;
         record(DrawOp::DrawGlyphs, s.clipBounds, params);
@@ -1028,7 +1048,7 @@ public:
     {
         if (isClipEmpty()) return;
         auto& s = state();
-        auto fi = renderer_.captureFill(s.fill);
+        auto fi = captureFill();
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
         record(DrawOp::FillRoundedRect, s.clipBounds,
@@ -1039,7 +1059,7 @@ public:
     {
         if (isClipEmpty()) return;
         auto& s = state();
-        auto fi = renderer_.captureFill(s.fill);
+        auto fi = captureFill();
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
         record(DrawOp::FillEllipse, s.clipBounds,
@@ -1051,7 +1071,7 @@ public:
     {
         if (isClipEmpty()) return;
         auto& s = state();
-        auto fi = renderer_.captureFill(s.fill);
+        auto fi = captureFill();
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
         record(DrawOp::StrokeRoundedRect, s.clipBounds,
@@ -1067,7 +1087,7 @@ public:
     {
         if (isClipEmpty()) return;
         auto& s = state();
-        auto fi = renderer_.captureFill(s.fill);
+        auto fi = captureFill();
         if (s.fill.isGradient() && s.fill.gradient)
             renderer_.registerGradient(*s.fill.gradient);
         record(DrawOp::StrokeEllipse, s.clipBounds,

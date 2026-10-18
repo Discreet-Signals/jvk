@@ -554,16 +554,23 @@ public:
         fonts_.push_back(f);
         return static_cast<uint32_t>(fonts_.size() - 1);
     }
-    uint32_t captureFill(const juce::FillType& f)
+    // A tiled image fill's texture, resolved when the draw was recorded (Graphics::captureFill), and its
+    // point sampling: what colour mode 3 samples. Null for every other fill.
+    struct FillTexture { VkDescriptorSet desc = VK_NULL_HANDLE; bool nearest = false; };
+
+    uint32_t captureFill(const juce::FillType& f, VkDescriptorSet texture = VK_NULL_HANDLE, bool nearest = false)
     {
-        if (!fills_.empty() && fills_.back() == f)
+        if (!fills_.empty() && fills_.back() == f
+            && fillTextures_.back().desc == texture && fillTextures_.back().nearest == nearest)
             return static_cast<uint32_t>(fills_.size() - 1);
         fills_.push_back(f);
+        fillTextures_.push_back({ texture, nearest });
         return static_cast<uint32_t>(fills_.size() - 1);
     }
 
     const juce::Font&     getFont(uint32_t i) const { return fonts_[i]; }
     const juce::FillType& getFill(uint32_t i) const { return fills_[i]; }
+    const FillTexture&    getFillTexture(uint32_t i) const { return fillTextures_[i]; }
 
     // Forward to arena for appending POD data after params
     void arena_align(uint32_t alignment) { arena_.align(alignment); }
@@ -676,6 +683,7 @@ private:
     // Non-POD captures (proper RAII, cleared each frame)
     std::vector<juce::Font>     fonts_;
     std::vector<juce::FillType> fills_;
+    std::vector<FillTexture>    fillTextures_;   // beside fills_, one each
 
     // Pending uploads queued during record; drained by flushUploads at the
     // top of execute(). Per-Renderer so two editors never share this vector.

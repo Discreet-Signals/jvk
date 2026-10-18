@@ -604,6 +604,85 @@ void ComplianceEditor::sceneCompliance2026(juce::Graphics& g, juce::Rectangle<fl
     }
 }
 
+// Every fill on text, paths and shapes, placed as juce places it: by the
+// paint's transform and the fill's own, never by the transform of the thing
+// drawn (drawText's translation to its area, fillPath's `t`). Each cell must
+// match the reference pane.
+void ComplianceEditor::sceneFillPlacement(juce::Graphics& g, juce::Rectangle<float> area)
+{
+    static const juce::Image test = makeTestImage(64, 64);
+    const float cw = area.getWidth() / 4.0f, ch = area.getHeight() / 2.0f;
+    auto cell = [&](int i) {
+        const int col = i % 4, row = i / 4;
+        return juce::Rectangle<float>((float) col * cw, (float) row * ch, cw, ch).reduced(12.0f);
+    };
+    g.setFont(juce::FontOptions(22.0f, juce::Font::bold));
+    auto rows = [](juce::Rectangle<float> c, int i) { return c.withHeight(c.getHeight() / 3.0f).translated(0.0f, (float) i * c.getHeight() / 3.0f); };
+
+    {   // 0: one linear gradient across the cell, three labels along it: each takes the colour where it stands
+        auto c = cell(0);
+        g.setGradientFill(juce::ColourGradient(juce::Colours::red, c.getX(), 0.0f, juce::Colours::cyan, c.getRight(), 0.0f, false));
+        for (int i = 0; i < 3; ++i)
+            g.drawText("Text", rows(c, i).withTrimmedLeft((float) i * c.getWidth() / 3.0f), juce::Justification::centredLeft, false);
+    }
+    {   // 1: the preset browser's fade: transparent at the cell's left, solid 24 px in, labels far right of it
+        auto c = cell(1);
+        juce::ColourGradient fade(juce::Colours::white.withAlpha(0.0f), c.getX(), 0.0f, juce::Colours::white, c.getRight(), 0.0f, false);
+        fade.addColour(24.0 / c.getWidth(), juce::Colours::white);
+        g.setGradientFill(fade);
+        g.drawText("fades in", rows(c, 0), juce::Justification::centredLeft, false);
+        g.drawText("visible", rows(c, 1).withTrimmedLeft(c.getWidth() * 0.4f), juce::Justification::centredLeft, false);
+        g.drawText("visible", rows(c, 2).withTrimmedLeft(c.getWidth() * 0.2f), juce::Justification::centredLeft, false);
+    }
+    {   // 2: a radial gradient on text
+        auto c = cell(2);
+        g.setGradientFill(juce::ColourGradient(juce::Colours::yellow, c.getCentreX(), c.getCentreY(),
+                                               juce::Colours::blue, c.getRight(), c.getCentreY(), true));
+        for (int i = 0; i < 3; ++i)
+            g.drawText("Radial", rows(c, i), juce::Justification::centred, false);
+    }
+    {   // 3: a tiled image on text, plain, faded and point-sampled
+        auto c = cell(3);
+        g.setTiledImageFill(test, (int) c.getX(), (int) c.getY(), 1.0f);
+        g.drawText("Image", rows(c, 0), juce::Justification::centredLeft, false);
+        g.setTiledImageFill(test, (int) c.getX(), (int) c.getY(), 0.4f);
+        g.drawText("Image", rows(c, 1), juce::Justification::centredLeft, false);
+        g.setImageResamplingQuality(juce::Graphics::lowResamplingQuality);
+        g.setFillType(juce::FillType(test, juce::AffineTransform::scale(3.0f).translated(c.getX(), c.getY())));
+        g.drawText("Image", rows(c, 2), juce::Justification::centredLeft, false);
+        g.setImageResamplingQuality(juce::Graphics::mediumResamplingQuality);
+    }
+    juce::Path star;
+    star.addStar({ 0.0f, 0.0f }, 5, 14.0f, 34.0f);
+    {   // 4: one gradient, a path filled twice at two offsets (fillPath's t): the two take different colours
+        auto c = cell(4);
+        g.setGradientFill(juce::ColourGradient(juce::Colours::red, c.getX(), 0.0f, juce::Colours::lime, c.getRight(), 0.0f, false));
+        g.fillPath(star, juce::AffineTransform::translation(c.getX() + 38.0f, c.getCentreY()));
+        g.fillPath(star, juce::AffineTransform::translation(c.getRight() - 38.0f, c.getCentreY()));
+    }
+    {   // 5: a tiled image on a path at an offset, and on a stroke
+        auto c = cell(5);
+        g.setTiledImageFill(test, (int) c.getX(), (int) c.getY(), 1.0f);
+        g.fillPath(star, juce::AffineTransform::translation(c.getX() + 38.0f, c.getCentreY()));
+        juce::Path ring;
+        ring.addEllipse(c.getRight() - 72.0f, c.getCentreY() - 32.0f, 64.0f, 64.0f);
+        g.strokePath(ring, juce::PathStrokeType(10.0f));
+    }
+    {   // 6: a tiled image on a rounded rectangle and an ellipse
+        auto c = cell(6);
+        g.setTiledImageFill(test, (int) c.getX(), (int) c.getY(), 1.0f);
+        g.fillRoundedRectangle(c.withWidth(c.getWidth() * 0.45f), 12.0f);
+        g.fillEllipse(c.withTrimmedLeft(c.getWidth() * 0.55f));
+    }
+    {   // 7: a tiled image on lines and on a rectangle's outline
+        auto c = cell(7);
+        g.setTiledImageFill(test, (int) c.getX(), (int) c.getY(), 1.0f);
+        g.drawLine(juce::Line<float>(c.getX() + 8.0f, c.getY() + 16.0f, c.getRight() - 8.0f, c.getY() + 16.0f), 10.0f);
+        g.drawLine(juce::Line<float>(c.getX() + 8.0f, c.getBottom() - 8.0f, c.getRight() - 8.0f, c.getY() + 40.0f), 8.0f);
+        g.drawRoundedRectangle(c.reduced(20.0f, 30.0f).translated(0.0f, 14.0f), 10.0f, 6.0f);
+    }
+}
+
 // =============================================================================
 // Scene registry
 // =============================================================================
@@ -628,6 +707,8 @@ const std::vector<ComplianceEditor::Scene>& ComplianceEditor::scenes()
         { "Exclude clip region",                &sceneExcludeClip, nullptr },
         { "Compliance fixes 2026-10 (borders, AA, gradient opacity, text, lines, clips)",
           &sceneCompliance2026, nullptr },
+        { "Fills on text, paths, shapes (gradient / image, placed by the paint)",
+          &sceneFillPlacement, "tiled fills may show a 1-texel seam blend at tile edges (CLAMP sampler + fract)" },
     };
     return s;
 }

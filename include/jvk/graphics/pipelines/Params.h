@@ -151,7 +151,8 @@ struct ExcludeRectParams {
 
 struct DrawGlyphsParams {
     uint32_t               glyphCount;
-    juce::AffineTransform  transform;
+    juce::AffineTransform  transform;      // the glyphs: the run's own transform, then the paint's
+    juce::AffineTransform  fillTransform;  // the fill: the paint's alone, as juce places every fill
     uint32_t               fontIndex;
     uint32_t               fillIndex;
     float                  opacity;

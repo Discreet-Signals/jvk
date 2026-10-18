@@ -84,6 +84,19 @@ vec4 sampleColor() {
     int mode = int(fragGradientInfo.z + 0.5);
     if (mode == 0)
         return fragColor;
+    if (mode == 3) {
+        // A tiled image fill: set 0 holds the image, gradientInfo.xy its UV
+        // (unbounded: wrapped, as the tiled image quad wraps), .w the
+        // point-sampling flag. Its texel is premultiplied, and this returns
+        // straight alpha (main() premultiplies once): un-premultiplied here.
+        vec2 uv = fract(fragGradientInfo.xy);
+        if (fragGradientInfo.w > 0.5) {
+            vec2 sz = vec2(textureSize(colorLUT, 0));
+            uv = (floor(uv * sz) + 0.5) / sz;
+        }
+        vec4 px = texture(colorLUT, uv);
+        return px.a > 0.0 ? vec4(px.rgb / px.a, px.a * fragColor.a) : vec4(0.0);
+    }
     float t = (mode == 2) ? length(fragGradientInfo.xy) : fragGradientInfo.x;
     t = clamp(t, 0.0, 1.0);
     vec4 col = texture(colorLUT, vec2(t, fragGradientInfo.w));
