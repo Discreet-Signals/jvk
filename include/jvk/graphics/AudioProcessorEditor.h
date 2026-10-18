@@ -96,13 +96,16 @@ public:
     // The targets declared with setTargets.
     const std::vector<Target>& getTargets() const { return targets_; }
 
-    // Reports whether a usable Vulkan device was acquired at construction.
-    // `false` means the runtime has no MoltenVK / ICD or the GPU can't
-    // expose a compatible device — callers should fall back to JUCE's
-    // native renderer and not attempt to enable Vulkan. Result is cached so
-    // it stays accurate even after setVulkanEnabled(false) has released our
-    // Device reference.
-    bool isVulkanAvailable() const { return vulkanAvailable_ && !(device_ && device_->isLost()); }
+    // False once Vulkan has failed this editor, at any stage: no Vulkan or no
+    // driver, no GPU, no device, no surface or swapchain, the device lost. jvk
+    // has then already fallen back to JUCE's renderer by itself (Vulkan off,
+    // jvk::Graphics::create returns nullptr), and stays there; the reason
+    // says why, in words for the user. A failure during construction happens
+    // before onVulkanUnavailable can be set, so check this once constructed;
+    // a later one calls onVulkanUnavailable, on the message thread.
+    bool isVulkanAvailable() const { return vulkanAvailable_; }
+    const juce::String& getVulkanUnavailableReason() const { return unavailableReason_; }
+    std::function<void()> onVulkanUnavailable;
     Device& getDevice() { return *device_; }
 
     // Block until the renderer is fully quiescent: worker thread idle, GPU
@@ -201,19 +204,32 @@ private:
         catchUp_.callback = [this] { if (missedTick_ && vulkanEnabled_ && renderer_) render(); };
 
         // vulkanEnabled_ defaults to true — wire up the Vulkan resources so
-        // construction matches the historical behavior. Subclasses that want
-        // to start disabled can call setVulkanEnabled(false) immediately.
+        // construction matches the historical behavior (or falls back, with
+        // no device). Subclasses that want to start disabled can call
+        // setVulkanEnabled(false) immediately.
         acquireVulkan();
-        vulkanAvailable_ = (device_ && device_->device() != VK_NULL_HANDLE);
-        diag::log(vulkanAvailable_ ? "editor: Vulkan available" : "editor: Vulkan unavailable, JUCE renderer");
+        if (vulkanAvailable_) diag::log("editor: Vulkan available");
+    }
+
+    // The one way out of Vulkan, whatever failed: Vulkan off, JUCE's renderer
+    // paints from here on, the reason kept and logged, the app told. Sticky.
+    void fallBack(const juce::String& reason)
+    {
+        vulkanAvailable_ = false;
+        unavailableReason_ = reason;
+        diag::log("editor: " + reason + ": JUCE renderer");
+        setVulkanEnabled(false);
+        if (onVulkanUnavailable) onVulkanUnavailable();
     }
 
     void acquireVulkan()
     {
         if (!device_) {
             device_ = Device::acquire();
-            if (device_) device_->initCaches();
+            // An unusable Device makes no Vulkan call: its caches' black pixel would be the first.
+            if (device_->usable()) device_->initCaches();
         }
+        if (!device_->usable()) { fallBack(device_->unavailableReason()); return; }
         metalView_.setVisible(true);
         setCachedComponentImage(new NullCachedImage());
 
@@ -426,20 +442,23 @@ private:
         if (renderer_->isBusy()) { missedTick_ = true; return; }
         missedTick_ = false;
 
-        // A lost device never renders again: hand this editor to JUCE's renderer
-        // (the next editor to acquire a Device gets a fresh one). Without a
-        // swapchain — the window minimised, a create that failed — try to make
-        // one now; until there is one, record NOTHING: a frame that can't begin
-        // would only queue uploads and pins that no submission ever releases.
-        if (device_->isLost()) {
-            diag::log("device lost: this editor falls back to the JUCE renderer");
-            setVulkanEnabled(false);
-            return;
-        }
+        // A lost device never renders again: fall back (the next editor to
+        // acquire a Device gets a fresh one). Without a swapchain, a minimised
+        // window (no extent) just waits; otherwise try to make one now, and fall
+        // back once that has failed for a second at a real size. Until there is
+        // one, record NOTHING: a frame that can't begin would only queue uploads
+        // and pins that no submission ever releases.
+        if (device_->isLost()) { fallBack("the graphics device was lost"); return; }
         if (!target_->canBegin()) {
+            const auto extent = target_->surfaceExtent();
+            if (extent.width == 0 || extent.height == 0) return;
             target_->revive();   // the worker is idle: the swapchain is ours to rebuild
-            if (!target_->canBegin()) return;
+            if (!target_->canBegin()) {
+                if (++swapchainFailures_ >= 60) fallBack("the Vulkan swapchain could not be created");
+                return;
+            }
         }
+        swapchainFailures_ = 0;
 
         renderer_->reset();
         // Process-wide monotonic tick. Every editor advances the SAME
@@ -511,18 +530,14 @@ private:
         nsViewGen_ = std::make_unique<jvk::core::macos::NSViewGenerator>();
         metalView_.setBounds(getLocalBounds());
         void* nsView = nsViewGen_->create(getWidth(), getHeight());
-        if (!nsView) return;
+        if (!nsView) { fallBack("the Vulkan view could not be created"); return; }
         metalView_.setView(nsView);
 
         VkSurfaceKHR surface = VK_NULL_HANDLE;
         VkMacOSSurfaceCreateInfoMVK ci {};
         ci.sType = VK_STRUCTURE_TYPE_MACOS_SURFACE_CREATE_INFO_MVK;
         ci.pView = nsView;
-        if (vkCreateMacOSSurfaceMVK(device_->instance(), &ci, nullptr, &surface) != VK_SUCCESS)
-        {
-            diag::log("vkCreateMacOSSurfaceMVK failed");
-            return;
-        }
+        vkCreateMacOSSurfaceMVK(device_->instance(), &ci, nullptr, &surface);
 #elif JUCE_WINDOWS
         // The child HWND must be created in the SAME DPI-awareness context
         // as the host window tree it is about to join: Windows does not
@@ -535,7 +550,7 @@ private:
         if (peer == nullptr) return;
         hwndGen_ = std::make_unique<jvk::core::windows::HWNDGenerator>();
         HWND childHwnd = hwndGen_->create(peer->getNativeHandle());
-        if (!childHwnd) return;
+        if (!childHwnd) { fallBack("the Vulkan window could not be created"); return; }
         metalView_.setHWND((void*)childHwnd);
         nativeWindow = (void*)childHwnd;
 
@@ -547,12 +562,11 @@ private:
         // created the HWND — i.e. the plugin DLL, not the host process
         // (GetModuleHandle(nullptr) would return the host .exe).
         ci.hinstance = jvk::core::windows::HWNDGenerator::moduleHInstance();
-        if (vkCreateWin32SurfaceKHR(device_->instance(), &ci, nullptr, &surface) != VK_SUCCESS)
-            return;
+        vkCreateWin32SurfaceKHR(device_->instance(), &ci, nullptr, &surface);
 #else
         VkSurfaceKHR surface = VK_NULL_HANDLE;
 #endif
-        if (surface == VK_NULL_HANDLE) return;
+        if (surface == VK_NULL_HANDLE) { fallBack("the Vulkan surface could not be created"); return; }
 
         // nativeWindow lets the target pin surface-size queries, acquire and
         // present to the window's own DPI-awareness context — every thread
@@ -747,7 +761,9 @@ private:
     // Render targets (setTargets): fixed while Vulkan runs.
     std::vector<Target> targets_;
     bool vulkanEnabled_ = true;
-    bool vulkanAvailable_ = false;
+    bool vulkanAvailable_ = true;   // until fallBack
+    juce::String unavailableReason_;
+    int swapchainFailures_ = 0;     // render ticks in a row with no swapchain at a real size
 };
 
 } // namespace jvk

@@ -87,6 +87,7 @@ ShaderImage::ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
     }
 
     displayImage = juce::Image(juce::Image::ARGB, w, h, true);
+    if (!device_->usable()) return;   // no Vulkan: never ready, the image stays blank
 
     reflectShader();
     createRenderTarget();
@@ -119,8 +120,8 @@ ShaderImage::~ShaderImage()
 {
     stopTimer();
 
+    if (!device_->usable()) return;
     VkDevice dev = device_->device();
-    if (!dev) return;
 
     vkWaitForFences(dev, 2, fence, VK_TRUE, UINT64_MAX);
     for (int i = 0; i < 2; i++)
@@ -236,8 +237,8 @@ void ShaderImage::createRenderTarget()
 
 void ShaderImage::destroyRenderTarget()
 {
+    if (!device_->usable()) return;
     VkDevice dev = device_->device();
-    if (!dev) return;
 
     for (int i = 0; i < 2; i++)
     {
@@ -341,8 +342,8 @@ void ShaderImage::createDescriptors()
 
 void ShaderImage::destroyDescriptors()
 {
+    if (!device_->usable()) return;
     VkDevice dev = device_->device();
-    if (!dev) return;
 
     for (auto& dsi : descriptorSets)
     {
@@ -371,8 +372,8 @@ void ShaderImage::destroyDescriptors()
 
 void ShaderImage::loadTexture(int binding, const juce::Image& image)
 {
+    if (!device_->usable()) return;
     VkDevice dev = device_->device();
-    if (!dev) return;
 
     TextureSlot* slot = nullptr;
     DescriptorSetInfo* ownerSet = nullptr;
@@ -620,8 +621,8 @@ void ShaderImage::createPipeline()
 
 void ShaderImage::destroyPipeline()
 {
+    if (!device_->usable()) return;
     VkDevice dev = device_->device();
-    if (!dev) return;
 
     if (graphicsPipeline) { vkDestroyPipeline(dev, graphicsPipeline, nullptr); graphicsPipeline = VK_NULL_HANDLE; }
     if (pipelineLayout)   { vkDestroyPipelineLayout(dev, pipelineLayout, nullptr); pipelineLayout = VK_NULL_HANDLE; }

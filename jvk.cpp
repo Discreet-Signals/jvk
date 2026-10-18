@@ -12,9 +12,10 @@
  ------------------------------------------------------------------------------
 */
 
-// Compile the vendored Vulkan Memory Allocator implementation into this (the
-// module's single) TU. Must precede jvk.h, which includes the VMA header.
+// Compile the vendored Vulkan Memory Allocator and volk implementations into
+// this (the module's single) TU. Must precede jvk.h, which includes both headers.
 #define VMA_IMPLEMENTATION
+#define VOLK_IMPLEMENTATION
 #include "jvk.h"
 
 // Core implementations

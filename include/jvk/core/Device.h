@@ -67,6 +67,12 @@ public:
     ResourceCaches& caches();
     void initCaches();
 
+    // Whether this Device came up, and why not when it didn't (no Vulkan, no
+    // driver, no GPU, ...). An unusable Device makes no Vulkan call; editors
+    // fall back to the JUCE renderer with this reason.
+    bool usable() const noexcept { return unavailableReason_.isEmpty(); }
+    const juce::String& unavailableReason() const noexcept { return unavailableReason_; }
+
     // Optional features enabled at device creation (when the GPU has them).
     // Per-attachment blend state; render targets need it.
     bool supportsIndependentBlend() const noexcept { return independentBlend_; }
@@ -106,6 +112,7 @@ public:
 
 private:
     Device();
+    void fail(const juce::String& reason) { unavailableReason_ = reason; diag::log(reason + ": JUCE renderer"); }
     bool createInstance();
     void setupDebugMessenger();
     bool selectPhysicalDevice();
@@ -134,6 +141,7 @@ private:
     Memory::M  bindings_;
 
     std::atomic<bool> lost_ { false };
+    juce::String unavailableReason_;
     bool independentBlend_ = false;
     bool textureCompressionBC_ = false;
 

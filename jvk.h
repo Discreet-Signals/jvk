@@ -48,7 +48,16 @@
 #include <juce_gui_extra/juce_gui_extra.h>
 #include <juce_audio_processors/juce_audio_processors.h>
 
+// Vulkan is LOADED at run time, never linked (Khronos's guidance, so a machine
+// without it still loads the binary): no prototypes, every vk* is a volk
+// function pointer that jvk::Device fills (vendored volk, the Vulkan SDK's
+// copy; the implementation is compiled once in jvk.cpp via VOLK_IMPLEMENTATION).
+// With VK_NO_PROTOTYPES, VMA fetches its functions through the two it is given.
+#ifndef VK_NO_PROTOTYPES
+ #define VK_NO_PROTOTYPES
+#endif
 #include <vulkan/vulkan.h>
+#include "include/jvk/vendor/volk.h"
 // Vulkan Memory Allocator (vendored, v3.1.0). Declarations only here — the
 // implementation is compiled once in jvk.cpp via VMA_IMPLEMENTATION.
 #include "include/jvk/vendor/vk_mem_alloc.h"

@@ -94,66 +94,47 @@ void configureMoltenVK(const PlatformProbe& p)
 }
 #endif
 
-#if JUCE_WINDOWS
-// The Vulkan loader on Windows.
-//
-// vulkan-1.dll is not part of Windows; GPU drivers install it into System32.
-// Every vk* import in this module is delay-loaded (/DELAYLOAD:vulkan-1.dll,
-// see CMakeLists.txt), so the plugin itself always loads, and nothing touches
-// the loader until this has found one:
-//   1. the system runtime in System32 — installed and updated by the driver,
-//      the copy every other Vulkan application on the machine uses;
-//   2. the copy jvk_bundle ships beside this module (LunarG's redistributable
-//      runtime), for machines whose driver never installed one.
-// Once a module named vulkan-1.dll is in the process, the delay-load helper's
-// own LoadLibrary("vulkan-1.dll") resolves to it (Windows returns an already
-// loaded module of that name without searching). If neither exists there is
-// no Vulkan on this machine at all; Device stays half-dead, no vk* call is
-// ever made, and the editor uses the JUCE renderer.
-HMODULE ensureVulkanLoader()
+// Loads Vulkan into volk's function pointers, once per process; empty when it
+// loaded, otherwise why not. Nothing links Vulkan (see jvk.h), so the binary
+// loads on any machine, and no vk* call is made unless this succeeded.
+//   Windows/Linux: the system loader the GPU driver installs (vulkan-1.dll,
+//                  libvulkan.so.1). We ship none: Khronos strongly discourages
+//                  a private copy, and a machine without it has no driver.
+//   macOS:         the MoltenVK the bundle carries in Contents/Frameworks (in
+//                  Debug the SDK loader beside it, so validation layers load).
+const juce::String& loadVulkan()
 {
-    static const HMODULE loader = []() -> HMODULE
+    static const juce::String error = []() -> juce::String
     {
-        if (HMODULE h = LoadLibraryExW(L"vulkan-1.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32))
-        {
-            diag::log("Vulkan loader: system (System32\\vulkan-1.dll)");
-            return h;
-        }
-
-        HMODULE self = nullptr;
-        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               reinterpret_cast<LPCWSTR>(&ensureVulkanLoader), &self))
-        {
-            wchar_t path[MAX_PATH] = {};
-            const DWORD n = GetModuleFileNameW(self, path, MAX_PATH);
-            if (n > 0 && n < MAX_PATH)
-            {
-                const juce::File beside = juce::File(juce::String(path)).getSiblingFile("vulkan-1.dll");
-                if (beside.existsAsFile())
-                {
-                    if (HMODULE h = LoadLibraryExW(beside.getFullPathName().toWideCharPointer(), nullptr,
-                                                   LOAD_WITH_ALTERED_SEARCH_PATH))
-                    {
-                        diag::log("Vulkan loader: bundled (" + beside.getFullPathName() + ")");
-                        return h;
-                    }
-                    diag::log("Vulkan loader: bundled copy present but failed to load (error "
-                              + juce::String((int) GetLastError()) + ")");
-                }
-            }
-        }
-        diag::log("Vulkan loader: none (no System32\\vulkan-1.dll, no bundled copy): JUCE renderer");
-        return nullptr;
-    }();
-    return loader;
-}
+#if JUCE_MAC
+        Dl_info info {};
+        if (dladdr((void*) &loadVulkan, &info) == 0 || info.dli_fname == nullptr)
+            return "Vulkan could not be located";
+       #if JUCE_DEBUG
+        const char* name = "libvulkan.1.dylib";
+       #else
+        const char* name = "libMoltenVK.dylib";
+       #endif
+        const auto lib = juce::File(info.dli_fname).getParentDirectory().getSiblingFile("Frameworks").getChildFile(name);
+        void* module = dlopen(lib.getFullPathName().toRawUTF8(), RTLD_NOW | RTLD_LOCAL);
+        auto* gipa = module != nullptr ? (PFN_vkGetInstanceProcAddr) dlsym(module, "vkGetInstanceProcAddr") : nullptr;
+        if (gipa == nullptr)
+            return juce::String("Vulkan failed to load (") + name + ")";
+        volkInitializeCustom(gipa);
+#else
+        if (volkInitialize() != VK_SUCCESS)
+            return "no Vulkan driver is installed";
 #endif
+        return {};
+    }();
+    return error;
+}
 
 } // namespace
 
 // =============================================================================
-// ICD discovery (MoltenVK on macOS) — Debug only: Release binds to the bundled
-// MoltenVK directly and ships no loader or manifest (see CMakeLists.txt).
+// ICD discovery (MoltenVK on macOS) — Debug only: Release loads the bundled
+// MoltenVK directly and ships no loader or manifest (see loadVulkan).
 // =============================================================================
 
 static inline void ensureICDDiscoverable()
@@ -222,33 +203,38 @@ Device::Device()
     const auto& platform = platformProbe();
     diag::log("---- jvk bring-up: " + platform.summary);
 
-#if JUCE_WINDOWS
-    if (ensureVulkanLoader() == nullptr) return;   // no vk* call may follow
-#endif
 #if JUCE_MAC
     configureMoltenVK(platform);                   // before the first vk* call
 #endif
 
-    if (!createInstance()) { diag::log("vkCreateInstance failed: JUCE renderer"); return; }
+    // Each step that fails leaves the Device unusable with its reason; no vk*
+    // call follows, and every editor falls back to the JUCE renderer.
+    if (const auto& error = loadVulkan(); error.isNotEmpty()) { fail(error); return; }
+    if (!createInstance()) { fail("the graphics driver doesn't support Vulkan"); return; }
     diag::log("instance created");
     setupDebugMessenger();
-    if (!selectPhysicalDevice()) { diag::log("no GPU with a graphics queue and swapchain support: JUCE renderer"); return; }
-    if (!createLogicalDevice()) { diag::log("vkCreateDevice failed: JUCE renderer"); return; }
+    if (!selectPhysicalDevice()) { fail("no graphics card with Vulkan support was found"); return; }
+    if (!createLogicalDevice()) { fail("the Vulkan device could not be created"); return; }
     diag::log("logical device created");
-    if (!createCommandPool()) { diag::log("vkCreateCommandPool failed: JUCE renderer"); return; }
+    if (!createCommandPool()) { fail("the Vulkan command pool could not be created"); return; }
 
     // VMA allocator — created before the memory tiers that view it. API
     // version matches the instance (created for Vulkan 1.0 above), so VMA
-    // sticks to core-1.0 entry points.
+    // sticks to core-1.0 entry points, fetched through the two volk loaded.
     {
+        VmaVulkanFunctions functions {};
+        functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+        functions.vkGetDeviceProcAddr   = vkGetDeviceProcAddr;
         VmaAllocatorCreateInfo aci {};
         aci.instance         = instance_;
         aci.physicalDevice   = physDevice_;
         aci.device           = device_;
         aci.vulkanApiVersion = VK_API_VERSION_1_0;
+        aci.pVulkanFunctions = &functions;
         if (vmaCreateAllocator(&aci, &allocator_) != VK_SUCCESS) {
             allocator_ = nullptr;
-            return;   // half-dead Device; editors probe device()/pool() results
+            fail("Vulkan memory could not be set up");
+            return;
         }
     }
 
@@ -475,7 +461,9 @@ bool Device::createInstance()
     }
 #endif
 
-    return vkCreateInstance(&ci, nullptr, &instance_) == VK_SUCCESS;
+    if (vkCreateInstance(&ci, nullptr, &instance_) != VK_SUCCESS) return false;
+    volkLoadInstance(instance_);   // every instance and device function, dispatched per handle
+    return true;
 }
 
 // =============================================================================
