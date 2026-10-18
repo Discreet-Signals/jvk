@@ -535,7 +535,11 @@ Per Gavin: full compliance is a goal, not a triage list. Split by dependency:
   (`:70` is an empty body today — silently draws unmasked content).
 - Tiled-image fills (`FillType::isTiledImage()` — currently renders flat colour; host code
   already works around it, `LookAndFeel.h:806`): REPEAT sampler + transform math in the
-  color pipeline.
+  color pipeline. DONE 2026-10-18: colour mode 3 (ui2d.frag, path_sdf.frag) — the texture
+  resolved at Graphics::captureFill, the UV per vertex (ColorDraw makeFillCtx) — on every
+  colour-pipeline draw, text and paths; fract() wrap, so the CLAMP seam remains. Fills on
+  text and paths are placed by the paint's transform, as juce's (compliance scene "Fills on
+  text, paths, shapes").
 
 **Unlocked by Phase 6 (offscreen layer images):**
 - TRUE `beginTransparencyLayer`/`endTransparencyLayer`: redirect recording into a layer
