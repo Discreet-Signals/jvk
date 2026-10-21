@@ -34,6 +34,16 @@
 // list. The descent term's crossings happen at x = p.x ∈ tile — local
 // again. Nothing non-local can contribute, so the sum is exact.
 //
+// The split between the first two terms is the CPU's, made ONCE: it
+// computes where each segment crosses y = T, counts the crossing into the
+// backdrop of every tile left of it, and hands it to the tile it lands in
+// as an OWNER — the first `owners` (fragTile.w) entries of that tile's
+// list. Only owners take part in the top term. Nothing here recomputes
+// that crossing, so no rounding can count it in both terms or in neither:
+// recomputing it as `xc <= R` relied on this GPU's OpFDiv rounding exactly
+// like the CPU's division, which Vulkan does not require (2.5 ULP), and a
+// crossing on a tile edge then inverted the whole tile.
+//
 // AA is derivative-free: fragPos is in physical pixels and a distance
 // field is 1-Lipschitz, so the edge band is exactly 1px wide — no
 // fwidth(). (fwidth across tile/strip boundaries mixes distances from
@@ -45,7 +55,7 @@ layout(push_constant) uniform PC {
     uint  segmentCount;   // unused in tile mode
     uint  fillRule;       // 0 = non-zero, 1 = even-odd
     uint  _r0;
-    float tileW;     // tile width in physical px (16, coarsened for huge paths)
+    float tileW;     // tile width in physical px (unread: ownership comes from the CPU)
     float _r2;
 } pc;
 
@@ -58,7 +68,7 @@ layout(std430, set = 1, binding = 0) readonly buffer Segments {
 layout(location = 0) in vec2 fragPos;
 layout(location = 1) in vec4 fragColor;
 layout(location = 2) in vec4 fragGradientInfo;
-layout(location = 3) flat in vec4 fragTile;        // x=localStart y=count z=backdrop
+layout(location = 3) flat in vec4 fragTile;        // x=localStart y=count z=backdrop w=owners
 layout(location = 4) flat in vec2 fragTileOrigin;  // tile top-left (px)
 
 layout(location = 0) out vec4 outColor;
@@ -135,8 +145,8 @@ void main()
     uint  base    = pc.segmentStart + uint(fragTile.x);
     uint  count   = uint(fragTile.y);
     int   winding = int(fragTile.z);      // backdrop at (tileRight, tileTop)
-    float tileTop   = fragTileOrigin.y;
-    float tileRight = fragTileOrigin.x + pc.tileW;
+    uint  owners  = uint(fragTile.w);     // list entries that cross the tile top here
+    float tileTop = fragTileOrigin.y;
 
     float alpha;
     if (count == 0u)
@@ -173,27 +183,23 @@ void main()
             //
             // so its sign answers BOTH questions consistently, and the zero
             // (segment through the corner) is settled once, below. `precise`
-            // is load-bearing twice over: it keeps xc bit-identical to the
-            // CPU tiler AND keeps that zero exact (an FMA would round it off
-            // the corner and the tie-break would never fire).
+            // keeps that zero exact: an FMA would round it off the corner
+            // and the tie-break would never fire. Whatever this GPU's
+            // rounding, both terms read the one value, so a crossing near
+            // the corner is still claimed exactly once.
             precise float cornerSide = (b.x - a.x) * (tileTop    - a.y)
                                      - (b.y - a.y) * (fragPos.x  - a.x);
 
             // Top term — crossing of y = tileTop at x in (p.x, tileRight].
-            // `precise` (no FMA contraction) keeps xc BIT-IDENTICAL to the
-            // CPU tiler's statement-split evaluation: tile boundaries are
-            // exact integer floats (power-of-2 tileW), so matching xc makes
-            // the B-vs-local split exact — no double count / drop when a
-            // crossing lands on a tile edge.
-            bool aAboveT = a.y > tileTop;
-            bool bAboveT = b.y > tileTop;
-            if (aAboveT != bAboveT)
+            // The owners (the first `owners` entries) are exactly the
+            // segments crossing the top inside this tile, as the CPU binned
+            // them against the backdrop; all that is left to ask is whether
+            // the crossing is right of p.x.
+            if (i < owners)
             {
-                precise float t  = (tileTop - a.y) / (b.y - a.y);
-                precise float dx = t * (b.x - a.x);
-                precise float xc = a.x + dx;
+                bool bAboveT = b.y > tileTop;
                 // xc > p.x, strict (sign(b.y-a.y) = bAboveT ? + : -).
-                if ((bAboveT ? cornerSide : -cornerSide) > 0.0 && xc <= tileRight)
+                if ((bAboveT ? cornerSide : -cornerSide) > 0.0)
                     winding += bAboveT ? 1 : -1;
             }
 

@@ -10,6 +10,8 @@
 //   inShapeInfo.x  = local segment start (relative to pc.segmentStart)
 //   inShapeInfo.y  = local segment count (0 = interior/exterior tile)
 //   inShapeInfo.z  = backdrop winding at (tileRight, tileTop)
+//   inShapeInfo.w  = owners: the leading list entries whose crossing of the
+//                    tile top lies in this tile (decided on the CPU)
 // All 6 vertices of a tile quad carry identical uv/shapeInfo, so `flat`
 // interpolation is exact.
 

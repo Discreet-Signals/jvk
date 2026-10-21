@@ -222,7 +222,7 @@ public:
     // (TILE mode — see path_sdf.frag): 6 vertices per emitted tile/run,
     // per-vertex color + gradientInfo populated exactly like the 2D color
     // pipeline, uv = tile origin, shapeInfo = (localStart, localCount,
-    // backdrop, 0). `colorDesc` is the shared color-source descriptor
+    // backdrop, owners). `colorDesc` is the shared color-source descriptor
     // (`ResourceCaches::gradientDescriptor()` or `defaultDescriptor()`) —
     // path_sdf.frag samples it iff gradientInfo.z > 0. `segmentStart` is
     // the base of the path's tile-local segment data in the SSBO.
