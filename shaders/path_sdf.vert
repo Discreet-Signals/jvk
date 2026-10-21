@@ -7,8 +7,9 @@
 // constant winding ("backdrop") and no segments, and edge tiles carry a
 // small local segment list. Per-tile data rides the UIVertex attributes:
 //   inUV           = tile top-left corner in physical pixels (flat)
-//   inShapeInfo.x  = local segment start (relative to pc.segmentStart)
-//   inShapeInfo.y  = local segment count (0 = interior/exterior tile)
+//   inShapeInfo.x  = first list entry (relative to pc.segmentStart; an entry
+//                    is two vec4s: the segment, then its xc at the tile top)
+//   inShapeInfo.y  = list entry count (0 = interior/exterior tile)
 //   inShapeInfo.z  = backdrop winding at (tileRight, tileTop)
 //   inShapeInfo.w  = owners: the leading list entries whose crossing of the
 //                    tile top lies in this tile (decided on the CPU)

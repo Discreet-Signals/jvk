@@ -19,14 +19,6 @@
 //        + [crossings of y = T with x in (p.x, R]]     … "top" term
 //        + [crossings of x = p.x with y in (T, p.y]]   … "descent" term
 //
-// The two intervals meet at the corner (p.x, T), and a crossing landing on
-// it must be claimed EXACTLY once. Both terms therefore decide their shared
-// boundary from ONE quantity — `cornerSide`, the corner's signed area against
-// the segment — with the through-the-corner case (cornerSide == 0) settled by
-// the segment's own direction. Two independent divisions instead answered
-// "no" twice and punched a 1px hole from the crossing to the tile's bottom
-// edge, once per tile column any shallow edge spans (see the loop).
-//
 // The backdrop is the ray at the tile's top-RIGHT corner — every segment
 // it counts crosses y = T strictly right of R, i.e. outside the tile, and
 // is summed on the CPU. The top term's crossings happen at y = T with
@@ -34,15 +26,29 @@
 // list. The descent term's crossings happen at x = p.x ∈ tile — local
 // again. Nothing non-local can contribute, so the sum is exact.
 //
-// The split between the first two terms is the CPU's, made ONCE: it
-// computes where each segment crosses y = T, counts the crossing into the
-// backdrop of every tile left of it, and hands it to the tile it lands in
-// as an OWNER — the first `owners` (fragTile.w) entries of that tile's
-// list. Only owners take part in the top term. Nothing here recomputes
-// that crossing, so no rounding can count it in both terms or in neither:
-// recomputing it as `xc <= R` relied on this GPU's OpFDiv rounding exactly
-// like the CPU's division, which Vulkan does not require (2.5 ULP), and a
-// crossing on a tile edge then inverted the whole tile.
+// EVERY boundary between the terms is decided from ONE number the CPU
+// computed: xc, where the segment crosses y = T. The CPU uses it to count
+// the crossing into the backdrop of every tile left of it and to hand it
+// to the tile it lands in as an OWNER (the first `owners` = fragTile.w
+// entries of that tile's list — only owners take part in the top term),
+// and it rides with every list entry of a segment that crosses this
+// tile's top (each entry is two vec4s: the segment, then (xc, 0, 0, 0)).
+// Here the one comparison `xc > p.x` then answers both halves of the
+// corner (p.x, T): the top term's "is the crossing right of the
+// fragment?" and the descent term's "does the segment meet x = p.x below
+// T?". A crossing near — or exactly on — the corner is therefore claimed
+// exactly once, by construction, whatever this GPU's arithmetic does.
+//
+// History, because each step was a real failure: two independent
+// divisions answered "no" twice at the corner and punched 1px holes down
+// to the tile bottom; a shared `precise` cross product (`cornerSide`) fixed
+// that on NVIDIA, but the descent gate built on it — `(bRight ? -cs : cs) >
+// 0` — evaluated true for segments meeting x = p.x ABOVE the tile on an
+// Intel HD 530 (Gen9, Windows), dripping fill from every glyph to its tile's
+// bottom edge; and re-deriving ownership as `xc <= R` on the GPU relied on
+// OpFDiv rounding like the CPU's, which Vulkan does not require (2.5 ULP).
+// What is left here is comparisons of stored values plus one per-fragment
+// division (the descent crossing's height) that no other term depends on.
 //
 // AA is derivative-free: fragPos is in physical pixels and a distance
 // field is 1-Lipschitz, so the edge band is exactly 1px wide — no
@@ -142,7 +148,7 @@ void writeTargets(vec4 colour)
 
 void main()
 {
-    uint  base    = pc.segmentStart + uint(fragTile.x);
+    uint  base    = pc.segmentStart + 2u * uint(fragTile.x);   // two vec4s per entry
     uint  count   = uint(fragTile.y);
     int   winding = int(fragTile.z);      // backdrop at (tileRight, tileTop)
     uint  owners  = uint(fragTile.w);     // list entries that cross the tile top here
@@ -161,47 +167,27 @@ void main()
         float minDist = 1e20;
         for (uint i = 0u; i < count; ++i)
         {
-            vec4 seg = segments.data[base + i];
+            vec4  seg = segments.data[base + 2u * i];
+            float xc  = segments.data[base + 2u * i + 1u].x;   // where it crosses y = tileTop (if it does)
             vec2 a = seg.xy;
             vec2 b = seg.zw;
 
             minDist = min(minDist, sdSegment(fragPos, a, b));
 
-            // The top and descent terms meet at the CORNER (p.x, tileTop).
-            // Decide both sides of that junction from ONE quantity — the
-            // corner's signed area against the segment — so a crossing that
-            // lands exactly on it is claimed exactly once. Asking each term
-            // its own division instead (xc > p.x  /  yc > tileTop) lets
-            // rounding answer "no" twice: the crossing is dropped, winding
-            // goes to 0, and the fill shows a 1px hole running from the
-            // crossing down to the tile's bottom edge. It is not a corner
-            // case — every shallow edge crosses a tile top once per tile
-            // column it spans.
-            //
-            //   cornerSide = (b-a) × (corner-a)
-            //              = (b.y-a.y)·(xc - p.x)  =  (b.x-a.x)·(tileTop - yc)
-            //
-            // so its sign answers BOTH questions consistently, and the zero
-            // (segment through the corner) is settled once, below. `precise`
-            // keeps that zero exact: an FMA would round it off the corner
-            // and the tie-break would never fire. Whatever this GPU's
-            // rounding, both terms read the one value, so a crossing near
-            // the corner is still claimed exactly once.
-            precise float cornerSide = (b.x - a.x) * (tileTop    - a.y)
-                                     - (b.y - a.y) * (fragPos.x  - a.x);
+            // Which ends lie past (below) the tile top — the CPU's own
+            // half-open test against the same floats, so "crosses the top"
+            // here is exactly the set it computed xc for.
+            bool aPastT = a.y > tileTop;
+            bool bPastT = b.y > tileTop;
+            // The ONE corner decision (see the header): the crossing of the
+            // tile top lies strictly right of this fragment.
+            bool xcRight = xc > fragPos.x;
 
             // Top term — crossing of y = tileTop at x in (p.x, tileRight].
-            // The owners (the first `owners` entries) are exactly the
-            // segments crossing the top inside this tile, as the CPU binned
-            // them against the backdrop; all that is left to ask is whether
-            // the crossing is right of p.x.
-            if (i < owners)
-            {
-                bool bAboveT = b.y > tileTop;
-                // xc > p.x, strict (sign(b.y-a.y) = bAboveT ? + : -).
-                if ((bAboveT ? cornerSide : -cornerSide) > 0.0)
-                    winding += bAboveT ? 1 : -1;
-            }
+            // The owners are exactly the segments crossing the top inside
+            // this tile, as the CPU binned them against the backdrop.
+            if (i < owners && xcRight)
+                winding += bPastT ? 1 : -1;
 
             // Descent term — crossing of x = p.x at y in (tileTop, p.y].
             // Sign from continuity of W along the downward walk: passing
@@ -211,23 +197,27 @@ void main()
             bool bRight = b.x > fragPos.x;
             if (aRight != bRight)
             {
-                float t  = (fragPos.x - a.x) / (b.x - a.x);
-                float yc = a.y + t * (b.y - a.y);
-                // yc > tileTop, from the same quantity as the top term. When
-                // the segment passes exactly THROUGH the corner (cornerSide
-                // == 0 — routine, not exotic: integer-ish art on a 16px grid
-                // makes both products exact) neither half-open test claims
-                // it, so decide it the way the fragment's own ray would: the
-                // fragment is below the corner, so the crossing counts iff it
-                // moves RIGHT as y grows, i.e. the segment descends rightward.
-                // A FLAT segment lying on the tile top is not one of these: it
-                // crosses nothing in (tileTop, p.y], and the corner's winding
-                // already counts the side below it. Read as a tie, a right-to-
-                // left one added -1 to every fragment of the tile row under it.
-                float below = bRight ? -cornerSide : cornerSide;
-                bool  onCorner = cornerSide == 0.0 && b.y != a.y && ((b.x > a.x) == (b.y > a.y));
-                if ((below > 0.0 || onCorner) && yc <= fragPos.y)
-                    winding += bRight ? 1 : -1;
+                // Is that crossing below the tile top? A segment that does
+                // not cross the top line answers by its ends: wholly past it,
+                // or wholly on/above it (a flat segment lying ON the top is
+                // the latter — it crosses nothing in (tileTop, p.y]). One that
+                // crosses it meets x = p.x below the top iff p.x lies between
+                // xc and its past-the-top end, i.e. iff that end and the
+                // crossing sit on opposite sides of p.x (`(bPastT == bRight)`
+                // is the end's side, as the segment straddles p.x). Through
+                // the corner exactly (xc == p.x) that counts the segments
+                // whose past-the-top end is right of p.x — the ones whose
+                // crossing moves right as y grows, which the top term then
+                // leaves alone (its test is strict): claimed exactly once.
+                bool belowTop = (aPastT == bPastT) ? aPastT
+                                                   : ((bPastT == bRight) != xcRight);
+                if (belowTop)
+                {
+                    float t  = (fragPos.x - a.x) / (b.x - a.x);
+                    float yc = a.y + t * (b.y - a.y);
+                    if (yc <= fragPos.y)
+                        winding += bRight ? 1 : -1;
+                }
             }
         }
 
