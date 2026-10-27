@@ -644,10 +644,14 @@ public:
         // touches (winding needs only true overlap; pad keeps the SDF exact
         // through the AA band). Its crossings of each row's top line are
         // binned by x-column so pass 2 can turn them into per-tile backdrop
-        // windings by suffix-summing right-to-left.
+        // windings by suffix-summing right-to-left, and each one is OWNED by
+        // the tile whose top edge it lands on.
         scratchTileCounts_.assign((size_t) nTiles, 0u);
+        scratchTileOwners_.assign((size_t) nTiles, 0u);
         scratchTileWind_.assign((size_t) nTiles, 0);
         scratchRowOverflow_.assign((size_t) ny, 0);
+        scratchOwners_.clear();
+        scratchCrossings_.clear();
 
         const float gridRight  = gx0 + (float) nx * tileW;
         const float gridBottom = gy0 + (float) ny * tileW;
@@ -659,19 +663,32 @@ public:
             return std::pair<int, int> { i0, i1 };
         };
 
-        for (auto& seg : scratchSegments_) {
+        // The tiles whose local list a segment joins (pad-expanded bbox ∩
+        // grid), or false for none. Passes 1 and 3 both ask HERE, so they
+        // cannot disagree about a single tile.
+        struct TileSpan { int x0, x1, y0, y1; };
+        auto localTiles = [&](const glm::vec4& seg, TileSpan& span) {
             const float xLo = std::min(seg.x, seg.z), xHi = std::max(seg.x, seg.z);
             const float yLo = std::min(seg.y, seg.w), yHi = std::max(seg.y, seg.w);
+            if (!(xHi + pad >= gx0 && xLo - pad < gridRight
+               && yHi + pad >= gy0 && yLo - pad < gridBottom))
+                return false;
+            const auto [x0, x1] = tileRange(xLo - pad, xHi + pad, nx, gx0);
+            const auto [y0, y1] = tileRange(yLo - pad, yHi + pad, ny, gy0);
+            span = { x0, x1, y0, y1 };
+            return true;
+        };
 
-            // Local lists (pad-expanded bbox ∩ grid).
-            if (xHi + pad >= gx0 && xLo - pad < gridRight
-             && yHi + pad >= gy0 && yLo - pad < gridBottom) {
-                auto [tx0, tx1] = tileRange(xLo - pad, xHi + pad, nx, gx0);
-                auto [ty0, ty1] = tileRange(yLo - pad, yHi + pad, ny, gy0);
-                for (int ty = ty0; ty <= ty1; ty++)
-                    for (int tx = tx0; tx <= tx1; tx++)
+        for (uint32_t si = 0; si < (uint32_t) scratchSegments_.size(); ++si) {
+            const auto& seg = scratchSegments_[si];
+            const float yLo = std::min(seg.y, seg.w), yHi = std::max(seg.y, seg.w);
+
+            // Local lists.
+            TileSpan span { 0, -1, 0, -1 };
+            if (localTiles(seg, span))
+                for (int ty = span.y0; ty <= span.y1; ty++)
+                    for (int tx = span.x0; tx <= span.x1; tx++)
                         scratchTileCounts_[(size_t)(ty * nx + tx)]++;
-            }
 
             // Row-top crossings. Half-open in y (a.y > T) != (b.y > T),
             // matching the shader's ray convention exactly.
@@ -681,23 +698,48 @@ public:
                 const float T = gy0 + (float) r * tileW;
                 const bool aAbove = seg.y > T, bAbove = seg.w > T;
                 if (aAbove == bAbove) continue;
-                // Statement-split so clang can't contract to FMA — must
-                // stay bit-identical to the shader's `precise` evaluation
-                // (see path_sdf.frag's top term) or a crossing exactly on a
-                // tile edge could be counted in both B and the local term.
+                // Only this side computes xc: wherever rounding puts a
+                // crossing on a tile edge, it is in exactly one of B and its
+                // owner's list, and the shader adds it from the list. The
+                // shader never re-derives it either — every list entry of
+                // this segment in row r carries this xc (pass 3), and both
+                // halves of path_sdf.frag's corner split compare against it.
                 const float tt = (T - seg.y) / (seg.w - seg.y);
                 const float dx = tt * (seg.z - seg.x);
                 const float xc = seg.x + dx;
                 const int sign = bAbove ? 1 : -1;
+                scratchCrossings_.push_back({ si, r, xc });
                 if (xc <= gx0) continue;   // left of every tile's ray origin
-                // Column bucket, half-open (colLeft, colRight] — pairs with
-                // the shader's `xc <= tileRight` so B excludes exactly the
-                // crossings the local top-term adds.
+                // Column bucket, half-open (colLeft, colRight].
                 const float fc = std::ceil((xc - gx0) * invTileW) - 1.0f;
-                if (fc >= (float) nx)
+                if (fc >= (float) nx) {
                     scratchRowOverflow_[(size_t) r] += sign; // right of grid
-                else
-                    scratchTileWind_[(size_t)(r * nx + std::max(0, (int) fc))] += sign;
+                    continue;
+                }
+                // On tile (r, c)'s top edge: every tile left of it counts the
+                // crossing in its backdrop (pass 2), and tile (r, c) OWNS it —
+                // its fragments add it wherever it lies right of them. Which
+                // tile owns a crossing is decided HERE, once, and travels to
+                // the shader with the tile (owners first in its list, their
+                // count in shapeInfo.w). The shader used to re-derive it as
+                // `xc <= tileRight` from its own division, which matched this
+                // one only where the GPU rounds OpFDiv exactly like the CPU —
+                // Vulkan allows 2.5 ULP, and drivers that use it counted a
+                // crossing on a tile edge twice or not at all, inverting the
+                // whole tile.
+                const int c = std::max(0, (int) fc);
+                const size_t tile = (size_t)(r * nx + c);
+                scratchTileWind_[tile] += sign;
+                scratchTileOwners_[tile]++;
+                scratchOwners_.push_back({ si, (uint32_t) tile, xc });
+                // The crossing is a point of the segment, so its tile is one
+                // of the segment's own local tiles; were rounding ever to say
+                // otherwise, the owner still joins the tile's list, and the
+                // list size has to say so.
+                if (r < span.y0 || r > span.y1 || c < span.x0 || c > span.x1) {
+                    jassertfalse;
+                    scratchTileCounts_[tile]++;
+                }
             }
         }
 
@@ -713,29 +755,61 @@ public:
             }
         }
 
-        // --- Pass 3: place segments tile-major. Offsets are an exclusive
-        // prefix over counts and double as write cursors; the emission loop
-        // recovers each tile's start as cursor − count.
+        // --- Pass 3: place segments tile-major, each tile's OWNERS first:
+        // the shader applies the top term to exactly the first `owners`
+        // entries of a tile's list. Two write cursors per tile — owners from
+        // the tile's start, the rest from start + owners — so the rest
+        // cursor ends at start + count and the emission loop recovers each
+        // tile's start as cursor − count.
+        //
+        // An entry is TWO vec4s: the segment, then (xc, 0, 0, 0) — where it
+        // crosses its tile's top line, from pass 1, when it does (0
+        // otherwise: the shader reads xc only for a segment that crosses).
         scratchTileOffsets_.resize((size_t) nTiles);
+        scratchOwnerCursor_.resize((size_t) nTiles);
         uint32_t total = 0;
         for (int i = 0; i < nTiles; i++) {
-            scratchTileOffsets_[(size_t) i] = total;
+            scratchOwnerCursor_[(size_t) i] = total;
+            scratchTileOffsets_[(size_t) i] = total + scratchTileOwners_[(size_t) i];
             total += scratchTileCounts_[(size_t) i];
         }
-        scratchBinned_.resize(total);
-        for (auto& seg : scratchSegments_) {
-            const float xLo = std::min(seg.x, seg.z), xHi = std::max(seg.x, seg.z);
-            const float yLo = std::min(seg.y, seg.w), yHi = std::max(seg.y, seg.w);
-            if (xHi + pad < gx0 || xLo - pad >= gridRight
-             || yHi + pad < gy0 || yLo - pad >= gridBottom) continue;
-            auto [tx0, tx1] = tileRange(xLo - pad, xHi + pad, nx, gx0);
-            auto [ty0, ty1] = tileRange(yLo - pad, yHi + pad, ny, gy0);
-            for (int ty = ty0; ty <= ty1; ty++)
-                for (int tx = tx0; tx <= tx1; tx++)
-                    scratchBinned_[scratchTileOffsets_[(size_t)(ty * nx + tx)]++] = seg;
+        scratchBinned_.resize((size_t) total * 2);
+        auto place = [&](uint32_t entry, const glm::vec4& seg, float xc) {
+            scratchBinned_[(size_t) entry * 2]     = seg;
+            scratchBinned_[(size_t) entry * 2 + 1] = { xc, 0.0f, 0.0f, 0.0f };
+        };
+        for (const auto& o : scratchOwners_)
+            place(scratchOwnerCursor_[o.tile]++, scratchSegments_[o.segment], o.xc);
+
+        // Then every local (segment, tile) pair that is not one of those.
+        // Pass 1 recorded owners and crossings segment by segment, rows
+        // ascending, so a segment's owners — and its crossings — are each one
+        // run in the same ascending order this loop visits its tiles in:
+        // sorted merges over the runs skip the owners and find each row's xc.
+        size_t ownersEnd = 0, crossingsEnd = 0;
+        for (uint32_t si = 0; si < (uint32_t) scratchSegments_.size(); ++si) {
+            size_t next = ownersEnd;
+            while (ownersEnd < scratchOwners_.size() && scratchOwners_[ownersEnd].segment == si)
+                ++ownersEnd;
+            size_t crossing = crossingsEnd;
+            while (crossingsEnd < scratchCrossings_.size() && scratchCrossings_[crossingsEnd].segment == si)
+                ++crossingsEnd;
+            TileSpan span;
+            if (!localTiles(scratchSegments_[si], span)) continue;
+            for (int ty = span.y0; ty <= span.y1; ty++) {
+                while (crossing < crossingsEnd && scratchCrossings_[crossing].row < ty) ++crossing;
+                const float xc = (crossing < crossingsEnd && scratchCrossings_[crossing].row == ty)
+                               ? scratchCrossings_[crossing].xc : 0.0f;
+                for (int tx = span.x0; tx <= span.x1; tx++) {
+                    const size_t idx = (size_t)(ty * nx + tx);
+                    while (next < ownersEnd && scratchOwners_[next].tile < idx) ++next;
+                    if (next < ownersEnd && scratchOwners_[next].tile == idx) continue;   // placed above
+                    place(scratchTileOffsets_[idx]++, scratchSegments_[si], xc);
+                }
+            }
         }
         const uint32_t segStart =
-            (total > 0) ? pp->uploadSegments(scratchBinned_.data(), total) : 0u;
+            (total > 0) ? pp->uploadSegments(scratchBinned_.data(), total * 2) : 0u;
 
         // Register the gradient row up-front so the atlas upload happens in
         // this frame's staging pass. makeGradientCtx below also registers
@@ -766,10 +840,11 @@ public:
         scratchTileVerts_.clear();
 
         auto emitQuad = [&](float x, float y, float w,
-                            uint32_t localStart, uint32_t localCount, int backdrop) {
+                            uint32_t localStart, uint32_t localCount, int backdrop,
+                            uint32_t owners) {
             const glm::vec2 uv { x, y };
             const glm::vec4 shape { (float) localStart, (float) localCount,
-                                    (float) backdrop, 0.0f };
+                                    (float) backdrop, (float) owners };
             const float x2 = x + w, y2 = y + tileW;
             UIVertex v0 { { x,  y  }, color, uv, shape, gi(x,  y ) };
             UIVertex v1 { { x2, y  }, color, uv, shape, gi(x2, y ) };
@@ -790,7 +865,7 @@ public:
             auto flushRun = [&](int cEnd) {
                 if (runStart < 0) return;
                 emitQuad(gx0 + (float) runStart * tileW, ty,
-                         (float)(cEnd - runStart) * tileW, 0u, 0u, runB);
+                         (float)(cEnd - runStart) * tileW, 0u, 0u, runB, 0u);
                 runStart = -1;
             };
             for (int c = 0; c < nx; c++) {
@@ -808,7 +883,8 @@ public:
                 } else {
                     flushRun(c);
                     emitQuad(gx0 + (float) c * tileW, ty, tileW,
-                             scratchTileOffsets_[idx] - cnt, cnt, B);
+                             scratchTileOffsets_[idx] - cnt, cnt, B,
+                             scratchTileOwners_[idx]);
                 }
             }
             flushRun(nx);
@@ -1842,6 +1918,12 @@ private:
     static constexpr float kPathTileSize = 16.0f;
     std::vector<uint32_t>  scratchTileCounts_;
     std::vector<uint32_t>  scratchTileOffsets_;
+    std::vector<uint32_t>  scratchTileOwners_;    // per tile: crossings of its top edge it owns
+    std::vector<uint32_t>  scratchOwnerCursor_;
+    struct TileOwner { uint32_t segment, tile; float xc; };
+    std::vector<TileOwner> scratchOwners_;        // segment order, rows ascending within one
+    struct RowCrossing { uint32_t segment; int row; float xc; };
+    std::vector<RowCrossing> scratchCrossings_;   // every row-top crossing, same order
     std::vector<int32_t>   scratchTileWind_;
     std::vector<int32_t>   scratchRowOverflow_;
     std::vector<UIVertex>  scratchTileVerts_;

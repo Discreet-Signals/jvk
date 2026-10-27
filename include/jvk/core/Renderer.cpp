@@ -1584,8 +1584,14 @@ void Renderer::execute()
     barriers[1].image = frame.swapImage;
     barriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
 
+    // TRANSFER in the source stages chains the swap image's layout
+    // transition after the acquire semaphore, which endFrame waits on at
+    // TRANSFER. Without it the transition (a write) is ordered after
+    // nothing the presentation engine signals and can land while the image
+    // is still being read for the previous present (SYNC-HAZARD-WRITE-AFTER-READ).
     vkCmdPipelineBarrier(frame.cmd,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+            | VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, nullptr, 0, nullptr, 2, barriers);
 
@@ -1724,6 +1730,17 @@ void State::setCustomPipeline(VkPipeline pipeline, VkPipelineLayout layout)
     if (pipeline != boundPipeline_) {
         vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         boundPipeline_ = pipeline;
+    }
+    // Same rule as setPipeline: sets bound under another layout are not
+    // valid for this one (their push-constant ranges differ, so the layouts
+    // are not compatible for set 0). Without forgetting them, a caller's
+    // setColorResource with the set the last colour draw used is skipped,
+    // and the draw reads set 0 bound under an incompatible layout
+    // (VUID-vkCmdDraw-None-08600) — undefined, and only NVIDIA happens to
+    // keep the old binding.
+    if (layout != boundLayout_) {
+        boundColorSet_ = VK_NULL_HANDLE;
+        boundShapeSet_ = VK_NULL_HANDLE;
         boundLayout_ = layout;
     }
     if (stencilDepth_ > 0)
