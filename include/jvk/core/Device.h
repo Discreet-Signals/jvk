@@ -19,11 +19,12 @@ class ResourceCaches;  // forward — defined in Cache.h
 //         instance(), physicalDevice(), device(), graphicsQueue(),
 //         graphicsFamily(), presentQueue(), presentFamily(), commandPool()
 //         (commandPool is only used by submitImmediate; per-render command
-//         pools live on RenderTarget), time().
+//         pools live on RenderTarget), time(), apiVersion(), computeQueue(),
+//         computeFamily(), computeQueueShared().
 //
 //   (b) Internally synchronized — safe to call from any thread, including
 //       concurrently from multiple editors' workers:
-//         pool() (Memory::L1), bindings() (Memory::M).
+//         pool() (Memory::L1), bindings() (Memory::M), computeQueueLock().
 //
 //   (c) Message-thread only — caller must not invoke from a render worker.
 //       Safe across editors because JUCE's message thread is single-threaded:
@@ -45,6 +46,23 @@ public:
     VkQueue          presentQueue()   const { return presentQueue_; }
     uint32_t         presentFamily()  const { return presentFamily_; }
     VkCommandPool    commandPool()    const { return commandPool_; }
+
+    // The Vulkan version in use: the lower of the instance's (1.2 where the
+    // loader has 1.1 or later, else 1.0) and the GPU's. Rendering uses 1.0's
+    // calls whatever it is; compute reads subgroup properties from 1.1.
+    uint32_t apiVersion() const { return apiVersion_; }
+
+    // The queue compute work (jvk::compute) is submitted to: a compute family
+    // without graphics where the GPU has one (async compute: NVIDIA's and
+    // AMD's run it beside the editors' frames), else another family with
+    // compute (MoltenVK's), else a second queue of the graphics family, else
+    // the graphics queue itself (computeQueueShared()). Null when
+    // the GPU has no compute at all. Submit to it only under
+    // computeQueueLock(), which is Renderer::queueLock() when the queue is shared.
+    VkQueue  computeQueue()       const { return computeQueue_; }
+    uint32_t computeFamily()      const { return computeFamily_; }
+    bool     computeQueueShared() const { return computeQueue_ != VK_NULL_HANDLE && computeQueue_ == graphicsQueue_; }
+    juce::CriticalSection& computeQueueLock();
 
     Memory::L1& pool()     { return pool_; }
     Memory::M&  bindings() { return bindings_; }
@@ -129,6 +147,12 @@ private:
     VkQueue          presentQueue_   = VK_NULL_HANDLE;
     uint32_t         graphicsFamily_ = UINT32_MAX;
     uint32_t         presentFamily_  = UINT32_MAX;
+    VkQueue          computeQueue_   = VK_NULL_HANDLE;
+    uint32_t         computeFamily_  = UINT32_MAX;
+    uint32_t         computeIndex_   = 0;     // the queue's index in its family
+    juce::CriticalSection computeLock_;       // the compute queue's, when it is its own
+    uint32_t         instanceVersion_ = VK_API_VERSION_1_0;
+    uint32_t         apiVersion_      = VK_API_VERSION_1_0;
     VkCommandPool    commandPool_    = VK_NULL_HANDLE;
     VkPipelineCache  pipelineCache_  = VK_NULL_HANDLE;
     VmaAllocator     allocator_      = nullptr;

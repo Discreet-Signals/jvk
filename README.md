@@ -22,6 +22,7 @@ This will process your .jucer to add the JVK module, add necessary search paths,
 - Bundled Plug 'N Play Components (ex. jvk::ShaderComponent - give it a shader, push data, awesome audio visualisations!)
 - Transparent Native OS Windows to not obscure parent juce::Component (HWND not supported yet)
 - [In Dev] Entity Component System for 3D rendering scenes with keyframe animations (I am porting from my juce openGL ECS rendering engine)
+- Compute: GLSL compute kernels over GPU buffers, beside the rendering, on a queue of their own where the GPU has one (`jvk::compute`, see [COMPUTE.md](COMPUTE.md))
 
 ## Examples
 - jvkTriangles: How to add a vulkan instance, and multpiple vulkan components as children of juce components

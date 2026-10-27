@@ -83,8 +83,11 @@
 #include "include/jvk/graphics/NoiseShader.h"
 #include "include/jvk/graphics/ShaderRegionVert.h"
 
-// SPIRV-Reflect (for Shader.h)
+// SPIRV-Reflect (for Shader.h and compute kernels)
 #include "include/jvk/reflect/spirv_reflect.h"
+
+// Compute — kernels over buffers, no graphics (see COMPUTE.md)
+#include "include/jvk/compute/Compute.h"
 
 // Graphics — JUCE 2D rendering
 #include "include/jvk/graphics/MSDF.h"

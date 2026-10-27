@@ -141,6 +141,97 @@ add_custom_target(jvk_shaders DEPENDS "${JVK_SHADER_HEADER}")
 target_sources(jvk INTERFACE "${JVK_SHADER_HEADER}")
 
 # ==============================================================================
+# jvk_compute_shaders — a consumer's compute kernels (GLSL), compiled to SPIR-V
+# and embedded in one header, rebuilt whenever a kernel or anything it
+# includes changes. jvk's GLSL library is on the include path:
+# #include "jvk/scan.glsl", "jvk/compute.glsl".
+#
+#   jvk_compute_shaders(<target>
+#       HEADER     <MyKernels.h>          # the generated header's name
+#       NAMESPACE  <my::kernels>          # each kernel a std::span<const uint32_t> named after its file
+#       SOURCES    <a.comp> ...           # a.comp -> my::kernels::a
+#       [INCLUDE_DIRS <dir> ...]          # for the kernels' own #includes
+#       [TARGET_ENV vulkan1.0|vulkan1.1|...])   # vulkan1.0 by default: loads on any Vulkan
+#
+# The header goes in the build tree, on <target>'s include path, and is one of
+# its sources (INTERFACE for an interface library), so it is made first.
+# ==============================================================================
+function(jvk_compute_shaders TARGET)
+    cmake_parse_arguments(ARG "" "HEADER;NAMESPACE;TARGET_ENV" "SOURCES;INCLUDE_DIRS" ${ARGN})
+    if (NOT ARG_HEADER OR NOT ARG_NAMESPACE OR NOT ARG_SOURCES)
+        message(FATAL_ERROR "jvk_compute_shaders(${TARGET}): HEADER, NAMESPACE and SOURCES are required")
+    endif()
+    if (NOT Vulkan_GLSLC_EXECUTABLE)
+        message(FATAL_ERROR "jvk_compute_shaders(${TARGET}): glslc not found (it comes with the Vulkan SDK)")
+    endif()
+    if (NOT ARG_TARGET_ENV)
+        set(ARG_TARGET_ENV vulkan1.0)
+    endif()
+
+    set(_out "${CMAKE_CURRENT_BINARY_DIR}/jvk_compute/${TARGET}")
+    file(MAKE_DIRECTORY "${_out}")
+    set(_includes "-I${CMAKE_CURRENT_FUNCTION_LIST_DIR}/shaders/include")
+    foreach(_dir ${ARG_INCLUDE_DIRS})
+        list(APPEND _includes "-I${_dir}")
+    endforeach()
+
+    # glslc's dependency files rebuild a kernel when something it includes changes. Ninja and
+    # Makefiles take them from CMake 3.20, Xcode and Visual Studio from 3.21; before that, only
+    # the kernel's own source is watched.
+    set(_depfiles OFF)
+    if (CMAKE_GENERATOR MATCHES "Ninja|Makefiles" OR CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+        set(_depfiles ON)
+    endif()
+
+    set(_names)
+    set(_spvs)
+    foreach(_source ${ARG_SOURCES})
+        get_filename_component(_source "${_source}" ABSOLUTE)
+        get_filename_component(_name "${_source}" NAME_WE)
+        string(MAKE_C_IDENTIFIER "${_name}" _name)
+        set(_spv "${_out}/${_name}.spv")
+        set(_depfile)
+        if (_depfiles)
+            set(_depfile DEPFILE "${_spv}.d")
+        endif()
+        add_custom_command(
+            OUTPUT  "${_spv}"
+            COMMAND "${Vulkan_GLSLC_EXECUTABLE}" -fshader-stage=compute --target-env=${ARG_TARGET_ENV} -O
+                    ${_includes} -MD -MF "${_spv}.d" -o "${_spv}" "${_source}"
+            DEPENDS "${_source}"
+            ${_depfile}
+            COMMENT "jvk: compiling ${_name} (compute)"
+            VERBATIM
+        )
+        list(APPEND _names "${_name}")
+        list(APPEND _spvs "${_spv}")
+    endforeach()
+
+    string(REPLACE ";" "|" _namesArg "${_names}")
+    string(REPLACE ";" "|" _spvsArg "${_spvs}")
+    set(_header "${_out}/${ARG_HEADER}")
+    add_custom_command(
+        OUTPUT  "${_header}"
+        COMMAND ${CMAKE_COMMAND} -DOUTPUT=${_header} -DNAMESPACE=${ARG_NAMESPACE}
+                -DNAMES=${_namesArg} -DFILES=${_spvsArg}
+                -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/cmake/jvk_embed_spirv.cmake"
+        DEPENDS ${_spvs} "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/cmake/jvk_embed_spirv.cmake"
+        COMMENT "jvk: embedding ${ARG_HEADER}"
+        VERBATIM
+    )
+    add_custom_target(${TARGET}_jvk_compute DEPENDS "${_header}")
+
+    get_target_property(_type ${TARGET} TYPE)
+    if (_type STREQUAL "INTERFACE_LIBRARY")
+        target_sources(${TARGET} INTERFACE "${_header}")
+        target_include_directories(${TARGET} INTERFACE "${_out}")
+    else()
+        target_sources(${TARGET} PRIVATE "${_header}")
+        target_include_directories(${TARGET} PRIVATE "${_out}")
+    endif()
+endfunction()
+
+# ==============================================================================
 # Platform configuration
 # ==============================================================================
 
@@ -211,6 +302,21 @@ function(jvk_bundle TARGET)
             COMMAND ${CMAKE_COMMAND} -E ${_dbg_mkdir} "${_icd}"
             COMMAND ${CMAKE_COMMAND} -E ${_dbg_copy} "${DS_VULKAN_ICD_JSON}" "${_icd}/MoltenVK_icd.json"
             COMMENT "jvk: Bundling MoltenVK into ${TARGET}"
+        )
+    endif()
+endfunction()
+
+# ==============================================================================
+# jvk_runtime — Vulkan for a plain executable (a test runner, a command-line
+# tool: no bundle). macOS: the shipped MoltenVK copied beside the executable,
+# where Device.cpp's loadVulkan looks after a bundle's Frameworks. Windows,
+# Linux: no-op (the system loader, as for plugins).
+# ==============================================================================
+function(jvk_runtime TARGET)
+    if (APPLE AND DS_VULKAN_MVK_LIB)
+        add_custom_command(TARGET ${TARGET} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DS_VULKAN_MVK_LIB}" "$<TARGET_FILE_DIR:${TARGET}>/libMoltenVK.dylib"
+            COMMENT "jvk: MoltenVK beside ${TARGET}"
         )
     endif()
 endfunction()

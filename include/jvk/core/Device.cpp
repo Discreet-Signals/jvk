@@ -101,7 +101,9 @@ void configureMoltenVK(const PlatformProbe& p)
 //                  libvulkan.so.1). We ship none: Khronos strongly discourages
 //                  a private copy, and a machine without it has no driver.
 //   macOS:         the MoltenVK the bundle carries in Contents/Frameworks (in
-//                  Debug the SDK loader beside it, so validation layers load).
+//                  Debug the SDK loader beside it, so validation layers load);
+//                  a plain executable (a test runner, a tool: no bundle), the
+//                  MoltenVK beside itself, which jvk_runtime() puts there.
 const juce::String& loadVulkan()
 {
     static const juce::String error = []() -> juce::String
@@ -115,9 +117,17 @@ const juce::String& loadVulkan()
        #else
         const char* name = "libMoltenVK.dylib";
        #endif
-        const auto lib = juce::File(info.dli_fname).getParentDirectory().getSiblingFile("Frameworks").getChildFile(name);
-        void* module = dlopen(lib.getFullPathName().toRawUTF8(), RTLD_NOW | RTLD_LOCAL);
-        auto* gipa = module != nullptr ? (PFN_vkGetInstanceProcAddr) dlsym(module, "vkGetInstanceProcAddr") : nullptr;
+        const auto binary = juce::File(info.dli_fname).getParentDirectory();
+        PFN_vkGetInstanceProcAddr gipa = nullptr;
+        for (const auto& lib : { binary.getSiblingFile("Frameworks").getChildFile(name), binary.getChildFile("libMoltenVK.dylib") })
+        {
+            if (! lib.existsAsFile())
+                continue;
+            void* module = dlopen(lib.getFullPathName().toRawUTF8(), RTLD_NOW | RTLD_LOCAL);
+            gipa = module != nullptr ? (PFN_vkGetInstanceProcAddr) dlsym(module, "vkGetInstanceProcAddr") : nullptr;
+            if (gipa != nullptr)
+                break;
+        }
         if (gipa == nullptr)
             return juce::String("Vulkan failed to load (") + name + ")";
         volkInitializeCustom(gipa);
@@ -356,6 +366,7 @@ Device::~Device()
         // External-sync: idle the device under the process queue lock so a
         // teardown never races another editor's worker inside vkQueueSubmit.
         const juce::ScopedLock queueSync(Renderer::queueLock());
+        const juce::ScopedLock computeSync(computeLock_);
         vkDeviceWaitIdle(device_);
     }
 
@@ -416,7 +427,15 @@ bool Device::createInstance()
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.pEngineName = "jvk";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.apiVersion = VK_API_VERSION_1_0;
+    // 1.2 where the loader has 1.1 or later (a 1.1 loader takes any version,
+    // and the instance runs at the lower of it and the driver's); a 1.0
+    // loader takes only 1.0. Rendering makes 1.0's calls either way; compute
+    // reads its subgroup properties from 1.1.
+    uint32_t loader = VK_API_VERSION_1_0;
+    if (vkEnumerateInstanceVersion == nullptr || vkEnumerateInstanceVersion(&loader) != VK_SUCCESS)
+        loader = VK_API_VERSION_1_0;
+    instanceVersion_ = loader >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_2 : VK_API_VERSION_1_0;
+    appInfo.apiVersion = instanceVersion_;
 
     std::vector<const char*> extensions = { VK_KHR_SURFACE_EXTENSION_NAME };
     VkInstanceCreateFlags flags = 0;
@@ -558,6 +577,40 @@ bool Device::selectPhysicalDevice()
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(physDevice_, &props);
     DBG("jvk::Device: " << props.deviceName);
+    apiVersion_ = std::min(VK_MAKE_API_VERSION(0, VK_API_VERSION_MAJOR(instanceVersion_), VK_API_VERSION_MINOR(instanceVersion_), 0),
+                           VK_MAKE_API_VERSION(0, VK_API_VERSION_MAJOR(props.apiVersion), VK_API_VERSION_MINOR(props.apiVersion), 0));
+
+    // The compute queue: a family of compute without graphics where the GPU
+    // has one (it runs beside graphics), else another family with compute
+    // (MoltenVK offers four, a queue each, every one a Metal command queue of
+    // its own), else a second queue of the graphics family, else the graphics
+    // queue itself.
+    {
+        uint32_t qfCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physDevice_, &qfCount, nullptr);
+        std::vector<VkQueueFamilyProperties> qfs(qfCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(physDevice_, &qfCount, qfs.data());
+        for (uint32_t i = 0; i < qfCount && computeFamily_ == UINT32_MAX; i++)
+            if ((qfs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && qfs[i].queueCount > 0)
+                computeFamily_ = i;
+        for (uint32_t i = 0; i < qfCount && computeFamily_ == UINT32_MAX; i++)
+            if (i != graphicsFamily_ && (qfs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && qfs[i].queueCount > 0)
+                computeFamily_ = i;
+        if (computeFamily_ == UINT32_MAX && (qfs[graphicsFamily_].queueFlags & VK_QUEUE_COMPUTE_BIT)) {
+            computeFamily_ = graphicsFamily_;
+            computeIndex_  = qfs[graphicsFamily_].queueCount > 1 ? 1 : 0;
+        }
+        juce::String families;
+        for (uint32_t i = 0; i < qfCount; i++)
+            families << (i > 0 ? ", " : "") << (int) i << ": " << (int) qfs[i].queueCount << " x "
+                     << ((qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) ? "G" : "") << ((qfs[i].queueFlags & VK_QUEUE_COMPUTE_BIT) ? "C" : "")
+                     << ((qfs[i].queueFlags & VK_QUEUE_TRANSFER_BIT) ? "T" : "");
+        diag::log("queue families: " + families);
+        diag::log(computeFamily_ == UINT32_MAX ? juce::String("compute: none")
+                  : computeFamily_ != graphicsFamily_ ? "compute: family " + juce::String((int) computeFamily_) + ", a queue of its own"
+                  : computeIndex_ == 1 ? juce::String("compute: a second queue of the graphics family")
+                  : juce::String("compute: shares the graphics queue"));
+    }
 
     const char* type = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU   ? "discrete"
                      : props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? "integrated"
@@ -582,15 +635,19 @@ bool Device::selectPhysicalDevice()
 
 bool Device::createLogicalDevice()
 {
-    float priority = 1.0f;
+    // Graphics first; a compute queue of its own below it, so editors' frames
+    // win where the driver weighs priorities.
+    const float priorities[] = { 1.0f, 0.5f };
     std::set<uint32_t> families = { graphicsFamily_, presentFamily_ };
+    if (computeFamily_ != UINT32_MAX)
+        families.insert(computeFamily_);
     std::vector<VkDeviceQueueCreateInfo> qcis;
     for (auto f : families) {
         VkDeviceQueueCreateInfo qci {};
         qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
         qci.queueFamilyIndex = f;
-        qci.queueCount = 1;
-        qci.pQueuePriorities = &priority;
+        qci.queueCount = f == computeFamily_ ? computeIndex_ + 1 : 1;
+        qci.pQueuePriorities = f == computeFamily_ && f != graphicsFamily_ ? priorities + 1 : priorities;
         qcis.push_back(qci);
     }
 
@@ -628,7 +685,14 @@ bool Device::createLogicalDevice()
 
     vkGetDeviceQueue(device_, graphicsFamily_, 0, &graphicsQueue_);
     vkGetDeviceQueue(device_, presentFamily_, 0, &presentQueue_);
+    if (computeFamily_ != UINT32_MAX)
+        vkGetDeviceQueue(device_, computeFamily_, computeIndex_, &computeQueue_);
     return true;
+}
+
+juce::CriticalSection& Device::computeQueueLock()
+{
+    return computeQueueShared() ? Renderer::queueLock() : computeLock_;
 }
 
 // =============================================================================
