@@ -771,7 +771,7 @@ gpu::ProgramId Backend::createProgram(const gpu::ProgramDesc& desc)
     // The portable convention spelled out, or the program's own bindings.
     if (desc.layout.bindings.empty())
     {
-        for (uint8_t i = 0; i < desc.layout.textures && i < gpu::kMaxDrawTextures; ++i)
+        for (uint8_t i = 0; i < desc.layout.textures && i < gpu::kPortableDrawTextures; ++i)
         {
             p.bindings.push_back({ gpu::BindingKind::Texture, i, 0, i });
             p.bindings.push_back({ gpu::BindingKind::Sampler, i, 0, uint8_t(8 + i) });

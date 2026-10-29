@@ -51,8 +51,13 @@ namespace jvk::gpu
 // transient memory; it never writes to the packet.
 // =============================================================================
 
-inline constexpr uint32_t kMaxDrawTextures = 8;   // eacp's codegen limit; every API allows more
-inline constexpr uint32_t kMaxDrawStorage  = 4;
+// A draw binds up to 16 textures: Vulkan's guaranteed per-stage sampled images, WebGPU's
+// default, and Metal's 16 samplers (each texture takes its own). The portable convention
+// (a ProgramLayout without native bindings: the bundle, shaders/Program.h) numbers its
+// samplers after 8 textures, eacp's codegen limit too.
+inline constexpr uint32_t kMaxDrawTextures      = 16;
+inline constexpr uint32_t kPortableDrawTextures = 8;
+inline constexpr uint32_t kMaxDrawStorage       = 4;
 
 // A byte range in one of the packet's data streams.
 struct Range

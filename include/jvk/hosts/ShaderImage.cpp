@@ -53,6 +53,14 @@ ShaderImage::ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
     builder_.setAlignments(caps.constantsAlignment, caps.storageAlignment);
 
     reflectShader();
+    if (textureSlots_ > gpu::kMaxDrawTextures || storageSlots_ > gpu::kMaxDrawStorage)
+    {
+        diag::log("jvk::ShaderImage: " + juce::String(textureSlots_) + " textures and " + juce::String(storageSlots_)
+                  + " blocks, a draw binds at most " + juce::String(gpu::kMaxDrawTextures) + " and "
+                  + juce::String(gpu::kMaxDrawStorage) + "; it draws nothing");
+        jassertfalse;
+        return;
+    }
     gpu::ProgramDesc desc;
     desc.name = "jvk::ShaderImage";
     desc.vertex = std::as_bytes(shaders::bundle::shaderRegionVert.spirv);
@@ -103,14 +111,12 @@ void ShaderImage::reflectShader()
         b.desc.binding = static_cast<uint8_t>(rb->binding);
         if (rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
         {
-            if (textureSlots_ >= gpu::kMaxDrawTextures) continue;
             b.desc.kind = gpu::BindingKind::CombinedTextureSampler;
             b.desc.slot = textureSlots_++;
         }
         else if (rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER
               || rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
         {
-            if (storageSlots_ >= gpu::kMaxDrawStorage) continue;
             b.desc.kind = rb->descriptor_type == SPV_REFLECT_DESCRIPTOR_TYPE_STORAGE_BUFFER
                         ? gpu::BindingKind::StorageBuffer : gpu::BindingKind::UniformBuffer;
             b.desc.slot = storageSlots_++;

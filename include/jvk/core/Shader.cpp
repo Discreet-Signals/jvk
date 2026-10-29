@@ -108,19 +108,15 @@ void Shader::reflectShader()
 
     // Slots: set 0's images in declaration order, then the scene, then the
     // per-draw images; set 0's blocks in order. The program's native layout
-    // names where each slot lives.
+    // names where each slot lives. Every binding takes one: a shader that
+    // needs more than a draw binds is refused whole (ensureProgram), never
+    // built without some of them.
     for (auto& b : bindings_)
     {
-        if (b.isBuffer()) {
-            if (storageSlots_ >= gpu::kMaxDrawStorage) { jassertfalse; continue; }
-            b.slot = storageSlots_++;
-        } else {
-            if (textureSlots_ >= gpu::kMaxDrawTextures) { jassertfalse; continue; }
-            b.slot = textureSlots_++;
-        }
+        b.slot = b.isBuffer() ? storageSlots_++ : textureSlots_++;
         nativeBindings_.push_back({ b.kind, b.slot, static_cast<uint8_t>(b.set), static_cast<uint8_t>(b.binding) });
     }
-    if (scene != nullptr && textureSlots_ < gpu::kMaxDrawTextures) {
+    if (scene != nullptr) {
         readsScene_ = true;
         sceneSlot_ = static_cast<int8_t>(textureSlots_++);
         nativeBindings_.push_back({ gpu::BindingKind::CombinedTextureSampler, static_cast<uint8_t>(sceneSlot_), 1, 0 });
@@ -130,7 +126,6 @@ void Shader::reflectShader()
         if (drawImages[i] == nullptr) continue;
         if (drawImageNames_.size() <= i) drawImageNames_.resize(i + 1);
         drawImageNames_[i] = str(drawImages[i]->name);
-        if (textureSlots_ >= gpu::kMaxDrawTextures) { jassertfalse; continue; }
         drawImageSlot_[i] = static_cast<int8_t>(textureSlots_++);
         nativeBindings_.push_back({ gpu::BindingKind::CombinedTextureSampler,
                                     static_cast<uint8_t>(drawImageSlot_[i]), static_cast<uint8_t>(2 + i), 0 });
@@ -168,6 +163,13 @@ bool Shader::ensureProgram(Renderer& r)
     const auto& caps = r.context().caps();
     if (caps.shaderFormat != gpu::ShaderFormat::SPIRV) {
         diag::log("jvk::Shader: this backend doesn't take SPIR-V; the shader draws nothing");
+        return false;
+    }
+    if (textureSlots_ > gpu::kMaxDrawTextures || storageSlots_ > gpu::kMaxDrawStorage) {
+        diag::log("jvk::Shader: " + juce::String(textureSlots_) + " textures and " + juce::String(storageSlots_)
+                  + " blocks, a draw binds at most " + juce::String(gpu::kMaxDrawTextures) + " and "
+                  + juce::String(gpu::kMaxDrawStorage) + "; the shader draws nothing");
+        jassertfalse;
         return false;
     }
 
