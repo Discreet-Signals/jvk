@@ -601,7 +601,7 @@ void Renderer::lower(const gpu::FrameInfo& info)
     // stencil-discarded pixels otherwise) — but only within the intermediate
     // pass's scissor, not full-screen.
     auto preCopyIfClipped = [&](uint8_t stencilDepth, const gpu::IRect& sc) {
-        if (stencilDepth == 0) return;
+        if (stencilDepth == 0 && !emitter_.stencilTested()) return;
         fullscreenPass("pre-copy", programs.copy, halves_[cur ^ 1], kSceneFormat, StencilTest::Outside,
                        { bind(halves_[cur]) }, {}, effectConstants(fe, 0, 0, 0), sc, stencilDepth);
     };
@@ -818,7 +818,7 @@ void Renderer::lower(const gpu::FrameInfo& info)
         const TargetMask versioned = sp.targetsRead & sp.targetsWritten;
         copyTargets(versioned, true, sc0);
         const auto formats = slotFormats(sp.targetSlots, true);
-        const bool clip = c.stencilDepth > 0;
+        const bool clip = emitter_.stencilTested();
         const auto pipeline = shaderPipeline(sc, formats, [&](uint32_t l) { return slotTarget(sp.targetSlots, l); }, clip);
         auto pass = [&](gpu::TextureId scene, int half) {
             auto& p = builder_.beginPass("shader → main + targets");
@@ -855,7 +855,7 @@ void Renderer::lower(const gpu::FrameInfo& info)
         formats.colorCount = 1;
         formats.colorFormats[0] = kSceneFormat;
         formats.depthStencil = true;
-        const auto pipeline = shaderPipeline(sc, formats, [](uint32_t) { return -1; }, c.stencilDepth > 0);
+        const auto pipeline = shaderPipeline(sc, formats, [](uint32_t) { return -1; }, emitter_.stencilTested());
         auto pass = [&](gpu::TextureId scene, gpu::TextureId dst, const gpu::IRect& area) {
             auto& p = builder_.beginPass("shader → main");
             p.colorCount = 1;
@@ -1011,7 +1011,7 @@ void Renderer::lower(const gpu::FrameInfo& info)
     // Binds the pipeline, constants and storage of a built-in scene draw.
     // False (draw nothing) when its pipeline couldn't be made.
     auto setPaint = [&](Paint kind, const DrawCommand& cmd) -> const PaintVariant* {
-        const auto* v = paintPipeline(kind, cmd.target, emitter_.stencilDepth() > 0, live);
+        const auto* v = paintPipeline(kind, cmd.target, emitter_.stencilTested(), live);
         if (v == nullptr) return nullptr;
         emitter_.invalidate();
         emitter_.setPipeline(v->id);
@@ -1391,12 +1391,14 @@ void Renderer::lower(const gpu::FrameInfo& info)
                 emitter_.setConstants(builder_.pushConstants(k));
                 coverQuad(cmd, p.rect, ref);
                 emitter_.invalidate();
+                if (cmd.op == DrawOp::ExcludeClipRect) emitter_.pushExclusion();
+                else                                   emitter_.popExclusion();
                 break;
             }
 
             case DrawOp::FillPath: {
                 // Analytical SDF path fill — tile quads into the scene pass.
-                const auto* v = paintPipeline(Paint::Path, cmd.target, emitter_.stencilDepth() > 0, live);
+                const auto* v = paintPipeline(Paint::Path, cmd.target, emitter_.stencilTested(), live);
                 if (v == nullptr) break;
                 const auto& p = arena.read<FillPathParams>(cmd.dataOffset);
                 const auto& fill = recorder_.getFill(p.fillIndex);
@@ -1448,7 +1450,7 @@ void Renderer::lower(const gpu::FrameInfo& info)
                     {
                         const auto pipeline = shaderPipeline(sc, sceneFormats(),
                             [&](uint32_t l) { return l >= 1 && l - 1 < targets_.size() ? static_cast<int>(l - 1) : -1; },
-                            emitter_.stencilDepth() > 0);
+                            emitter_.stencilTested());
                         shaderDraw(sc, sp, pipeline, sp.region, fe, cmd.clipBounds,
                                    emitter_.stencilDepth(), {});
                         emitter_.invalidate();

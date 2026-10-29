@@ -205,6 +205,7 @@ public:
         clipRectStack_.clear();
         currentClipBounds_ = {};
         stencilDepth_ = 0;
+        exclusions_   = 0;
         invalidate();
     }
 
@@ -309,6 +310,12 @@ public:
     }
     void pushStencilDepth() { ++stencilDepth_; }
     void popStencilDepth()  { if (stencilDepth_ > 0) --stencilDepth_; }
+    // Excluded rects (excludeClipRectangle) park their pixels out of the
+    // current depth, so a draw must test the stencil while one is active even
+    // at depth 0, where no path clip is.
+    void pushExclusion() { ++exclusions_; }
+    void popExclusion()  { if (exclusions_ > 0) --exclusions_; }
+    bool stencilTested() const { return stencilDepth_ > 0 || exclusions_ > 0; }
 
     juce::Rectangle<int> clipBounds() const { return currentClipBounds_; }
     uint8_t              stencilDepth() const { return stencilDepth_; }
@@ -338,6 +345,7 @@ private:
     std::vector<juce::Rectangle<int>> clipRectStack_;
     juce::Rectangle<int>              currentClipBounds_;
     uint8_t                           stencilDepth_ = 0;
+    uint32_t                          exclusions_ = 0;
 };
 
 } // namespace jvk
