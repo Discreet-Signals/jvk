@@ -108,7 +108,17 @@ public:
     }
 
     bool passOpen() const { return open_; }
+    bool passEmpty() const { return open_ && draws_.size() == passes_.back().firstDraw; }
     gpu::Pass& currentPass() { return passes_.back(); }
+
+    // Takes back the open pass, which has no draws.
+    void discardPass()
+    {
+        jassert(passEmpty());
+        if (!passEmpty()) return;
+        passes_.pop_back();
+        open_ = false;
+    }
 
     // Appends a draw to the open pass. A draw that continues the last one
     // (same pipeline, bindings, scissor, stencil reference and constants, its

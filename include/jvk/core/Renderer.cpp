@@ -311,6 +311,8 @@ void Renderer::releaseFrameTextures()
     for (auto t : targetScratches_) context_->retire(t, serial_);
     targetTextures_.clear();
     targetScratches_.clear();
+    for (auto& level : pyramid_)
+        for (auto& t : level) { context_->retire(t, serial_); t = {}; }
     textureExtent_ = {};
 }
 
@@ -331,6 +333,29 @@ gpu::TextureId Renderer::targetScratch(size_t i)
         targetScratches_[i] = context_->backend().createTexture(td);
     }
     return targetScratches_[i];
+}
+
+gpu::Extent Renderer::pyramidExtent(int level) const
+{
+    const uint32_t d = 1u << level;
+    return { (textureExtent_.width + d - 1) / d, (textureExtent_.height + d - 1) / d };
+}
+
+gpu::TextureId Renderer::pyramidLevel(int level, int i)
+{
+    auto& t = pyramid_[level - 1][i];
+    if (!t)
+    {
+        const auto e = pyramidExtent(level);
+        gpu::TextureDesc d;
+        d.format = kSceneFormat;
+        d.usage  = gpu::TextureUsage::Sampled | gpu::TextureUsage::RenderTarget;
+        d.width  = e.width;
+        d.height = e.height;
+        d.label  = "jvk blur pyramid";
+        t = context_->backend().createTexture(d);
+    }
+    return t;
 }
 
 // =============================================================================
@@ -478,8 +503,11 @@ void Renderer::lower(const gpu::FrameInfo& info)
     // always ends the scene pass, so whatever is live where a pass begins
     // stays live to its end. The scene pass is open or not: a pass of its own
     // ends it (endScene), and it reopens only for the next command that draws
-    // into it, so a run of passes pays no empty scene segments in between.
-    bool sceneOpen = false;
+    // into it, so a run of passes pays no empty scene segments in between. One
+    // that ends with no draws in it after all (a clip rect pushed between two
+    // effects reopens it and draws nothing) loads what it attaches and changes
+    // nothing: it is taken back. A clearing one stays.
+    bool sceneOpen = false, sceneClears = false;
     auto beginScene = [&](bool withClears, size_t firstCommand) {
         auto& p = builder_.beginPass(withClears ? "scene (clear)" : "scene");
         const TargetMask liveHere = recorder_.liveTargets(firstCommand);
@@ -497,10 +525,12 @@ void Renderer::lower(const gpu::FrameInfo& info)
         p.depthStencil = { stencil_, withClears ? LoadOp::Clear : LoadOp::Load, StoreOp::Store, 0 };
         p.renderArea = { 0, 0, static_cast<int32_t>(fe.width), static_cast<int32_t>(fe.height) };
         sceneOpen = true;
+        sceneClears = withClears;
         emitter_.invalidate();
     };
     auto endScene = [&] {
-        if (sceneOpen) builder_.endPass();
+        if (sceneOpen && !sceneClears && builder_.passEmpty()) builder_.discardPass();
+        else if (sceneOpen) builder_.endPass();
         sceneOpen = false;
     };
 
@@ -548,12 +578,42 @@ void Renderer::lower(const gpu::FrameInfo& info)
         builder_.endPass();
     };
 
-    auto effectConstants = [&](gpu::Extent e, float dirX, float dirY, float radius) {
+    auto effectConstants = [&](gpu::Extent e, float dirX, float dirY, uint32_t tapCount = 0, float scale = 1.0f) {
         EffectConstants c;
         c.viewportW = static_cast<float>(e.width);
         c.viewportH = static_cast<float>(e.height);
-        c.dirX = dirX; c.dirY = dirY; c.radius = radius;
+        c.dirX = dirX; c.dirY = dirY; c.scale = scale; c.tapCount = tapCount;
         return builder_.pushConstants(c);
+    };
+
+    // A Gaussian's 1D kernel as blur.frag (and shape_blur.frag's separable
+    // pass) reads it, in the frame's storage: sigma = radius / 2 out to
+    // `radius` px, normalised, the centre (0, weight) first, then each pair of
+    // integer texels (i, i + 1) as ONE bilinear tap between them carrying both
+    // weights. Made once a pass here instead of an exp() per tap per pixel
+    // there. No taps at radius 0.5 or less; the storage is bound either way
+    // (every pass of the program declares it).
+    struct Kernel { gpu::Range taps; uint32_t count = 0; };
+    auto gaussian = [&](float radius) {
+        auto& t = blurTaps_;
+        t.clear();
+        if (radius > 0.5f)
+        {
+            const float twoS2 = 0.5f * radius * radius;
+            const int n = static_cast<int>(std::ceil(radius));
+            float total = 1.0f;
+            t.insert(t.end(), { 0.0f, 1.0f });
+            for (int i1 = 1; i1 <= n; i1 += 2)
+            {
+                const int i2 = i1 + 1;
+                const float w1 = std::exp(-float(i1 * i1) / twoS2), w2 = i2 <= n ? std::exp(-float(i2 * i2) / twoS2) : 0.0f;
+                t.insert(t.end(), { (float(i1) * w1 + float(i2) * w2) / (w1 + w2), w1 + w2 });
+                total += 2.0f * (w1 + w2);
+            }
+            for (size_t i = 1; i < t.size(); i += 2) t[i] /= total;
+        }
+        return Kernel { builder_.pushStorage(t.data(), static_cast<uint32_t>(t.size() * sizeof(float))),
+                        static_cast<uint32_t>(t.size() / 2) };
     };
 
     // Runs a single post-process pass (`applyPass(src, dst)`) and swaps the
@@ -921,10 +981,11 @@ void Renderer::lower(const gpu::FrameInfo& info)
             const float m = std::ceil(bp.radius * std::max(1.0f, bp.scale) * s) + 2.0f;
             const gpu::IRect scH = inPixels(R, s, 0.0f, m, e), scV = inPixels(R, s, 0.0f, 0.0f, e);
             if (scV.isEmpty()) return;
+            const auto kernel = gaussian(bp.radius * s);
             fullscreenPass("blur H", programs.blur, scratch, format, StencilTest::None,
-                           { bind(target) }, {}, effectConstants(e, 1.0f, 0.0f, bp.radius * s), scH, 0);
+                           { bind(target) }, { kernel.taps }, effectConstants(e, 1.0f, 0.0f, kernel.count), scH, 0);
             fullscreenPass("blur V", programs.blur, target, format, StencilTest::None,
-                           { bind(scratch) }, {}, effectConstants(e, 0.0f, 1.0f, bp.radius * s), scV, 0);
+                           { bind(scratch) }, { kernel.taps }, effectConstants(e, 0.0f, 1.0f, kernel.count), scV, 0);
         }
         else if (c.op == DrawOp::EffectHSV) {
             const auto& hp = arena.read<HSVParams>(c.dataOffset);
@@ -959,18 +1020,20 @@ void Renderer::lower(const gpu::FrameInfo& info)
             const float m = std::ceil(sp.maxRadius * pc.blurStep) + 2.0f;
             const gpu::IRect scR = inPixels(R, s, 0.0f, 0.0f, e);
             if (scR.isEmpty()) return;
+            const auto kernel = gaussian(pc.kernelType == 0 ? sp.maxRadius * pc.blurStep : 0.0f);
+            pc.tapCount = kernel.count;
             if (pc.kernelType == 0) {
                 pc.dirX = 1.0f; pc.dirY = 0.0f;
                 fullscreenPass("shape blur H", programs.shapeBlur, scratch, format, StencilTest::None,
-                               { bind(target) }, {}, builder_.pushConstants(pc), inPixels(R, s, 0.0f, m, e), 0);
+                               { bind(target) }, { kernel.taps }, builder_.pushConstants(pc), inPixels(R, s, 0.0f, m, e), 0);
                 pc.dirX = 0.0f; pc.dirY = 1.0f;
                 fullscreenPass("shape blur V", programs.shapeBlur, target, format, StencilTest::None,
-                               { bind(scratch) }, {}, builder_.pushConstants(pc), scR, 0);
+                               { bind(scratch) }, { kernel.taps }, builder_.pushConstants(pc), scR, 0);
             } else {
                 copyTarget(t, true, inPixels(R, s, m, m, e));
                 pc.dirX = 1.0f; pc.dirY = 0.0f;
                 fullscreenPass("shape blur", programs.shapeBlur, target, format, StencilTest::None,
-                               { bind(scratch) }, {}, builder_.pushConstants(pc), scR, 0);
+                               { bind(scratch) }, { kernel.taps }, builder_.pushConstants(pc), scR, 0);
             }
         }
         else if (c.op == DrawOp::BlurPath && s == 1.0f) {
@@ -1163,23 +1226,63 @@ void Renderer::lower(const gpu::FrameInfo& info)
                 // own horizontal apron reads the true scene (always valid). Two
                 // swaps land `cur` back on the starting half, so pixels outside
                 // R keep the original scene untouched.
+                //
+                // A LARGE radius runs down a pyramid instead: a Gaussian of
+                // sigma leaves nothing finer than sigma, so it is made `levels`
+                // halvings down, where sigma is still at least 8 of the level's
+                // px. 2x2 box steps down, the Gaussian there with the variance
+                // the steps and the way up don't spread, then one bilinear read
+                // back up into the current half, inside the clip. That read
+                // never samples the half it writes: no swap, no pre-copy.
+                // Against the full-resolution blur of a lit frame (sigma 32 px,
+                // a quarter down): within 2 levels of 255, 0.40 ms for 6.8.
                 const auto& bp = arena.read<BlurParams>(cmd.dataOffset);
                 const auto R = roiFinal(bp.region, cmd.clipBounds);
                 if (R.isEmpty()) break;
+                endScene();
+                const float sigma = 0.5f * bp.radius;
+                const int levels = sigma < 16.0f ? 0 : std::min(kPyramidLevels, static_cast<int>(std::log2(sigma / 8.0f)));
+                if (levels > 0) {
+                    const float d = static_cast<float>(1 << levels);
+                    float spread = d * d / 6.0f;   // the way up: a tent 2^levels px a side
+                    for (int i = 0; i < levels; ++i) spread += 0.25f * static_cast<float>(1 << (2 * i));   // each 2x2 box
+                    const float rl = 2.0f * std::sqrt(std::max(sigma * sigma - spread, 0.0f)) / d;
+                    const auto kernel = gaussian(rl);
+                    const float ml = std::ceil(rl) + 2.0f;
+                    auto down = [&](int i) { return pyramidLevel(i, 0); };
+                    for (int i = 1; i <= levels; ++i) {
+                        const float pad = (ml + 2.0f) * static_cast<float>(1 << (levels - i)) + 2.0f;
+                        const auto src = i == 1 ? halves_[cur] : down(i - 1);
+                        fullscreenPass("blur down", programs.blur, down(i), kSceneFormat, StencilTest::None,
+                                       { bind(src) }, { kernel.taps }, effectConstants(i == 1 ? fe : pyramidExtent(i - 1), 0, 0, 0, 2.0f),
+                                       inPixels(R, 1.0f / static_cast<float>(1 << i), pad, pad, pyramidExtent(i)), 0);
+                    }
+                    const auto e = pyramidExtent(levels);
+                    fullscreenPass("blur H", programs.blur, pyramidLevel(levels, 1), kSceneFormat, StencilTest::None,
+                                   { bind(down(levels)) }, { kernel.taps }, effectConstants(e, 1.0f, 0.0f, kernel.count),
+                                   inPixels(R, 1.0f / d, 2.0f, ml + 2.0f, e), 0);
+                    fullscreenPass("blur V", programs.blur, down(levels), kSceneFormat, StencilTest::None,
+                                   { bind(pyramidLevel(levels, 1)) }, { kernel.taps }, effectConstants(e, 0.0f, 1.0f, kernel.count),
+                                   inPixels(R, 1.0f / d, 2.0f, 2.0f, e), 0);
+                    fullscreenPass("blur up", programs.blur, halves_[cur], kSceneFormat, StencilTest::Inside,
+                                   { bind(down(levels)) }, { kernel.taps }, effectConstants(e, 0, 0, 0, 1.0f / d),
+                                   roiScissor(R, 0.0f, 0.0f), cmd.stencilDepth);
+                    break;
+                }
                 const float m = std::ceil(bp.radius * std::max(1.0f, bp.scale)) + 2.0f;
                 const gpu::IRect scH = roiScissor(R, 0.0f, m);
                 const gpu::IRect scV = roiScissor(R, 0.0f, 0.0f);
-                endScene();
+                const auto kernel = gaussian(bp.radius);
                 // Seed the intermediate half's outside-clip pixels within H's
                 // scissor (V's taps cross the clip edge and read them).
                 preCopyIfClipped(cmd.stencilDepth, scH);
                 effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) {
                     fullscreenPass("blur H", programs.blur, dst, kSceneFormat, StencilTest::Inside,
-                                   { bind(src) }, {}, effectConstants(fe, 1.0f, 0.0f, bp.radius), scH, cmd.stencilDepth);
+                                   { bind(src) }, { kernel.taps }, effectConstants(fe, 1.0f, 0.0f, kernel.count), scH, cmd.stencilDepth);
                 });
                 effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) {
                     fullscreenPass("blur V", programs.blur, dst, kSceneFormat, StencilTest::Inside,
-                                   { bind(src) }, {}, effectConstants(fe, 0.0f, 1.0f, bp.radius), scV, cmd.stencilDepth);
+                                   { bind(src) }, { kernel.taps }, effectConstants(fe, 0.0f, 1.0f, kernel.count), scV, cmd.stencilDepth);
                 });
                 break;
             }
@@ -1254,6 +1357,8 @@ void Renderer::lower(const gpu::FrameInfo& info)
                 if (R.isEmpty()) break;
                 const float m = std::ceil(sp.maxRadius * sp.blurStep) + 2.0f;
                 const gpu::IRect scR = roiScissor(R, 0.0f, 0.0f);
+                const auto kernel = gaussian(kt == 0 ? sp.maxRadius * sp.blurStep : 0.0f);
+                pc.tapCount = kernel.count;
 
                 endScene();
                 auto blurPass = [&](const char* label, float dirX, float dirY, const gpu::IRect& sc) {
@@ -1261,7 +1366,7 @@ void Renderer::lower(const gpu::FrameInfo& info)
                     const auto constants = builder_.pushConstants(pc);
                     effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) {
                         fullscreenPass(label, programs.shapeBlur, dst, kSceneFormat, StencilTest::Inside,
-                                       { bind(src) }, {}, constants, sc, cmd.stencilDepth);
+                                       { bind(src) }, { kernel.taps }, constants, sc, cmd.stencilDepth);
                     });
                 };
                 if (kt == 0) {

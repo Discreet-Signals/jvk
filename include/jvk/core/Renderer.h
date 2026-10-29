@@ -185,6 +185,10 @@ private:
     bool ensureFrameTextures(gpu::Extent extent);
     void releaseFrameTextures();
     gpu::TextureId targetScratch(size_t i);
+    // A blur pyramid's level (1 = half the frame's size, rounded up), its texture i of two. Made on first use (worker).
+    static constexpr int kPyramidLevels = 3;
+    gpu::Extent    pyramidExtent(int level) const;
+    gpu::TextureId pyramidLevel(int level, int i);
     void validateTargets(std::vector<Target> requested);
 
     // ---- Pipelines ----
@@ -211,6 +215,8 @@ private:
     gpu::Extent    textureExtent_;
     gpu::TextureId halves_[2], stencil_;
     std::vector<gpu::TextureId> targetTextures_, targetScratches_;
+    gpu::TextureId pyramid_[kPyramidLevels][2];   // a large blur's levels: 1/2, 1/4, 1/8 of the frame, two each
+    std::vector<float> blurTaps_;                   // the kernel being made (worker only)
 
     gpu::Extent extent_;
     uint64_t    serial_ = 0;

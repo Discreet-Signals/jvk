@@ -76,13 +76,14 @@ struct ClipMaskConstants
 };
 static_assert(sizeof(ClipMaskConstants) == 48);
 
-// blur.frag, copy.frag: 20 bytes of members, 32 bound.
+// blur.frag, copy.frag: 24 bytes of members, 32 bound.
 struct EffectConstants
 {
-    float viewportW = 0, viewportH = 0;
-    float dirX = 0, dirY = 0;
-    float radius = 0;
-    float _pad[3] {};
+    float    viewportW = 0, viewportH = 0;   // the source's extent
+    float    dirX = 0, dirY = 0;
+    float    scale = 1;                      // source px per destination px
+    uint32_t tapCount = 0;                   // the kernel's taps in its storage; 0: one bilinear read
+    float    _pad[2] {};
 };
 static_assert(sizeof(EffectConstants) == 32);
 
@@ -123,7 +124,7 @@ struct ShapeBlurConstants
     int   edgePlacement = 0;                 // 0=centered,1=inside,2=outside
     int   inverted = 0;
     int   kernelType = 0;                    // 0 = one separable pass along dir, 1 = Poisson disc, 2 = 2D Gaussian
-    float _pad0 = 0;
+    uint32_t tapCount = 0;                   // kernel 0: the full radius's taps in its storage (0: none made)
 };
 static_assert(sizeof(ShapeBlurConstants) == 96);
 

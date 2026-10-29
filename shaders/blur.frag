@@ -4,63 +4,48 @@
 // Separable Gaussian blur pass. Run twice — once horizontal, once vertical —
 // with ping-pong framebuffers to get a 2D blur.
 //
-// Dynamic radius: weights are computed on-the-fly from a true Gaussian
-// (sigma = radius / 2). Uses the linear-sampling trick — each paired tap
-// is placed between two texels so bilinear filtering gives us two samples
-// for one texture() call, halving the bandwidth for a given kernel extent.
+// The kernel arrives made (Renderer: gaussian()): `taps` holds tapCount
+// (offset, weight) pairs, the centre first, every other one read at ±offset —
+// a true Gaussian of sigma = radius / 2, normalised, each pair of integer
+// texels collapsed to one bilinear tap between them (the linear-sampling
+// trick). A tap costs two texture reads and a multiply-add: no exp() per tap
+// per pixel.
 //
-// viewportSize: extent of the source image (pixels). Used to derive texel size.
+// With no taps (tapCount 0) the pass is one bilinear read: the steps of a
+// blur pyramid, down (a 2x2 box) and back up. A fragment reads its source at
+// its own centre times `scale` (source px per destination px: 1 across, 2
+// down, 1 / 2^levels up), exact at any size, odd ones included.
+//
+// viewportSize: extent of the SOURCE image (pixels).
 // direction:    (1,0) for horizontal pass, (0,1) for vertical.
-// radius:       kernel half-width in pixels. 0 = pass-through.
 JVK_CONSTANTS {
     vec2  viewportSize;
     vec2  direction;
-    float radius;
+    float scale;
+    uint  tapCount;
 } pc;
 
 JVK_TEXTURE(0, srcTexture);
 JVK_SAMPLER(0, srcSampler);
 
-layout(location = 0) in  vec2 fragUV;
-layout(location = 0) out vec4 outColor;
+JVK_STORAGE(0) Taps {
+    vec2 data[];
+} taps;
 
-// Upper bound for the driver's loop cost model. The runtime `if (i1 > N) break;`
-// exits at the actual radius, so only insane radii (> 8192 px) would pay full cost.
-const int MAX_PAIRS = 4096;
+layout(location = 0) out vec4 outColor;
 
 void main() {
     vec2 texelSize = 1.0 / pc.viewportSize;
+    vec2 uv = gl_FragCoord.xy * pc.scale * texelSize;
+    vec4 color = texture(sampler2D(srcTexture, srcSampler), uv);
+    if (pc.tapCount == 0u) { outColor = color; return; }
 
-    if (pc.radius <= 0.5) {
-        outColor = texture(sampler2D(srcTexture, srcSampler), fragUV);
-        return;
+    color *= taps.data[0].y;
+    for (uint i = 1u; i < pc.tapCount; ++i) {
+        vec2 t = taps.data[i];
+        vec2 off = pc.direction * t.x * texelSize;
+        color += (texture(sampler2D(srcTexture, srcSampler), uv + off)
+                + texture(sampler2D(srcTexture, srcSampler), uv - off)) * t.y;
     }
-
-    float sigma = pc.radius * 0.5;
-    float twoS2 = 2.0 * sigma * sigma;
-    int   N     = int(ceil(pc.radius));
-
-    // Center tap (weight = exp(0) = 1).
-    vec4  color       = texture(sampler2D(srcTexture, srcSampler), fragUV);
-    float totalWeight = 1.0;
-
-    // Walk integer texel offsets in pairs (1,2), (3,4), (5,6), ...
-    // Collapse each pair to a single bilinear tap between the two texels.
-    for (int p = 0; p < MAX_PAIRS; ++p) {
-        int i1 = 2 * p + 1;
-        if (i1 > N) break;
-        int i2 = i1 + 1;
-
-        float w1 = exp(-float(i1 * i1) / twoS2);
-        float w2 = (i2 <= N) ? exp(-float(i2 * i2) / twoS2) : 0.0;
-        float w  = w1 + w2;
-        float o  = (float(i1) * w1 + float(i2) * w2) / w;
-
-        vec2 off = pc.direction * o * texelSize;
-        color += texture(sampler2D(srcTexture, srcSampler), fragUV + off) * w;
-        color += texture(sampler2D(srcTexture, srcSampler), fragUV - off) * w;
-        totalWeight += 2.0 * w;
-    }
-
-    outColor = color / totalWeight;
+    outColor = color;
 }

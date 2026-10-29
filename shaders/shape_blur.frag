@@ -52,11 +52,21 @@ JVK_CONSTANTS {
                             // 2 = 2D grid with linear-sampling trick — exact
                             //     Gaussian at ¼ the taps of a naive N²
                             //     nested loop (High).
-    float _pad0;            // pad block to 96 bytes (std140 multiple-of-16)
+    uint  tapCount;         // kernel 0: the full radius's taps in `taps`
+                            // (0: none made); keeps the block at 96 bytes
 } pc;
 
 JVK_TEXTURE(0, srcTexture);
 JVK_SAMPLER(0, srcSampler);
+
+// The 1D kernel at the FULL radius (maxRadius × blurStep), made once a pass
+// by the renderer as blur.frag's is: (offset, weight) pairs, the centre first,
+// normalised. A fragment at the full radius (all of the shape's interior)
+// reads it instead of an exp() per tap; one in the falloff band, whose
+// radius is its own, still makes its weights.
+JVK_STORAGE(0) Taps {
+    vec2 data[];
+} taps;
 
 layout(location = 0) in  vec2 fragUV;
 layout(location = 0) out vec4 outColor;
@@ -216,15 +226,28 @@ void main() {
         // to reference level and deep-region RMS improves 3.6×. The first
         // pass reads the true scene — always valid, no gate.
         bool gated = pc.direction.y != 0.0;
+        bool made = pc.tapCount > 0u && radius >= pc.maxRadius * pc.blurStep;
+        if (made) {
+            color *= taps.data[0].y;
+            totalWeight = taps.data[0].y;
+        }
         for (int p = 0; p < MAX_PAIRS; ++p) {
-            int i1 = 2 * p + 1;
-            if (i1 > N) break;
-            int i2 = i1 + 1;
+            float w, o;
+            if (made) {
+                if (uint(p) + 1u >= pc.tapCount) break;
+                vec2 t = taps.data[p + 1];
+                o = t.x;
+                w = t.y;
+            } else {
+                int i1 = 2 * p + 1;
+                if (i1 > N) break;
+                int i2 = i1 + 1;
 
-            float w1 = exp(-float(i1 * i1) / twoS2);
-            float w2 = (i2 <= N) ? exp(-float(i2 * i2) / twoS2) : 0.0;
-            float w  = w1 + w2;
-            float o  = (float(i1) * w1 + float(i2) * w2) / w;
+                float w1 = exp(-float(i1 * i1) / twoS2);
+                float w2 = (i2 <= N) ? exp(-float(i2 * i2) / twoS2) : 0.0;
+                w = w1 + w2;
+                o = (float(i1) * w1 + float(i2) * w2) / w;
+            }
 
             vec2 off = pc.direction * o * texelSize;
             float gP = 1.0, gM = 1.0;
