@@ -1,6 +1,6 @@
 # jvk
 
-A Vulkan renderer for JUCE plugin editors on macOS and Windows. Derive your editor from `jvk::AudioProcessorEditor` and your existing `paint()` code draws through Vulkan. If Vulkan isn't available on a machine, the editor falls back to JUCE's own renderer.
+A GPU renderer for JUCE plugin editors: Metal on macOS, Vulkan on Windows. Derive your editor from `jvk::AudioProcessorEditor` and your existing `paint()` code draws on the GPU. If the GPU isn't available on a machine, the editor falls back to JUCE's own renderer.
 
 ## Requirements
 
@@ -16,7 +16,7 @@ Download it from <https://vulkan.lunarg.com/sdk/home> and run the installer. Sel
 - **macOS:** install to the default `~/VulkanSDK/<version>`. jvk finds the newest SDK there when `VULKAN_SDK` isn't set.
 - **Windows:** the installer sets `VULKAN_SDK` for you. Restart your terminal or IDE afterwards so it sees the variable.
 
-The SDK is only needed to build. Your users don't need to install it: on macOS, jvk copies MoltenVK into your plugin bundle, and on Windows it uses the Vulkan driver that ships with the GPU.
+The SDK is only needed to build, on every platform: its `glslc` compiles jvk's shaders, and jvk uses its GLM headers. Your users don't need to install it: on macOS, jvk draws with Metal, which every Mac has, and on Windows it uses the Vulkan driver that ships with the GPU.
 
 ## 2. Add jvk to your project
 
@@ -44,13 +44,20 @@ target_sources(MyPlugin PRIVATE Source/PluginProcessor.cpp Source/PluginEditor.c
 
 target_link_libraries(MyPlugin PRIVATE jvk juce::juce_audio_utils)
 
-# Copies MoltenVK into each macOS bundle (does nothing on Windows)
+# Copies MoltenVK into each macOS bundle when the build has the Vulkan backend
+# (otherwise, and on Windows, it does nothing)
 foreach(format AU VST3 Standalone)
     jvk_bundle(MyPlugin_${format})
 endforeach()
 ```
 
-If JUCE hasn't been added when jvk is configured, jvk downloads JUCE 8.0.12 itself. The first configure also downloads msdfgen, plus MoltenVK on macOS, so it needs an internet connection.
+If JUCE hasn't been added when jvk is configured, jvk downloads JUCE 8.0.12 itself. The first configure also downloads msdfgen, plus MoltenVK when a macOS build has the Vulkan backend, so it needs an internet connection.
+
+### Backends
+
+`JVK_BACKENDS` picks the backends a build compiles, and so what it ships. On macOS it defaults to `Metal`: nothing of Vulkan is compiled or bundled. On Windows and Linux it is `Vulkan`.
+
+To compare the two on a Mac, configure with `-DJVK_BACKENDS="Metal;Vulkan"`. The build then carries MoltenVK as well, still draws with Metal, and draws with Vulkan when the app runs with `JVK_BACKEND=vulkan` in its environment.
 
 ## Drawing
 

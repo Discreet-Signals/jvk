@@ -8,6 +8,8 @@
 #   plain          the SPIR-V the translations start from (constants as a
 #                  uniform block at binding 24), translated to MSL by
 #                  SPIRV-Cross with each binding number as its Metal index
+# A build compiles the forms its backends take: the SPIR-V under JVK_VULKAN,
+# the MSL under JVK_METAL (jvk.h, CMake's JVK_BACKENDS).
 # Both are validated (spirv-val), and each program's layout (textures,
 # storage buffers, constants size, colour outputs) is reflected from the
 # SPIR-V (spirv-cross --reflect), never written by hand. The script also
@@ -74,7 +76,8 @@ STAGES = [
     ('hsv.frag',           'frag', 'hsv_frag',           True),
     ('shape_blur.frag',    'frag', 'shape_blur_frag',    True),
     ('path_blur.frag',     'frag', 'path_blur_frag',     True),
-    # The vertex stage of user jvk::Shaders: Vulkan only, and its push-constant
+    # The vertex stage of user jvk::Shaders: SPIR-V for every backend (Metal
+    # translates it with the user's stage at run time), and its push-constant
     # block is the users' native contract, so it stays as written.
     ('shader_region.vert', 'vert', 'shader_region_vert', False),
 ]
@@ -276,21 +279,33 @@ namespace jvk::shaders::bundle
 for src, kind, name, translate in STAGES:
     s = stages[name]
     out += '// %s\n' % src
-    out += 'alignas(4) inline constexpr uint32_t %s_spv[] = {\n%s\n};\n' % (name, words(s['spirv']))
+    spirv = 'alignas(4) inline constexpr uint32_t %s_spv[] = {\n%s\n};\n' % (name, words(s['spirv']))
+    out += '#if JVK_VULKAN\n%s#endif\n' % spirv if translate else spirv
     if translate:
-        out += 'inline constexpr char %s_msl[] =\n%s;\n' % (name, msl_literal(s['msl']))
+        out += '#if JVK_METAL\ninline constexpr char %s_msl[] =\n%s;\n#endif\n' % (name, msl_literal(s['msl']))
     out += '\n'
 
 def stage_init(name):
-    s = stages[name]
-    if s['msl']:
-        return '{ %s_spv, { %s_msl, sizeof(%s_msl) - 1 } }' % (name, name, name)
+    if stages[name]['msl']:
+        return '{ JVK_BUNDLE_SPIRV(%s), JVK_BUNDLE_MSL(%s) }' % (name, name)
     return '{ %s_spv, {} }' % name
 
 out += """// =============================================================================
 // Programs: name, vertex, fragment, textures, storage buffers, constants
-// bytes, colour outputs (reflected from the SPIR-V).
+// bytes, colour outputs (reflected from the SPIR-V). A form no backend of the
+// build takes is left empty.
 // =============================================================================
+
+#if JVK_VULKAN
+ #define JVK_BUNDLE_SPIRV(stage) stage##_spv
+#else
+ #define JVK_BUNDLE_SPIRV(stage) std::span<const uint32_t> {}
+#endif
+#if JVK_METAL
+ #define JVK_BUNDLE_MSL(stage) std::string_view { stage##_msl, sizeof (stage##_msl) - 1 }
+#else
+ #define JVK_BUNDLE_MSL(stage) std::string_view {}
+#endif
 
 """
 
@@ -303,8 +318,11 @@ for p in programs:
         p['name'], p['name'], stage_init(p['vert']), stage_init(p['frag']),
         p['textures'], p['storage'], p['constants'], p['outputs'])
 
-out += """// The vertex stage of user jvk::Shaders (shader_region.vert): Vulkan SPIR-V,
-// its push-constant block the users' native contract.
+out += """#undef JVK_BUNDLE_SPIRV
+#undef JVK_BUNDLE_MSL
+
+// The vertex stage of user jvk::Shaders (shader_region.vert): SPIR-V for every
+// backend, its push-constant block the users' native contract.
 inline const Stage shaderRegionVert %s;
 
 } // namespace jvk::shaders::bundle

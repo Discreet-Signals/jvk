@@ -34,6 +34,42 @@ set(MSDFGEN_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(msdfgen)
 
 # ==============================================================================
+# Backends — what this build compiles, and so what it ships. A list:
+#   Metal    macOS only, and its default: nothing of Vulkan is compiled or
+#            bundled (no MoltenVK, volk, VMA, nor the built-in shaders' SPIR-V).
+#   Vulkan   everywhere else; on macOS through MoltenVK, which jvk_bundle copies
+#            into each bundle.
+# "Metal;Vulkan" compiles both: Metal runs unless JVK_BACKEND=vulkan is set at
+# run time, to compare them.
+# ==============================================================================
+
+if (APPLE)
+    set(JVK_BACKENDS "Metal" CACHE STRING "jvk backends to compile: Metal, Vulkan, or both")
+else()
+    set(JVK_BACKENDS "Vulkan" CACHE STRING "jvk backends to compile: Vulkan")
+endif()
+foreach(_jvk_backend ${JVK_BACKENDS})
+    if (NOT _jvk_backend MATCHES "^(Metal|Vulkan)$")
+        message(FATAL_ERROR "jvk: unknown backend \"${_jvk_backend}\" in JVK_BACKENDS (Metal, Vulkan)")
+    endif()
+endforeach()
+set(JVK_METAL  FALSE)
+set(JVK_VULKAN FALSE)
+if ("Metal" IN_LIST JVK_BACKENDS)
+    set(JVK_METAL TRUE)
+endif()
+if ("Vulkan" IN_LIST JVK_BACKENDS)
+    set(JVK_VULKAN TRUE)
+endif()
+if (JVK_METAL AND NOT APPLE)
+    message(FATAL_ERROR "jvk: the Metal backend is macOS only")
+endif()
+if (NOT JVK_METAL AND NOT JVK_VULKAN)
+    message(FATAL_ERROR "jvk: JVK_BACKENDS names no backend")
+endif()
+message(STATUS "jvk: backends ${JVK_BACKENDS}")
+
+# ==============================================================================
 # jvk module — manual INTERFACE target
 #
 # We cannot use juce_add_module() because it does a GLOB_RECURSE from the
@@ -54,18 +90,21 @@ if (NOT TARGET jvk)
     # Module sources — compiled by each consuming target (standard JUCE module pattern).
     # On macOS the .mm includes the .cpp; on other platforms compile .cpp directly.
     if (APPLE)
-        # jvk_spirv_cross.cpp: the Metal backend's SPIR-V → MSL translator, its own TU.
-        target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk.mm"
-                                     "${CMAKE_CURRENT_SOURCE_DIR}/jvk_spirv_cross.cpp")
+        target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk.mm")
     else()
         target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk.cpp")
+    endif()
+    # The Metal backend's SPIR-V → MSL translator, its own TU.
+    if (JVK_METAL)
+        target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk_spirv_cross.cpp")
     endif()
 
     # C++20 required for std::span, std::optional
     target_compile_features(jvk INTERFACE cxx_std_20)
 
-    # Tell JUCE this module is available
-    target_compile_definitions(jvk INTERFACE JUCE_MODULE_AVAILABLE_jvk=1)
+    # Tell JUCE this module is available, and jvk.h which backends to compile
+    target_compile_definitions(jvk INTERFACE JUCE_MODULE_AVAILABLE_jvk=1
+        JVK_METAL=$<BOOL:${JVK_METAL}> JVK_VULKAN=$<BOOL:${JVK_VULKAN}>)
 
     # MSDF text rendering
     target_link_libraries(jvk INTERFACE msdfgen::msdfgen-core)
@@ -105,7 +144,9 @@ endif()
 
 find_package(Vulkan REQUIRED)
 # Headers only: jvk LOADS Vulkan at run time and never links it (volk, see jvk.h
-# and loadVulkan in Device.cpp), so a binary always loads, Vulkan or not.
+# and loadVulkan in Device.cpp), so a binary always loads, Vulkan or not. Every
+# build takes the SDK, Metal alone too: its glslc compiles the shaders, and its
+# include folder holds the glm core uses.
 target_link_libraries(jvk INTERFACE Vulkan::Headers)
 
 # ==============================================================================
@@ -183,8 +224,11 @@ target_sources(jvk INTERFACE "${JVK_SHADER_HEADER}")
 # ==============================================================================
 
 if (APPLE)
-    target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_MACOS_MVK)
     target_link_libraries(jvk INTERFACE "-framework QuartzCore" "-framework Metal" "-framework CoreGraphics")
+endif()
+
+if (APPLE AND JVK_VULKAN)
+    target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_MACOS_MVK)
 
     # The SHIPPED driver is pinned here, never read from whichever SDK is installed:
     # MoltenVK 1.4.0 is the last build that runs on macOS 10.15 (1.4.1 raised the
@@ -218,7 +262,7 @@ if (APPLE)
 elseif (WIN32)
     target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_WIN32_KHR)
 
-elseif (UNIX)
+elseif (UNIX AND NOT APPLE)
     find_package(X11 QUIET)
     if (X11_FOUND)
         target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_XLIB_KHR)
@@ -228,12 +272,25 @@ endif()
 # ==============================================================================
 # jvk_bundle — per plugin-format target runtime setup. Call from the consuming
 # project after juce_add_plugin (or any target that produces a bundle/exe).
-#   macOS:   copy libMoltenVK into the bundle; Debug adds the loader + ICD manifest.
+#   macOS, Vulkan: copy libMoltenVK into the bundle; Debug adds the loader + ICD
+#            manifest.
+#   macOS, Metal alone: nothing to copy; takes out what a Vulkan build left.
 #   Windows, Linux: no-op. jvk loads the system loader the GPU driver installs;
 #            we ship none (Khronos strongly discourages a private copy).
 # ==============================================================================
 function(jvk_bundle TARGET)
-    if (APPLE AND DS_VULKAN_MVK_LIB)
+    if (APPLE AND NOT "Vulkan" IN_LIST JVK_BACKENDS)
+        # A bundle built before with Vulkan keeps its libraries until removed,
+        # and Frameworks with them when nothing else is in it.
+        set(_contents "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents")
+        add_custom_command(TARGET ${TARGET} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E rm -rf "${_contents}/Frameworks/libMoltenVK.dylib"
+                "${_contents}/Frameworks/libvulkan.1.dylib" "${_contents}/Resources/vulkan"
+            COMMAND find "${_contents}" -maxdepth 1 -name Frameworks -type d -empty -delete
+            COMMENT "jvk: ${TARGET} draws with Metal, no Vulkan libraries"
+            VERBATIM
+        )
+    elseif (APPLE)
         set(_fw  "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Frameworks")
         set(_icd "$<TARGET_BUNDLE_DIR:${TARGET}>/Contents/Resources/vulkan/icd.d")
         # Outside Debug, `-E true` swallows the loader/manifest steps; the rm first

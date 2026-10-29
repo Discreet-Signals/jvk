@@ -20,6 +20,7 @@ namespace jvk::shaders::bundle
 // =============================================================================
 
 // ui2d.vert
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t ui2d_vert_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x00000037, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -85,6 +86,8 @@ alignas(4) inline constexpr uint32_t ui2d_vert_spv[] = {
     0x0004003d, 0x0000001b, 0x00000036, 0x00000035, 0x0003003e, 0x00000034, 0x00000036, 0x000100fd,
     0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char ui2d_vert_msl[] =
 R"jvkmsl(#include <metal_stdlib>
 #include <simd/simd.h>
@@ -130,8 +133,10 @@ vertex main0_out main0(main0_in in [[stage_in]], constant JvkConstants& pc [[buf
 }
 
 )jvkmsl";
+#endif
 
 // ui2d.frag
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t ui2d_frag_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x0000029b, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
     0x00000032, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
@@ -630,6 +635,8 @@ alignas(4) inline constexpr uint32_t ui2d_frag_spv[] = {
     0x0004003d, 0x0000001f, 0x00000285, 0x00000278, 0x0003003e, 0x00000276, 0x00000285, 0x000100fd,
     0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char ui2d_frag_msl[] =
 R"jvkmsl(#pragma clang diagnostic ignored "-Wmissing-prototypes"
 
@@ -960,8 +967,10 @@ fragment main0_out main0(main0_in in [[stage_in]], const device FrameData& frame
 }
 
 )jvkmsl";
+#endif
 
 // noise.frag
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t noise_frag_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x00000048, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -1017,6 +1026,8 @@ alignas(4) inline constexpr uint32_t noise_frag_spv[] = {
     0x0000002a, 0x00000029, 0x00050085, 0x00000006, 0x0000002b, 0x00000027, 0x0000002a, 0x0006000c,
     0x00000006, 0x0000002c, 0x00000001, 0x0000000a, 0x0000002b, 0x000200fe, 0x0000002c, 0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char noise_frag_msl[] =
 R"jvkmsl(#pragma clang diagnostic ignored "-Wmissing-prototypes"
 
@@ -1053,8 +1064,10 @@ fragment main0_out main0(main0_in in [[stage_in]], float4 gl_FragCoord [[positio
 }
 
 )jvkmsl";
+#endif
 
 // path_sdf.vert
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t path_sdf_vert_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x00000039, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -1134,6 +1147,8 @@ alignas(4) inline constexpr uint32_t path_sdf_vert_spv[] = {
     0x00000034, 0x0000002b, 0x00050041, 0x0000000e, 0x00000038, 0x00000032, 0x00000024, 0x0003003e,
     0x00000038, 0x00000037, 0x000100fd, 0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char path_sdf_vert_msl[] =
 R"jvkmsl(#include <metal_stdlib>
 #include <simd/simd.h>
@@ -1189,8 +1204,10 @@ vertex main0_out main0(main0_in in [[stage_in]], constant JvkConstants& pc [[buf
 }
 
 )jvkmsl";
+#endif
 
 // path_sdf.frag
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t path_sdf_frag_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x00000233, 0x00000000, 0x00020011, 0x00000001, 0x00020011,
     0x00000032, 0x0006000b, 0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e,
@@ -1628,6 +1645,8 @@ alignas(4) inline constexpr uint32_t path_sdf_frag_spv[] = {
     0x00000143, 0x000200f9, 0x00000138, 0x000200f8, 0x00000138, 0x0004003d, 0x0000000f, 0x00000144,
     0x00000136, 0x0003003e, 0x00000134, 0x00000144, 0x000100fd, 0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char path_sdf_frag_msl[] =
 R"jvkmsl(#pragma clang diagnostic ignored "-Wmissing-prototypes"
 
@@ -1922,8 +1941,10 @@ R"jvkmsl(                }
 }
 
 )jvkmsl";
+#endif
 
 // clip.vert
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t clip_vert_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x0000002c, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -1970,6 +1991,8 @@ alignas(4) inline constexpr uint32_t clip_vert_spv[] = {
     0x00000028, 0x00000026, 0x0000001b, 0x00050041, 0x0000002a, 0x0000002b, 0x00000024, 0x00000014,
     0x0003003e, 0x0000002b, 0x00000029, 0x000100fd, 0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char clip_vert_msl[] =
 R"jvkmsl(#include <metal_stdlib>
 #include <simd/simd.h>
@@ -2003,8 +2026,10 @@ vertex main0_out main0(main0_in in [[stage_in]], constant JvkConstants& pc [[buf
 }
 
 )jvkmsl";
+#endif
 
 // clip.frag
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t clip_frag_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x00000101, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -2205,6 +2230,8 @@ alignas(4) inline constexpr uint32_t clip_frag_spv[] = {
     0x00000065, 0x0000003a, 0x000600a9, 0x00000010, 0x00000068, 0x00000065, 0x00000066, 0x00000067,
     0x000200fe, 0x00000068, 0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char clip_frag_msl[] =
 R"jvkmsl(#pragma clang diagnostic ignored "-Wmissing-prototypes"
 
@@ -2321,8 +2348,10 @@ R"jvkmsl(                segsBase = (pc.segmentStart + pc.stripCount) + uint(ent
 }
 
 )jvkmsl";
+#endif
 
 // clip_mask.frag
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t clip_mask_frag_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x0000005d, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -2401,6 +2430,8 @@ alignas(4) inline constexpr uint32_t clip_mask_frag_spv[] = {
     0x0000005a, 0x0000005b, 0x000200f8, 0x0000005a, 0x000100fc, 0x000200f8, 0x0000005b, 0x000100fd,
     0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char clip_mask_frag_msl[] =
 R"jvkmsl(#include <metal_stdlib>
 #include <simd/simd.h>
@@ -2457,8 +2488,10 @@ fragment void main0(main0_in in [[stage_in]], constant JvkConstants& pc [[buffer
 }
 
 )jvkmsl";
+#endif
 
 // blur.vert
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t blur_vert_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x0000002e, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -2502,6 +2535,8 @@ alignas(4) inline constexpr uint32_t blur_vert_spv[] = {
     0x00000029, 0x0000002a, 0x00000028, 0x00000025, 0x00050041, 0x0000002c, 0x0000002d, 0x00000020,
     0x00000021, 0x0003003e, 0x0000002d, 0x0000002b, 0x000100fd, 0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char blur_vert_msl[] =
 R"jvkmsl(#include <metal_stdlib>
 #include <simd/simd.h>
@@ -2525,8 +2560,10 @@ vertex main0_out main0(uint gl_VertexIndex [[vertex_id]])
 }
 
 )jvkmsl";
+#endif
 
 // blur.frag
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t blur_frag_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x000000b2, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -2659,6 +2696,8 @@ alignas(4) inline constexpr uint32_t blur_frag_spv[] = {
     0x00050088, 0x0000001e, 0x000000b1, 0x000000ae, 0x000000b0, 0x0003003e, 0x00000020, 0x000000b1,
     0x000100fd, 0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char blur_frag_msl[] =
 R"jvkmsl(#include <metal_stdlib>
 #include <simd/simd.h>
@@ -2727,8 +2766,10 @@ fragment main0_out main0(main0_in in [[stage_in]], constant JvkConstants& pc [[b
 }
 
 )jvkmsl";
+#endif
 
 // copy.frag
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t copy_frag_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x0000001c, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -2764,6 +2805,8 @@ alignas(4) inline constexpr uint32_t copy_frag_spv[] = {
     0x00000016, 0x00050057, 0x00000007, 0x00000018, 0x00000013, 0x00000017, 0x0003003e, 0x00000009,
     0x00000018, 0x000100fd, 0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char copy_frag_msl[] =
 R"jvkmsl(#include <metal_stdlib>
 #include <simd/simd.h>
@@ -2795,8 +2838,10 @@ fragment main0_out main0(main0_in in [[stage_in]], texture2d<float> srcTexture [
 }
 
 )jvkmsl";
+#endif
 
 // hsv.frag
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t hsv_frag_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x0000015f, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -3046,6 +3091,8 @@ alignas(4) inline constexpr uint32_t hsv_frag_spv[] = {
     0x00060050, 0x00000007, 0x000000ed, 0x000000d6, 0x000000e1, 0x000000ec, 0x000200fe, 0x000000ed,
     0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char hsv_frag_msl[] =
 R"jvkmsl(#pragma clang diagnostic ignored "-Wmissing-prototypes"
 
@@ -3133,8 +3180,10 @@ fragment main0_out main0(constant JvkConstants& pc [[buffer(24)]], texture2d<flo
 }
 
 )jvkmsl";
+#endif
 
 // shape_blur.frag
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t shape_blur_frag_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x0000039a, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -3795,6 +3844,8 @@ alignas(4) inline constexpr uint32_t shape_blur_frag_spv[] = {
     0x00000001, 0x00000004, 0x00000142, 0x00050057, 0x00000029, 0x00000144, 0x00000141, 0x00000143,
     0x000200fe, 0x00000144, 0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char shape_blur_frag_msl[] =
 R"jvkmsl(#pragma clang diagnostic ignored "-Wmissing-prototypes"
 
@@ -4149,8 +4200,10 @@ R"jvkmsl(                totalWeight += (2.0 * wyT);
 }
 
 )jvkmsl";
+#endif
 
 // path_blur.frag
+#if JVK_VULKAN
 alignas(4) inline constexpr uint32_t path_blur_frag_spv[] = {
     0x07230203, 0x00010000, 0x000d000b, 0x000003bb, 0x00000000, 0x00020011, 0x00000001, 0x0006000b,
     0x00000001, 0x4c534c47, 0x6474732e, 0x3035342e, 0x00000000, 0x0003000e, 0x00000000, 0x00000001,
@@ -4833,6 +4886,8 @@ alignas(4) inline constexpr uint32_t path_blur_frag_spv[] = {
     0x0006000c, 0x00000007, 0x00000166, 0x00000001, 0x00000004, 0x00000165, 0x00050057, 0x0000001d,
     0x00000167, 0x00000164, 0x00000166, 0x000200fe, 0x00000167, 0x00010038,
 };
+#endif
+#if JVK_METAL
 inline constexpr char path_blur_frag_msl[] =
 R"jvkmsl(#pragma clang diagnostic ignored "-Wmissing-prototypes"
 
@@ -5198,6 +5253,7 @@ R"jvkmsl(                if (x1_1 > N)
 }
 
 )jvkmsl";
+#endif
 
 // shader_region.vert
 alignas(4) inline constexpr uint32_t shader_region_vert_spv[] = {
@@ -5275,41 +5331,56 @@ alignas(4) inline constexpr uint32_t shader_region_vert_spv[] = {
 
 // =============================================================================
 // Programs: name, vertex, fragment, textures, storage buffers, constants
-// bytes, colour outputs (reflected from the SPIR-V).
+// bytes, colour outputs (reflected from the SPIR-V). A form no backend of the
+// build takes is left empty.
 // =============================================================================
 
+#if JVK_VULKAN
+ #define JVK_BUNDLE_SPIRV(stage) stage##_spv
+#else
+ #define JVK_BUNDLE_SPIRV(stage) std::span<const uint32_t> {}
+#endif
+#if JVK_METAL
+ #define JVK_BUNDLE_MSL(stage) std::string_view { stage##_msl, sizeof (stage##_msl) - 1 }
+#else
+ #define JVK_BUNDLE_MSL(stage) std::string_view {}
+#endif
+
 // ui2d.vert + ui2d.frag — constants: vec2 viewportSize @0, int paintsMain @8, int _pad @12
-inline const Program ui2d { "ui2d", { ui2d_vert_spv, { ui2d_vert_msl, sizeof(ui2d_vert_msl) - 1 } }, { ui2d_frag_spv, { ui2d_frag_msl, sizeof(ui2d_frag_msl) - 1 } }, 2, 1, 16, 8 };
+inline const Program ui2d { "ui2d", { JVK_BUNDLE_SPIRV(ui2d_vert), JVK_BUNDLE_MSL(ui2d_vert) }, { JVK_BUNDLE_SPIRV(ui2d_frag), JVK_BUNDLE_MSL(ui2d_frag) }, 2, 1, 16, 8 };
 
 // ui2d.vert + noise.frag — constants: vec2 viewportSize @0, int paintsMain @8, int _pad @12
-inline const Program noise { "noise", { ui2d_vert_spv, { ui2d_vert_msl, sizeof(ui2d_vert_msl) - 1 } }, { noise_frag_spv, { noise_frag_msl, sizeof(noise_frag_msl) - 1 } }, 0, 0, 16, 1 };
+inline const Program noise { "noise", { JVK_BUNDLE_SPIRV(ui2d_vert), JVK_BUNDLE_MSL(ui2d_vert) }, { JVK_BUNDLE_SPIRV(noise_frag), JVK_BUNDLE_MSL(noise_frag) }, 0, 0, 16, 1 };
 
 // path_sdf.vert + path_sdf.frag — constants: vec2 viewportSize @0, uint segmentStart @8, uint segmentCount @12, uint fillRule @16, uint _r0 @20, float tileW @24, float _r2 @28, int paintsMain @32, int _p0 @36, int _p1 @40, int _p2 @44
-inline const Program path { "path", { path_sdf_vert_spv, { path_sdf_vert_msl, sizeof(path_sdf_vert_msl) - 1 } }, { path_sdf_frag_spv, { path_sdf_frag_msl, sizeof(path_sdf_frag_msl) - 1 } }, 1, 2, 48, 8 };
+inline const Program path { "path", { JVK_BUNDLE_SPIRV(path_sdf_vert), JVK_BUNDLE_MSL(path_sdf_vert) }, { JVK_BUNDLE_SPIRV(path_sdf_frag), JVK_BUNDLE_MSL(path_sdf_frag) }, 1, 2, 48, 8 };
 
 // clip.vert + clip.frag — constants: vec2 viewportSize @0, vec2 center @8, vec2 halfSize @16, float cornerRadius @24, uint shapeType @28, uint segmentStart @32, uint segmentCount @36, uint fillRule @40, uint stripCount @44, float stripMinY @48, float invStripH @52
-inline const Program clip { "clip", { clip_vert_spv, { clip_vert_msl, sizeof(clip_vert_msl) - 1 } }, { clip_frag_spv, { clip_frag_msl, sizeof(clip_frag_msl) - 1 } }, 0, 1, 64, 0 };
+inline const Program clip { "clip", { JVK_BUNDLE_SPIRV(clip_vert), JVK_BUNDLE_MSL(clip_vert) }, { JVK_BUNDLE_SPIRV(clip_frag), JVK_BUNDLE_MSL(clip_frag) }, 0, 1, 64, 0 };
 
 // clip.vert + clip_mask.frag — constants: vec2 viewportSize @0, vec2 toMaskX @8, vec2 toMaskY @16, vec2 toMaskOffset @24, vec2 maskSize @32, uint nearest @40, uint _pad @44
-inline const Program clipMask { "clipMask", { clip_vert_spv, { clip_vert_msl, sizeof(clip_vert_msl) - 1 } }, { clip_mask_frag_spv, { clip_mask_frag_msl, sizeof(clip_mask_frag_msl) - 1 } }, 1, 0, 48, 0 };
+inline const Program clipMask { "clipMask", { JVK_BUNDLE_SPIRV(clip_vert), JVK_BUNDLE_MSL(clip_vert) }, { JVK_BUNDLE_SPIRV(clip_mask_frag), JVK_BUNDLE_MSL(clip_mask_frag) }, 1, 0, 48, 0 };
 
 // blur.vert + blur.frag — constants: vec2 viewportSize @0, vec2 direction @8, float radius @16
-inline const Program blur { "blur", { blur_vert_spv, { blur_vert_msl, sizeof(blur_vert_msl) - 1 } }, { blur_frag_spv, { blur_frag_msl, sizeof(blur_frag_msl) - 1 } }, 1, 0, 32, 1 };
+inline const Program blur { "blur", { JVK_BUNDLE_SPIRV(blur_vert), JVK_BUNDLE_MSL(blur_vert) }, { JVK_BUNDLE_SPIRV(blur_frag), JVK_BUNDLE_MSL(blur_frag) }, 1, 0, 32, 1 };
 
 // blur.vert + copy.frag — constants: vec2 viewportSize @0, vec2 direction @8, float radius @16
-inline const Program copy { "copy", { blur_vert_spv, { blur_vert_msl, sizeof(blur_vert_msl) - 1 } }, { copy_frag_spv, { copy_frag_msl, sizeof(copy_frag_msl) - 1 } }, 1, 0, 32, 1 };
+inline const Program copy { "copy", { JVK_BUNDLE_SPIRV(blur_vert), JVK_BUNDLE_MSL(blur_vert) }, { JVK_BUNDLE_SPIRV(copy_frag), JVK_BUNDLE_MSL(copy_frag) }, 1, 0, 32, 1 };
 
 // blur.vert + hsv.frag — constants: vec2 viewportSize @0, float scaleH @8, float scaleS @12, float scaleV @16, float deltaH @20, float deltaS @24, float deltaV @28
-inline const Program hsv { "hsv", { blur_vert_spv, { blur_vert_msl, sizeof(blur_vert_msl) - 1 } }, { hsv_frag_spv, { hsv_frag_msl, sizeof(hsv_frag_msl) - 1 } }, 1, 0, 32, 1 };
+inline const Program hsv { "hsv", { JVK_BUNDLE_SPIRV(blur_vert), JVK_BUNDLE_MSL(blur_vert) }, { JVK_BUNDLE_SPIRV(hsv_frag), JVK_BUNDLE_MSL(hsv_frag) }, 1, 0, 32, 1 };
 
 // blur.vert + shape_blur.frag — constants: vec2 viewportSize @0, vec2 direction @8, vec2 invCol0 @16, vec2 invCol1 @24, vec2 invCol2 @32, vec2 shapeHalf @40, vec2 lineB @48, float maxRadius @56, float falloff @60, float blurStep @64, float cornerRadius @68, float lineThickness @72, int shapeType @76, int edgePlacement @80, int inverted @84, int kernelType @88, float _pad0 @92
-inline const Program shapeBlur { "shapeBlur", { blur_vert_spv, { blur_vert_msl, sizeof(blur_vert_msl) - 1 } }, { shape_blur_frag_spv, { shape_blur_frag_msl, sizeof(shape_blur_frag_msl) - 1 } }, 1, 0, 96, 1 };
+inline const Program shapeBlur { "shapeBlur", { JVK_BUNDLE_SPIRV(blur_vert), JVK_BUNDLE_MSL(blur_vert) }, { JVK_BUNDLE_SPIRV(shape_blur_frag), JVK_BUNDLE_MSL(shape_blur_frag) }, 1, 0, 96, 1 };
 
 // blur.vert + path_blur.frag — constants: vec2 viewportSize @0, vec2 direction @8, float maxRadius @16, float falloff @20, float strokeHalfWidth @24, uint segmentStart @28, uint segmentCount @32, uint fillRule @36, int edgePlacement @40, int inverted @44, int kernelType @48, uint stripCount @52, float stripMinY @56, float invStripH @60
-inline const Program pathBlur { "pathBlur", { blur_vert_spv, { blur_vert_msl, sizeof(blur_vert_msl) - 1 } }, { path_blur_frag_spv, { path_blur_frag_msl, sizeof(path_blur_frag_msl) - 1 } }, 1, 1, 64, 1 };
+inline const Program pathBlur { "pathBlur", { JVK_BUNDLE_SPIRV(blur_vert), JVK_BUNDLE_MSL(blur_vert) }, { JVK_BUNDLE_SPIRV(path_blur_frag), JVK_BUNDLE_MSL(path_blur_frag) }, 1, 1, 64, 1 };
 
-// The vertex stage of user jvk::Shaders (shader_region.vert): Vulkan SPIR-V,
-// its push-constant block the users' native contract.
+#undef JVK_BUNDLE_SPIRV
+#undef JVK_BUNDLE_MSL
+
+// The vertex stage of user jvk::Shaders (shader_region.vert): SPIR-V for every
+// backend, its push-constant block the users' native contract.
 inline const Stage shaderRegionVert { shader_region_vert_spv, {} };
 
 } // namespace jvk::shaders::bundle

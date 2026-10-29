@@ -13,7 +13,8 @@
 */
 
 // Compile the vendored Vulkan Memory Allocator and volk implementations into
-// this (the module's single) TU. Must precede jvk.h, which includes both headers.
+// this (the module's single) TU. Must precede jvk.h, which includes both headers
+// when the build has the Vulkan backend.
 #define VMA_IMPLEMENTATION
 #define VOLK_IMPLEMENTATION
 #include "jvk.h"
@@ -28,10 +29,12 @@
 #include "include/jvk/hosts/ShaderImage.cpp"
 
 // Vulkan backend
+#if JVK_VULKAN
 #include "include/jvk/backends/vulkan/Device.cpp"
 #include "include/jvk/backends/vulkan/VulkanBackend.cpp"
 #include "include/jvk/backends/vulkan/VulkanSurface.cpp"
 #include "include/jvk/backends/vulkan/VulkanHost.cpp"
+#endif
 
 // SPIRV-Reflect (C source)
 extern "C" {

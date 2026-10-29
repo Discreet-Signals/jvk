@@ -8,7 +8,7 @@ namespace jvk {
 // The JUCE host of the translation layer (TRANSLATION_LAYER.md, "Hosts"): its
 // paint runs through jvk::Graphics into a core Renderer, which lowers each
 // frame on its worker and submits it to a window surface. Which backend draws
-// is the WindowHost's business (createWindowHost: Vulkan for now); the frame
+// is the WindowHost's business (createWindowHost: the build's); the frame
 // loop, paint, resize policy and the fall back to JUCE's renderer are here.
 // =============================================================================
 

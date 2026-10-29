@@ -19,7 +19,7 @@
  vendor:        Discreet Signals
  version:       2.0
  name:          Discreet Signals Vulkan Module
- description:   GPU juce::Graphics translation layer, with a Vulkan backend
+ description:   GPU juce::Graphics translation layer, with Metal and Vulkan backends
  website:       https://github.com/Discreet-Signals/jvk
  searchpaths:   include
  dependencies:  juce_core, juce_events, juce_data_structures, juce_graphics, juce_gui_basics, juce_gui_extra, juce_audio_processors
@@ -70,7 +70,20 @@
 //                      offscreen ShaderImage.
 //   backends/vulkan/   the Vulkan backend: gpu::Backend and gpu::Surface on
 //                      Vulkan, and the Vulkan window host.
+//   backends/metal/    the same on Metal (jvk.mm).
 // =============================================================================
+
+// The backends this build compiles (CMake: JVK_BACKENDS), each 0 or 1. A build
+// without jvk's CMake gets its default: Metal on macOS, Vulkan elsewhere.
+#ifndef JVK_METAL
+ #define JVK_METAL JUCE_MAC
+#endif
+#ifndef JVK_VULKAN
+ #define JVK_VULKAN (! JUCE_MAC)
+#endif
+#if ! (JVK_METAL || JVK_VULKAN)
+ #error "jvk: no backend (JVK_BACKENDS)"
+#endif
 
 // ---- Core: the backend interface (jvk::gpu) --------------------------------
 #include "include/jvk/core/PixelFormat.h"
@@ -105,6 +118,12 @@
 #include "include/jvk/hosts/WindowHost.h"
 #include "include/jvk/hosts/AudioProcessorEditor.h"
 #include "include/jvk/hosts/ShaderImage.h"
+#if JUCE_MAC
+ #include "include/jvk/hosts/macos/NSViewGenerator.h"   // the view both macOS backends draw into
+#endif
+
+// ---- Backends (the Metal one: jvk.mm) ---------------------------------------
+#include "include/jvk/backends/SlotTable.h"   // the handle tables both share
 
 // ---- Vulkan backend ---------------------------------------------------------
 //
@@ -113,6 +132,7 @@
 // function pointer that jvk::Device fills (vendored volk, the Vulkan SDK's
 // copy; the implementation is compiled once in jvk.cpp via VOLK_IMPLEMENTATION).
 // With VK_NO_PROTOTYPES, VMA fetches its functions through the two it is given.
+#if JVK_VULKAN
 #ifndef VK_NO_PROTOTYPES
  #define VK_NO_PROTOTYPES
 #endif
@@ -122,13 +142,11 @@
 // implementation is compiled once in jvk.cpp via VMA_IMPLEMENTATION.
 #include "include/jvk/backends/vulkan/vendor/vk_mem_alloc.h"
 
-#include "include/jvk/backends/SlotTable.h"
 #include "include/jvk/backends/vulkan/Formats.h"
 #include "include/jvk/backends/vulkan/Memory.h"
 #include "include/jvk/backends/vulkan/Resource.h"
 #include "include/jvk/backends/vulkan/Device.h"
 #if JUCE_MAC
- #include "include/jvk/backends/vulkan/macos/NSViewGenerator.h"
  #include "include/jvk/backends/vulkan/macos/MetalCapabilities.h"
 #elif JUCE_WINDOWS
  #include "include/jvk/backends/vulkan/windows/HWNDGenerator.h"
@@ -136,3 +154,4 @@
 #include "include/jvk/backends/vulkan/VulkanBackend.h"
 #include "include/jvk/backends/vulkan/VulkanSurface.h"
 #include "include/jvk/backends/vulkan/VulkanHost.h"
+#endif

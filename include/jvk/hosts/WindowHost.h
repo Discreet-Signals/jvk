@@ -23,8 +23,8 @@ namespace jvk
 // editor's peer with a Surface presenting into it. Everything else (the frame
 // loop, paint, the software fallback, resize policy) is the editor's.
 //
-// One per editor. The Vulkan host is backends/vulkan/VulkanHost.h;
-// createWindowHost() picks the build's default.
+// One per editor. The hosts are backends/metal/MetalHost.mm and
+// backends/vulkan/VulkanHost.h; createWindowHost() picks the build's.
 // =============================================================================
 
 class WindowHost

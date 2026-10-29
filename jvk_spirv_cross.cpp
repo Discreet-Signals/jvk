@@ -16,7 +16,7 @@
  ------------------------------------------------------------------------------
 */
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && (! defined(JVK_METAL) || JVK_METAL)
 
 // Its own namespace: a host that links another SPIRV-Cross keeps its own.
 #define SPIRV_CROSS_NAMESPACE_OVERRIDE jvk_spirv_cross

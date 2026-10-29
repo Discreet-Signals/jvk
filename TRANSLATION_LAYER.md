@@ -252,11 +252,15 @@ land before any second backend:
 - **`jvk::AudioProcessorEditor`** (`hosts/`) is generic over a `WindowHost`
   (`hosts/WindowHost.h`): the backend, plus a native child view with a window
   `Surface`. The render loop, `paintEntireComponent`, the software fallback, resize
-  policy and the timer are the editor's. `createWindowHost()` (`hosts/WindowHost.cpp`)
-  picks the host: Metal on macOS (`JVK_BACKEND=vulkan` runs MoltenVK instead, to compare
-  them), Vulkan elsewhere. The Vulkan host (`backends/vulkan/VulkanHost`) keeps
-  `NSViewGenerator` / `HWNDGenerator` and the swapchain; the Metal host
-  (`backends/metal/MetalHost`) draws the same `NSViewGenerator` view's `CAMetalLayer`.
+  policy and the timer are the editor's. A build compiles the backends CMake's
+  `JVK_BACKENDS` names (`JVK_METAL`, `JVK_VULKAN` in `jvk.h`): Metal alone on macOS by
+  default, so nothing of Vulkan is compiled or bundled (no MoltenVK, volk, VMA, nor the
+  built-in shaders' SPIR-V); Vulkan elsewhere. `createWindowHost()`
+  (`hosts/WindowHost.cpp`) picks the host among them: Metal on macOS, unless the build
+  has both and `JVK_BACKEND=vulkan` runs MoltenVK instead, to compare them. Both macOS
+  hosts draw into the same native view (`hosts/macos/NSViewGenerator`): the Vulkan host
+  (`backends/vulkan/VulkanHost`, with `HWNDGenerator` on Windows) through the swapchain,
+  the Metal host (`backends/metal/MetalHost`) through its `CAMetalLayer`.
 - **Offscreen host.** `ShaderImage` (`hosts/`) is one pass of one draw into a texture
   on an offscreen `Surface` of `defaultBackend()`, read back a frame late.
   `jvk::ImageType` keeps a CPU mirror as its source of truth and its own texture,
@@ -272,7 +276,8 @@ land before any second backend:
 include/jvk/
   core/                the translation layer (no GPU API; CMake checks)
     gpu/               the backend interface: Types, PipelineState, FramePacket, Backend
-    shaders/           Program.h (the bundle's shape), Bundle.h (generated: SPIR-V + MSL)
+    shaders/           Program.h (the bundle's shape), Bundle.h (generated: SPIR-V + MSL,
+                       each compiled by the builds whose backends take it)
     Recorder           P2: DrawOp, DrawCommand, Arena, captures, record target, liveness, segments
     Params, Targets    command payloads; render targets and their blend rules
     Context            per backend: built-in programs, interned pipelines, default textures,
@@ -284,7 +289,8 @@ include/jvk/
     ops/               lowering of the 2D draws (ColorDraw) and the programs' constants
     Graphics, Shader, ImageType
                        the JUCE-facing API
-  hosts/               WindowHost (interface), AudioProcessorEditor, ShaderImage
+  hosts/               WindowHost (interface), AudioProcessorEditor, ShaderImage;
+                       macos/NSViewGenerator (the native view both macOS backends draw into)
   backends/SlotTable   the handle tables both backends share
   backends/vulkan/     VulkanBackend, VulkanSurface (packet executor, swapchain, offscreen),
                        VulkanHost; Device, Memory, Resource, Formats, macos/, windows/, vendor/
