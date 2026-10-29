@@ -24,4 +24,14 @@
 #if JUCE_MAC
 #include "include/jvk/backends/vulkan/macos/NSViewGenerator.mm"
 #include "include/jvk/backends/vulkan/macos/MetalCapabilities.mm"
+
+// Metal backend (the macOS default: hosts/WindowHost.cpp). Its SPIR-V → MSL
+// translator is the separate jvk_spirv_cross.cpp.
+#import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#include "include/jvk/backends/metal/SpirvToMsl.h"
+#include "include/jvk/backends/metal/MetalBackend.h"
+#include "include/jvk/backends/metal/MetalBackend.mm"
+#include "include/jvk/backends/metal/MetalSurface.mm"
+#include "include/jvk/backends/metal/MetalHost.mm"
 #endif

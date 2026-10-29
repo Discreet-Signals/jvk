@@ -10,16 +10,6 @@
  ------------------------------------------------------------------------------
 */
 
-namespace jvk
-{
-
-std::unique_ptr<WindowHost> createWindowHost()
-{
-    return std::make_unique<vulkan::WindowHost>();
-}
-
-} // namespace jvk
-
 namespace jvk::vulkan
 {
 

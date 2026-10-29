@@ -24,6 +24,7 @@
 #include "include/jvk/core/Shader.cpp"
 
 // Hosts
+#include "include/jvk/hosts/WindowHost.cpp"
 #include "include/jvk/hosts/ShaderImage.cpp"
 
 // Vulkan backend

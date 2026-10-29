@@ -95,6 +95,7 @@ gpu::ProgramId Context::createProgram(const shaders::Program& p)
 {
     gpu::ProgramDesc desc;
     desc.name = p.name;
+    desc.format = caps().shaderFormat;
     if (caps().shaderFormat == gpu::ShaderFormat::MSL)
     {
         if (p.vertex.msl.empty() || p.fragment.msl.empty()) return {};

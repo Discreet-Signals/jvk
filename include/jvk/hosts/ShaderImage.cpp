@@ -47,7 +47,7 @@ ShaderImage::ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
     std::memcpy(fragmentSpirv_.data(), fragmentSpv, fragmentSpirv_.size() * 4);
 
     backend_ = defaultBackend();
-    if (backend_ == nullptr || backend_->caps().shaderFormat != gpu::ShaderFormat::SPIRV) return;
+    if (backend_ == nullptr || !backend_->caps().spirvPrograms) return;
     context_ = Context::forBackend(backend_);
     const auto& caps = backend_->caps();
     builder_.setAlignments(caps.constantsAlignment, caps.storageAlignment);

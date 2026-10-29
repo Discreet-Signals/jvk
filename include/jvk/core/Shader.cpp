@@ -161,7 +161,7 @@ bool Shader::ensureProgram(Renderer& r)
     failed_ = true;   // cleared below once the program exists: a failure is never retried
 
     const auto& caps = r.context().caps();
-    if (caps.shaderFormat != gpu::ShaderFormat::SPIRV) {
+    if (!caps.spirvPrograms) {
         diag::log("jvk::Shader: this backend doesn't take SPIR-V; the shader draws nothing");
         return false;
     }

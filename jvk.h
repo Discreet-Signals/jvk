@@ -122,6 +122,7 @@
 // implementation is compiled once in jvk.cpp via VMA_IMPLEMENTATION.
 #include "include/jvk/backends/vulkan/vendor/vk_mem_alloc.h"
 
+#include "include/jvk/backends/SlotTable.h"
 #include "include/jvk/backends/vulkan/Formats.h"
 #include "include/jvk/backends/vulkan/Memory.h"
 #include "include/jvk/backends/vulkan/Resource.h"

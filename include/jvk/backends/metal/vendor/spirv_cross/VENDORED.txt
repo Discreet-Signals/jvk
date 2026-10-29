@@ -1,0 +1,3 @@
+SPIRV-Cross, vendored for the Metal backend (jvk::Shader programs: SPIR-V -> MSL at run time).
+Upstream: https://github.com/KhronosGroup/SPIRV-Cross  tag vulkan-sdk-1.4.341.0 (a0fba56)
+Only the parser, the GLSL and MSL back ends; unmodified. Built by jvk_spirv_cross.cpp (Apple only).

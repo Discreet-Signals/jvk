@@ -60,6 +60,10 @@ struct Caps
 
     bool independentBlend     = true;         // per-attachment blend state (render targets need it)
     bool textureCompressionBC = false;
+
+    // Whether createProgram takes SPIR-V with native bindings (a jvk::Shader's
+    // program), natively or through a run-time translator.
+    bool spirvPrograms = true;
 };
 
 // =============================================================================
@@ -105,8 +109,11 @@ struct ProgramDesc
 {
     const char* name = nullptr;          // debug name; may be null
 
-    // Both stages in the backend's Caps::shaderFormat: SPIR-V words, or source
-    // text (MSL, HLSL, WGSL). The bytes need only outlive createProgram().
+    // Both stages in `format`: the backend's Caps::shaderFormat (the bundle's
+    // programs), or SPIR-V with native bindings where Caps::spirvPrograms says
+    // the backend takes it. SPIR-V words, or source text (MSL, HLSL, WGSL). The
+    // bytes need only outlive createProgram().
+    ShaderFormat format = ShaderFormat::SPIRV;
     std::span<const std::byte> vertex;
     std::span<const std::byte> fragment;
     const char* vertexEntry   = "main";

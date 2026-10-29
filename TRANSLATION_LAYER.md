@@ -188,7 +188,9 @@ A backend consumes the format named by `Caps::shaderFormat`. Reflection happens 
 build time, so no backend needs spirv-reflect at run time. User shaders go through the
 same CMake function. A user shader supplied only as SPIR-V at run time (today's
 `vk->shader(spirv)`) keeps working on the Vulkan backend, and on others wherever the
-host ships a runtime translator.
+host ships a runtime translator: the Metal backend does (`Caps::spirvPrograms`), with a
+vendored SPIRV-Cross (`backends/metal/vendor/spirv_cross`, its own translation unit
+`jvk_spirv_cross.cpp`) that maps each native binding to the slot `jvk::Shader` reflected.
 
 Slang is worth evaluating later as the source language, since it emits all four
 formats itself. Moving to it would mean migrating the sources.
@@ -250,9 +252,11 @@ land before any second backend:
 - **`jvk::AudioProcessorEditor`** (`hosts/`) is generic over a `WindowHost`
   (`hosts/WindowHost.h`): the backend, plus a native child view with a window
   `Surface`. The render loop, `paintEntireComponent`, the software fallback, resize
-  policy and the timer are the editor's. `createWindowHost()` picks the build's host;
-  the Vulkan host (`backends/vulkan/VulkanHost`) keeps `NSViewGenerator` /
-  `HWNDGenerator` and the swapchain.
+  policy and the timer are the editor's. `createWindowHost()` (`hosts/WindowHost.cpp`)
+  picks the host: Metal on macOS (`JVK_BACKEND=vulkan` runs MoltenVK instead, to compare
+  them), Vulkan elsewhere. The Vulkan host (`backends/vulkan/VulkanHost`) keeps
+  `NSViewGenerator` / `HWNDGenerator` and the swapchain; the Metal host
+  (`backends/metal/MetalHost`) draws the same `NSViewGenerator` view's `CAMetalLayer`.
 - **Offscreen host.** `ShaderImage` (`hosts/`) is one pass of one draw into a texture
   on an offscreen `Surface` of `defaultBackend()`, read back a frame late.
   `jvk::ImageType` keeps a CPU mirror as its source of truth and its own texture,
@@ -281,8 +285,12 @@ include/jvk/
     Graphics, Shader, ImageType
                        the JUCE-facing API
   hosts/               WindowHost (interface), AudioProcessorEditor, ShaderImage
+  backends/SlotTable   the handle tables both backends share
   backends/vulkan/     VulkanBackend, VulkanSurface (packet executor, swapchain, offscreen),
                        VulkanHost; Device, Memory, Resource, Formats, macos/, windows/, vendor/
+  backends/metal/      MetalBackend (textures, programs, pipelines, staged and in-place
+                       writes), MetalSurface (packet executor, CAMetalLayer, offscreen),
+                       MetalHost; SpirvToMsl + vendor/spirv_cross (jvk_spirv_cross.cpp)
   reflect/             spirv-reflect (jvk::Shader and ShaderImage reflect user SPIR-V)
 shaders/               GLSL sources, jvk_portable.glsl, compile.sh → core/shaders/Bundle.h
 ```
@@ -306,15 +314,14 @@ benchmark numbers from a `main` build).
 | **P5 Lowering** | Every op lowered in the core; the render graph is `Renderer::lower`; record → lower → submit. The old renderer and pipelines are deleted | done, unbuilt |
 | **P6 Shaders** | Portable profile, build-time bundle (SPIR-V + MSL via SPIRV-Cross, reflected layouts). WGSL and HLSL not generated yet (no Tint/Naga in the toolchain) | done |
 | **P7 Hosts** | `WindowHost`, generic `AudioProcessorEditor`, Vulkan host, `ShaderImage` on an offscreen surface | done, unbuilt |
-| **P8 Second backend** | Metal | next |
+| **P8 Second backend** | Metal (`backends/metal/`): the macOS default. Pixel-identical to Vulkan on 12 of the 13 compliance scenes (the 13th: 0.01% of pixels); draws the packet straight into Metal command buffers (no descriptor sets, no pipeline-cache file at start-up), unified-memory textures written and read in place | done |
 
 ---
 
 ## Open questions
 
-1. **Second backend: eacp or raw Metal first?** eacp covers Metal, D3D12 and Vulkan
-   in one adapter. Raw Metal removes MoltenVK sooner and has no third-party
-   constraints.
+1. **Second backend: eacp or raw Metal first?** Raw Metal (P8): it removed MoltenVK
+   from the macOS path. eacp remains the candidate for D3D12 and WebGPU.
 2. **Vulkan pass execution.** The backend caches `VkRenderPass` / `VkFramebuffer`
    objects per attachment set (works everywhere). `VK_KHR_dynamic_rendering` would
    avoid the caches; check it against the pinned MoltenVK 1.4.0 and the macOS 10.15

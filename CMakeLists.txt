@@ -54,7 +54,9 @@ if (NOT TARGET jvk)
     # Module sources — compiled by each consuming target (standard JUCE module pattern).
     # On macOS the .mm includes the .cpp; on other platforms compile .cpp directly.
     if (APPLE)
-        target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk.mm")
+        # jvk_spirv_cross.cpp: the Metal backend's SPIR-V → MSL translator, its own TU.
+        target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk.mm"
+                                     "${CMAKE_CURRENT_SOURCE_DIR}/jvk_spirv_cross.cpp")
     else()
         target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk.cpp")
     endif()
@@ -182,7 +184,7 @@ target_sources(jvk INTERFACE "${JVK_SHADER_HEADER}")
 
 if (APPLE)
     target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_MACOS_MVK)
-    target_link_libraries(jvk INTERFACE "-framework QuartzCore")
+    target_link_libraries(jvk INTERFACE "-framework QuartzCore" "-framework Metal" "-framework CoreGraphics")
 
     # The SHIPPED driver is pinned here, never read from whichever SDK is installed:
     # MoltenVK 1.4.0 is the last build that runs on macOS 10.15 (1.4.1 raised the
