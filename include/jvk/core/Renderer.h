@@ -103,10 +103,7 @@ public:
     void setRecordTarget(uint8_t attachment) { recorder_.setRecordTarget(attachment); }
     void noteTargetsRead(TargetMask targets) { recorder_.noteTargetsRead(targets); }
     uint32_t captureFont(const juce::Font& f) { return recorder_.captureFont(f); }
-    uint32_t captureFill(const juce::FillType& f, gpu::TextureId texture = {}, bool nearest = false)
-    {
-        return recorder_.captureFill(f, texture, nearest);
-    }
+    uint32_t captureFill(const juce::FillType& f, const Recorder::FillColour& c) { return recorder_.captureFill(f, c); }
     void arena_align(uint32_t alignment) { recorder_.arena_align(alignment); }
     template <typename T>
     void arena_pushSpan(std::span<const T> data) { recorder_.arena_pushSpan(data); }
@@ -169,7 +166,7 @@ public:
     const Arena&          arena() const { return recorder_.arena(); }
     const juce::Font&     getFont(uint32_t i) const { return recorder_.getFont(i); }
     const juce::FillType& getFill(uint32_t i) const { return recorder_.getFill(i); }
-    const Recorder::FillTexture& getFillTexture(uint32_t i) const { return recorder_.getFillTexture(i); }
+    const Recorder::FillColour& getFillColour(uint32_t i) const { return recorder_.getFillColour(i); }
     gpu::TextureId gradientTexture() const { return gradientAtlas_.texture(); }
     gpu::TextureId defaultTexture() const  { return context_->defaultTexture(); }
     const ShaderCapture& shaderCapture(uint32_t i) const { return shaderCaptures_[i]; }

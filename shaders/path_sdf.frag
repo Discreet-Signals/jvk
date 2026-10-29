@@ -118,20 +118,19 @@ vec4 sampleColor() {
     if (mode == 3) {
         // A tiled image fill: texture 0 holds the image, gradientInfo.xy its UV
         // (unbounded: wrapped, as the tiled image quad wraps), .w the
-        // point-sampling flag. Its texel is premultiplied, and this returns
-        // straight alpha (main() premultiplies once): un-premultiplied here.
+        // point-sampling flag. Its texel is premultiplied, as this returns.
         vec2 uv = fract(fragGradientInfo.xy);
         if (fragGradientInfo.w > 0.5) {
             vec2 sz = vec2(textureSize(colorLUT, 0));
             uv = (floor(uv * sz) + 0.5) / sz;
         }
         vec4 px = texture(sampler2D(colorLUT, colorLUTSampler), uv);
-        return px.a > 0.0 ? vec4(px.rgb / px.a, px.a * fragColor.a) : vec4(0.0);
+        return px * fragColor.a;
     }
     float t = (mode == 2) ? length(fragGradientInfo.xy) : fragGradientInfo.x;
     t = clamp(t, 0.0, 1.0);
     vec4 col = texture(sampler2D(colorLUT, colorLUTSampler), vec2(t, fragGradientInfo.w));
-    return vec4(col.rgb, col.a * fragColor.a);
+    return vec4(col.rgb * col.a, col.a) * fragColor.a;
 }
 
 // PAINT INTO THE MAIN COLOUR also sets the render targets declared
@@ -232,7 +231,7 @@ void main()
         alpha = clamp(0.5 - signedDist, 0.0, 1.0);
     }
 
-    vec4 col = sampleColor();
-    outColor = vec4(col.rgb, col.a * alpha);
+    // Premultiplied, as every colour draw: the colour (sampleColor) by coverage.
+    outColor = sampleColor() * alpha;
     writeTargets(outColor);
 }

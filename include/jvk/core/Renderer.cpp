@@ -384,7 +384,7 @@ const Renderer::PaintVariant* Renderer::paintPipeline(Paint kind, uint8_t attach
             break;
         case Paint::Path:
             d.program = programs.path;
-            blend = gpu::BlendState::over();
+            blend = gpu::BlendState::premultiplied();   // path_sdf.frag writes premultiplied, as ui2d.frag
             break;
     }
     const bool paintsMain = drawTargets(targets_, attachment, blend, clears, d);
@@ -1410,9 +1410,9 @@ void Renderer::lower(const gpu::FrameInfo& info)
                 // Colour source — a tiled image fill's texture, the gradient
                 // atlas for gradient fills, the default for solids.
                 // path_sdf.frag samples it iff gradientInfo.z > 0.
-                const auto& fillTexture = recorder_.getFillTexture(p.fillIndex);
+                const auto& fillColour = recorder_.getFillColour(p.fillIndex);
                 const gpu::TextureId colour =
-                    fillTexture.texture ? fillTexture.texture
+                    fillColour.texture ? fillColour.texture
                     : (fill.isGradient() && fill.gradient) ? gradientAtlas_.texture()
                     : ctx.defaultTexture();
                 emitter_.invalidate();

@@ -81,7 +81,7 @@ inline GradientCtx makeFillCtx(Renderer& r, uint32_t fillIndex, const juce::Affi
     if (!fill.isTiledImage()) return makeGradientCtx(r, fill, physical);
 
     GradientCtx c;
-    const auto& texture = r.getFillTexture(fillIndex);
+    const auto& texture = r.getFillColour(fillIndex);
     if (!texture.texture) { c.invisible = true; return c; }
     c.mode    = 3.0f;
     c.image   = texture.texture;
@@ -113,19 +113,20 @@ inline glm::vec4 gradientAt(const GradientCtx& c, float px, float py)
     return glm::vec4(0.0f);
 }
 
-// Effective color attribute: for solid, carries the colour + opacity; for
-// gradient, white with opacity (the LUT sample already supplies RGB, opacity
-// multiplies in the shader). `solid` is the fill's colour either way: juce's
-// FillType::setOpacity writes its alpha, for a gradient fill too, so a
-// gradient under g.setOpacity(0.3f) renders at 30% (it used to render opaque).
-inline glm::vec4 fillColorAttr(const GradientCtx& grad, juce::Colour solid, float opacity)
+// Effective color attribute, PREMULTIPLIED (the shaders take it as it is):
+// for solid, the colour faded by opacity; for gradient, white at the opacity
+// (the LUT sample already supplies RGB, opacity multiplies in the shader).
+// `solid` is the fill's colour either way: juce's FillType::setOpacity writes
+// its alpha, for a gradient fill too, so a gradient under g.setOpacity(0.3f)
+// renders at 30% (it used to render opaque).
+inline glm::vec4 fillColorAttr(const GradientCtx& grad, const Colour& solid, float opacity)
 {
     if (grad.invisible)
         return glm::vec4(0.0f);
     if (grad.active())
-        return glm::vec4(1.0f, 1.0f, 1.0f, solid.getFloatAlpha() * opacity);
-    return { solid.getFloatRed(), solid.getFloatGreen(),
-             solid.getFloatBlue(), solid.getFloatAlpha() * opacity };
+        return glm::vec4(solid.a * opacity);
+    const auto c = solid * opacity;
+    return { c.r, c.g, c.b, c.a };
 }
 
 // Every built-in texture samples filtered and clamped; point sampling is the
@@ -275,12 +276,11 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
     switch (cmd.op) {
         case DrawOp::FillRect: {
             auto& p    = arena.read<FillRectParams>(cmd.dataOffset);
-            auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
-            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            auto color = fillColorAttr(grad, r.getFillColour(p.fillIndex).colour, p.opacity);
             // Axis-aligned by construction: Graphics::fillRect takes a rotated or
             // sheared rectangle as a path. The SDF rect gives fractional edges
             // juce's anti-aliasing (a flat quad snapped them to whole pixels).
@@ -297,11 +297,10 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
                 (cmd.dataOffset + static_cast<uint32_t>(sizeof(FillRectListParams)) + 3u) & ~3u;
             auto rects = arena.readSpan<juce::Rectangle<float>>(rectsOffset, p.rectCount);
 
-            auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
             state.setResources(colorDescFor(grad, r), def);
-            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            auto color = fillColorAttr(grad, r.getFillColour(p.fillIndex).colour, p.opacity);
 
             auto gi = [&](float px, float py) {
                 return grad.active() ? gradientAt(grad, px, py) : glm::vec4(0.0f);
@@ -331,7 +330,6 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
 
         case DrawOp::FillRoundedRect: {
             auto& p    = arena.read<FillRoundedRectParams>(cmd.dataOffset);
-            auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             auto  phys = toPixels(p.rect, p.transform, p.scale);
             // cornerSize is in LOGICAL pixels — scale it by the composed
@@ -343,7 +341,7 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
             GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
-            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            auto color = fillColorAttr(grad, r.getFillColour(p.fillIndex).colour, p.opacity);
             glm::vec4 shape(1.0f, phys.getWidth() * 0.5f, phys.getHeight() * 0.5f, cs);
 
             // Expand quad by `pad` on each side. UV must stay anchored to the
@@ -362,13 +360,12 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
 
         case DrawOp::FillEllipse: {
             auto& p    = arena.read<FillEllipseParams>(cmd.dataOffset);
-            auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             auto  phys = toPixels(p.area, p.transform, p.scale);
             GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
-            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            auto color = fillColorAttr(grad, r.getFillColour(p.fillIndex).colour, p.opacity);
             glm::vec4 shape(2.0f, phys.getWidth() * 0.5f, phys.getHeight() * 0.5f, 0.0f);
 
             float pad = 1.0f;
@@ -383,7 +380,6 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
 
         case DrawOp::StrokeRoundedRect: {
             auto& p    = arena.read<StrokeRoundedRectParams>(cmd.dataOffset);
-            auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             auto  phys = toPixels(p.rect, p.transform, p.scale);
             // Both cornerSize and lineWidth are logical pixels — scale by
@@ -393,7 +389,7 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
             GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
-            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            auto color = fillColorAttr(grad, r.getFillColour(p.fillIndex).colour, p.opacity);
             // Type 8 = stroked rounded rect. Shader: abs(roundedRectSDF) - sw/2.
             glm::vec4 shape(8.0f, phys.getWidth() * 0.5f, phys.getHeight() * 0.5f,
                             packHalf2(cs, sw));
@@ -413,7 +409,6 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
 
         case DrawOp::StrokeEllipse: {
             auto& p    = arena.read<StrokeEllipseParams>(cmd.dataOffset);
-            auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             auto  phys = toPixels(p.area, p.transform, p.scale);
             // lineWidth is in logical pixels — use the composed transform
@@ -422,7 +417,7 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
             GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
-            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            auto color = fillColorAttr(grad, r.getFillColour(p.fillIndex).colour, p.opacity);
             // Type 9 = stroked ellipse. Shader: abs(ellipseSDF) - sw/2.
             glm::vec4 shape(9.0f, phys.getWidth() * 0.5f, phys.getHeight() * 0.5f,
                             packHalf2(0.0f, sw));
@@ -471,7 +466,7 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
             const bool maskFill = p.alphaMaskFill != 0;
             emitTransformedQuad(state, cmd, p00, p10, p11, p01,
                                 maskFill ? p.tint
-                                         : glm::vec4(1, 1, 1, p.opacity),
+                                         : glm::vec4(p.opacity),
                                 glm::vec4(maskFill ? 5.0f : 3.0f, nearest, 0, 0));
             break;
         }
@@ -534,7 +529,6 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
             auto positions = arena.readSpan<juce::Point<float>>(posOffset, p.glyphCount);
 
             auto& font = r.getFont(p.fontIndex);
-            auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             // The fill by the paint's transform alone: the run's own (drawText's
             // translation to its area) places the glyphs, never the fill.
@@ -544,7 +538,7 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
             // texture varies per glyph (atlas page).
             state.setColorResource(colorDescFor(grad, r));
 
-            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            auto color = fillColorAttr(grad, r.getFillColour(p.fillIndex).colour, p.opacity);
 
             const float fontH   = font.getHeight();   // logical: the quad is built there, then transformed
             const float hScale  = font.getHorizontalScale();
@@ -639,12 +633,11 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
 
         case DrawOp::DrawLine: {
             auto& p    = arena.read<DrawLineParams>(cmd.dataOffset);
-            auto& fill = r.getFill(p.fillIndex);
             auto  tx   = toPhysical(p.transform, p.scale);
             GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
 
             state.setResources(colorDescFor(grad, r), def);
-            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            auto color = fillColorAttr(grad, r.getFillColour(p.fillIndex).colour, p.opacity);
 
             float x1 = p.line.getStartX(), y1 = p.line.getStartY();
             float x2 = p.line.getEndX(),   y2 = p.line.getEndY();

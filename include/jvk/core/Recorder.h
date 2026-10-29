@@ -206,24 +206,31 @@ public:
         return static_cast<uint32_t>(fonts_.size() - 1);
     }
 
-    // A tiled image fill's texture, resolved when the draw was recorded
-    // (Graphics::captureFill), and its point sampling: what colour mode 3
+    // Where a captured fill's colour comes from, beside juce's FillType: its
+    // colour as jvk keeps it (floats, premultiplied: Colour.h), and a tiled
+    // image fill's texture, resolved when the draw was recorded
+    // (Graphics::captureFill), with its point sampling: what colour mode 3
     // samples. Null for every other fill.
-    struct FillTexture { gpu::TextureId texture; bool nearest = false; };
-
-    uint32_t captureFill(const juce::FillType& f, gpu::TextureId texture = {}, bool nearest = false)
+    struct FillColour
     {
-        if (!fills_.empty() && fills_.back() == f
-            && fillTextures_.back().texture == texture && fillTextures_.back().nearest == nearest)
+        Colour         colour;
+        gpu::TextureId texture;
+        bool           nearest = false;
+        bool operator==(const FillColour&) const = default;
+    };
+
+    uint32_t captureFill(const juce::FillType& f, const FillColour& c)
+    {
+        if (!fills_.empty() && fills_.back() == f && fillColours_.back() == c)
             return static_cast<uint32_t>(fills_.size() - 1);
         fills_.push_back(f);
-        fillTextures_.push_back({ texture, nearest });
+        fillColours_.push_back(c);
         return static_cast<uint32_t>(fills_.size() - 1);
     }
 
     const juce::Font&     getFont(uint32_t i) const { return fonts_[i]; }
     const juce::FillType& getFill(uint32_t i) const { return fills_[i]; }
-    const FillTexture&    getFillTexture(uint32_t i) const { return fillTextures_[i]; }
+    const FillColour&     getFillColour(uint32_t i) const { return fillColours_[i]; }
 
     // Append POD data after a command's params (read back at a known offset).
     void arena_align(uint32_t alignment) { arena_.align(alignment); }
@@ -258,7 +265,7 @@ public:
         arena_.reset();
         fonts_.clear();
         fills_.clear();
-        fillTextures_.clear();
+        fillColours_.clear();
         segments_.clear();
         recordTarget_ = 0;   // every frame starts drawing into the main colour
         scaledTargets_ = scaledTargets;
@@ -321,7 +328,7 @@ private:
     // Non-POD captures (proper RAII, cleared each frame)
     std::vector<juce::Font>     fonts_;
     std::vector<juce::FillType> fills_;
-    std::vector<FillTexture>    fillTextures_;   // beside fills_, one each
+    std::vector<FillColour>     fillColours_;    // beside fills_, one each
 
     std::vector<std::byte>      segments_;
 };

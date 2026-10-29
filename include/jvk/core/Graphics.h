@@ -118,6 +118,21 @@ public:
         return ctx != nullptr && ctx->setTarget(name);
     }
 
+    // The colour `g` paints from now on, as floats (Colour.h): fills, strokes,
+    // text and image tints carry them to the target whole. juce's own
+    // setColour goes first, so juce's pending save happens before jvk's state
+    // changes, and a renderer that isn't jvk paints the nearest juce::Colour
+    // (then this returns false). A later setColour or setOpacity sets it again
+    // from a juce::Colour.
+    static bool setColour(juce::Graphics& g, Colour c)
+    {
+        g.setColour(c);
+        auto* ctx = create(g);
+        if (ctx == nullptr) return false;
+        ctx->state().colour = c;
+        return true;
+    }
+
     // ===== LowLevelGraphicsContext overrides =====
     bool isVectorDevice() const override { return false; }
 
@@ -471,7 +486,11 @@ public:
     }
     void endTransparencyLayer() override { restoreState(); }
 
-    void setFill(const juce::FillType& fill) override { state().fill = fill; }
+    void setFill(const juce::FillType& fill) override
+    {
+        state().fill = fill;
+        state().colour = fill.colour;
+    }
 
     // juce contract (FillType::setOpacity → colour.withAlpha): setOpacity
     // REPLACES the current fill colour's alpha in place. Modeling it as a
@@ -481,7 +500,12 @@ public:
     // exactly this before compositing, which made pedal shadows vanish after
     // any glass-panel paint). state().opacity is the transparency-LAYER
     // multiplier only; plain setOpacity must never touch it.
-    void setOpacity(float opacity) override { state().fill.setOpacity(opacity); }
+    // A colour set as floats (setColour) is set again from its juce::Colour.
+    void setOpacity(float opacity) override
+    {
+        state().fill.setOpacity(opacity);
+        state().colour = state().fill.colour;
+    }
     // juce's LOW quality is point sampling; medium and high are both smooth.
     // Every built-in texture binding samples LINEAR, so nearest is carried
     // per DRAW instead: the flag rides the image
@@ -816,7 +840,7 @@ public:
         // never its fill (juce's fillShape).
         const auto fillIndex = captureFill();
         ops::GradientCtx grad = ops::makeFillCtx(renderer_, fillIndex, s.transform.scaled(displayScale_));
-        glm::vec4 color = ops::fillColorAttr(grad, s.fill.colour, s.opacity);
+        glm::vec4 color = ops::fillColorAttr(grad, s.colour, s.opacity);
 
         auto gi = [&](float px, float py) -> glm::vec4 {
             return grad.active() ? ops::gradientAt(grad, px, py)
@@ -921,16 +945,15 @@ public:
             // (sampleColor shades the quad, the mask alpha gates it). The
             // fill's opacity (FillType::setOpacity) rides the colour's alpha.
             renderer_.registerGradient(*s.fill.gradient);
-            p.tint              = { 1.0f, 1.0f, 1.0f, s.fill.colour.getFloatAlpha() * s.opacity };
+            p.tint              = glm::vec4(s.colour.a * s.opacity);
             p.alphaMaskFill     = 2;
             p.fillIndex         = captureFill();
             p.gradientTransform = s.transform;
         }
         else
         {
-            p.tint = { s.fill.colour.getFloatRed(), s.fill.colour.getFloatGreen(),
-                       s.fill.colour.getFloatBlue(),
-                       s.fill.colour.getFloatAlpha() * s.opacity };
+            const auto c = s.colour * s.opacity;
+            p.tint = { c.r, c.g, c.b, c.a };
             p.alphaMaskFill = 1;
         }
         renderer_.push(DrawOp::DrawImage, clipRect, s.stencilDepth, p);
@@ -942,7 +965,7 @@ public:
     uint32_t captureFill()
     {
         auto& s = state();
-        return renderer_.captureFill(s.fill, s.fill.isTiledImage() ? tiledFillTexture() : gpu::TextureId {}, s.nearest);
+        return renderer_.captureFill(s.fill, { s.colour, s.fill.isTiledImage() ? tiledFillTexture() : gpu::TextureId {}, s.nearest });
     }
 
     // A tiled image fill's texture: null for no image or a singular placement,
@@ -991,8 +1014,7 @@ public:
         }
         // juce contract: image fills are modulated by the fill colour's
         // alpha (FillType::setOpacity writes it), layer opacity on top.
-        p.tint = { 1.0f, 1.0f, 1.0f,
-                   s.fill.colour.getFloatAlpha() * s.opacity };
+        p.tint = glm::vec4(s.colour.a * s.opacity);
         p.nearest = s.nearest;
         record(DrawOp::FillTiledImage, clipRect, p);
     }
@@ -1021,7 +1043,7 @@ public:
         // fillType.colour.getAlpha() for gradient/image fills too
         // (juce_RenderingHelpers.h renderImage). s.opacity is the
         // transparency-layer multiplier on top.
-        const float alpha = s.opacity * s.fill.colour.getFloatAlpha();
+        const float alpha = s.opacity * s.colour.a;
         record(DrawOp::DrawImage, s.clipBounds,
             DrawImageParams { desc, t.followedBy(s.transform), alpha, displayScale_,
                               img.getWidth(), img.getHeight(), s.nearest });
@@ -1199,11 +1221,10 @@ public:
             EffectBlendParams { v, v, v, physicalRegion(region), 1.0f });
     }
 
-    void tint(juce::Colour c, juce::Rectangle<float> region = {})
+    void tint(Colour c, juce::Rectangle<float> region = {})
     {
         auto& s = state();
-        record(DrawOp::EffectBlend, s.clipBounds,
-            EffectBlendParams { c.getFloatRed(), c.getFloatGreen(), c.getFloatBlue(), physicalRegion(region), 1.0f });
+        record(DrawOp::EffectBlend, s.clipBounds, EffectBlendParams { c.r, c.g, c.b, physicalRegion(region), 1.0f });
     }
 
     void warmth(float amount, juce::Rectangle<float> region = {})
@@ -1469,6 +1490,7 @@ private:
     struct RecordState {
         juce::AffineTransform transform;
         juce::FillType        fill { juce::Colours::black };
+        Colour                colour { juce::Colours::black };   // what draws paint: fill.colour, or floats (setColour)
         // Transparency-LAYER alpha only (beginTransparencyLayer multiplies it
         // in its own saved scope). Plain setOpacity follows the juce contract
         // instead: it rewrites fill.colour's alpha (FillType::setOpacity).

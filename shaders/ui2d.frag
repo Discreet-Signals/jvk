@@ -80,7 +80,9 @@ float median(float r, float g, float b) {
 // gradientInfo.w is the pre-normalised y of the gradient's row in the atlas
 // (row-center, safe under linear filtering). Each row is one 256-sample LUT
 // rasterized from juce::ColourGradient::getColourAtPosition, so N-stop
-// gradients work natively. Opacity always comes from fragColor.a.
+// gradients work natively. Opacity always comes from fragColor.a. Every mode
+// returns PREMULTIPLIED colour: the vertex colour arrives premultiplied
+// (jvk::Colour), a LUT texel is premultiplied here.
 // TODO(WGSL uniformity): texture() under the per-vertex mode branch; sample
 // with explicit LOD/gradients before a WGSL build.
 vec4 sampleColor() {
@@ -90,21 +92,20 @@ vec4 sampleColor() {
     if (mode == 3) {
         // A tiled image fill: texture 0 holds the image, gradientInfo.xy its UV
         // (unbounded: wrapped, as the tiled image quad wraps), .w the
-        // point-sampling flag. Its texel is premultiplied, and this returns
-        // straight alpha (main() premultiplies once): un-premultiplied here.
+        // point-sampling flag. Its texel is premultiplied, as this returns.
         vec2 uv = fract(fragGradientInfo.xy);
         if (fragGradientInfo.w > 0.5) {
             vec2 sz = vec2(textureSize(colorLUT, 0));
             uv = (floor(uv * sz) + 0.5) / sz;
         }
         vec4 px = texture(sampler2D(colorLUT, colorLUTSampler), uv);
-        return px.a > 0.0 ? vec4(px.rgb / px.a, px.a * fragColor.a) : vec4(0.0);
+        return px * fragColor.a;
     }
 
     float t = (mode == 2) ? length(fragGradientInfo.xy) : fragGradientInfo.x;
     t = clamp(t, 0.0, 1.0);
     vec4 col = texture(sampler2D(colorLUT, colorLUTSampler), vec2(t, fragGradientInfo.w));
-    return vec4(col.rgb, col.a * fragColor.a);
+    return vec4(col.rgb * col.a, col.a) * fragColor.a;
 }
 
 // ---- Alpha convention ----------------------------------------------------
@@ -120,8 +121,10 @@ vec4 sampleColor() {
 //   - images  — passed through untouched (already premultiplied)
 //   - shapes  — coverage returned as vec4(a), not vec4(1,1,1,a), so that
 //               multiplying by a premultiplied colour stays premultiplied
-//   - colors  — sampleColor() returns STRAIGHT alpha (vertex attribute or
-//               gradient LUT texel); main() premultiplies once, at the end
+//   - colors  — sampleColor() returns PREMULTIPLIED colour: the vertex
+//               attribute arrives premultiplied (jvk::Colour, so rgb at alpha
+//               0 adds under the draw), a gradient LUT texel is premultiplied
+//               there
 //
 // Getting this wrong is visible, not subtle: blending premultiplied source
 // with SRC_ALPHA applies alpha twice —
@@ -269,12 +272,8 @@ void writeTargets(vec4 colour)
 }
 
 void main() {
-    vec4 color = sampleColor();
-    vec4 shape = sampleShape();
-    // Premultiply the (straight-alpha) color once, here, then modulate by the
-    // already-premultiplied shape. Both operands are premultiplied at this
-    // point, so their product is too — which is what BlendMode::Premultiplied
-    // expects. See the alpha-convention note above.
-    outColor = vec4(color.rgb * color.a, color.a) * shape;
+    // Both operands are premultiplied, so their product is too — which is
+    // what BlendMode::Premultiplied expects. See the alpha-convention note above.
+    outColor = sampleColor() * sampleShape();
     writeTargets(outColor);
 }

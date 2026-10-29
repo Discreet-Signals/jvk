@@ -87,6 +87,7 @@
 
 // ---- Core: the backend interface (jvk::gpu) --------------------------------
 #include "include/jvk/core/PixelFormat.h"
+#include "include/jvk/core/Colour.h"
 #include "include/jvk/core/Diagnostics.h"
 #include "include/jvk/core/gpu/Types.h"
 #include "include/jvk/core/gpu/PipelineState.h"
