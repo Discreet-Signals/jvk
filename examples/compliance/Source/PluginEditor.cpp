@@ -31,6 +31,9 @@ ComplianceEditor::ComplianceEditor(ComplianceProcessor& p)
 {
     setWantsKeyboardFocus(true);
     setSize(kMargin * 3 + kPaneW * 2, kHeaderH + kPaneH + kFooterH + kMargin * 2);
+    // JVK_COMPLIANCE_SCENE=n opens on scene n (1-based): one capture per launch, no keys.
+    if (const int s = juce::SystemStats::getEnvironmentVariable("JVK_COMPLIANCE_SCENE", {}).getIntValue(); s > 0)
+        setScene(s - 1);
 }
 
 juce::Rectangle<int> ComplianceEditor::headerArea() const
@@ -82,12 +85,19 @@ bool ComplianceEditor::keyPressed(const juce::KeyPress& key)
 
 // The reference is what the JUCE SOFTWARE renderer produces for the scene —
 // the golden image the live pane is judged against.
+// At the live pane's device resolution, so the panes compare pixel for pixel
+// (a reference at points, stretched onto a 2x display, blurs every edge).
 void ComplianceEditor::rebuildReference()
 {
     auto pane = leftPane();
     if (pane.isEmpty()) return;
-    reference_ = juce::Image(juce::Image::ARGB, pane.getWidth(), pane.getHeight(), true);
+    referenceScale_ = getPaintScale();
+    noiseScale_     = referenceScale_;
+    noiseOrigin_    = rightPane().getPosition().toFloat() * referenceScale_;
+    reference_ = juce::Image(juce::Image::ARGB, juce::roundToInt(pane.getWidth() * referenceScale_),
+                             juce::roundToInt(pane.getHeight() * referenceScale_), true);
     juce::Graphics ig(reference_);
+    ig.addTransform(juce::AffineTransform::scale(referenceScale_));
     ig.fillAll(juce::Colour(0xFF15151D));
     scenes()[static_cast<size_t>(sceneIndex_)].painter(
         ig, juce::Rectangle<float>(0, 0, (float) pane.getWidth(), (float) pane.getHeight()));
@@ -107,7 +117,8 @@ void ComplianceEditor::paint(juce::Graphics& g)
                headerArea().reduced(kMargin, 0), juce::Justification::centredLeft);
     g.setFont(juce::FontOptions(13.0f));
     g.setColour(juce::Colours::white.withAlpha(0.6f));
-    g.drawText(juce::String("renderer: ") + (vulkanOn_ ? "jvk (Vulkan)" : "JUCE software")
+    const bool metal = getBackend() != nullptr && getBackend()->caps().shaderFormat == jvk::gpu::ShaderFormat::MSL;
+    g.drawText(juce::String("renderer: ") + (vulkanOn_ ? (metal ? "jvk (Metal)" : "jvk (Vulkan)") : "JUCE software")
                    + "   [<-/->] scene   [V] toggle renderer",
                headerArea().reduced(kMargin, 0), juce::Justification::centredRight);
 
@@ -119,9 +130,15 @@ void ComplianceEditor::paint(juce::Graphics& g)
     g.drawText("LIVE (active renderer)", rightPane().withY(kHeaderH - 6).withHeight(14),
                juce::Justification::centredLeft);
 
-    // Left: the golden image.
+    // Left: the golden image, opaque (the colour's alpha modulates an image draw:
+    // the labels' 0.5 left the reference drawn at half opacity).
+    if (getPaintScale() != referenceScale_)   // the display's scale is known once the window shows
+        rebuildReference();
     if (reference_.isValid())
-        g.drawImageAt(reference_, leftPane().getX(), leftPane().getY());
+    {
+        g.setOpacity(1.0f);
+        g.drawImage(reference_, leftPane().toFloat());
+    }
 
     // Right: the same painter, live through the active renderer, clipped and
     // translated so scene code sees an origin-based area in both panes.
@@ -220,6 +237,31 @@ void ComplianceEditor::sceneDeepClips(juce::Graphics& g, juce::Rectangle<float> 
 // The live host pattern: a jvk blend effect (drawNoise) INSIDE a path clip.
 // Reference has no jvk extras, so the caveat states the noise only shows on
 // the live pane — what must MATCH is the clip shape containing it.
+void ComplianceEditor::drawNoiseModel(juce::Graphics& g, juce::Rectangle<float> area, float amount)
+{
+    // shaders/noise.frag: Dave Hoskins' hash12 of gl_FragCoord (the pixel's
+    // centre), blended Over at `amount` (white noise, the static hash).
+    auto fract = [](float v) { return v - std::floor(v); };
+    auto hash12 = [&](float x, float y) {
+        float a = fract(x * 0.1031f), b = fract(y * 0.1031f), c = fract(x * 0.1031f);
+        const float d = a * (b + 33.33f) + b * (c + 33.33f) + c * (a + 33.33f);
+        a += d; b += d; c += d;
+        return fract((a + b) * c);
+    };
+    const int w = juce::roundToInt(area.getWidth() * noiseScale_), h = juce::roundToInt(area.getHeight() * noiseScale_);
+    juce::Image noise(juce::Image::ARGB, w, h, false);
+    juce::Image::BitmapData bd(noise, juce::Image::BitmapData::writeOnly);
+    const auto alpha = static_cast<juce::uint8>(juce::roundToInt(amount * 255.0f));
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+        {
+            const float n = hash12(noiseOrigin_.x + area.getX() * noiseScale_ + (float) x + 0.5f,
+                                   noiseOrigin_.y + area.getY() * noiseScale_ + (float) y + 0.5f);
+            bd.setPixelColour(x, y, juce::Colour::greyLevel(n).withAlpha(alpha));
+        }
+    g.drawImage(noise, area);
+}
+
 void ComplianceEditor::sceneBlendInClip(juce::Graphics& g, juce::Rectangle<float> area)
 {
     auto disc = area.reduced(area.getWidth() * 0.2f);
@@ -236,6 +278,8 @@ void ComplianceEditor::sceneBlendInClip(juce::Graphics& g, juce::Rectangle<float
 
     if (auto vk = jvk::Graphics::create(g))
         vk->drawNoise(0.25f, true);
+    else
+        drawNoiseModel(g, area, 0.25f);
 
     g.setColour(juce::Colours::white);
     g.drawEllipse(disc, 4.0f);
@@ -691,8 +735,7 @@ const std::vector<ComplianceEditor::Scene>& ComplianceEditor::scenes()
 {
     static const std::vector<Scene> s = {
         { "Deep clip stack (path->path->rect)", &sceneDeepClips,         nullptr },
-        { "Blend effect inside path clip",      &sceneBlendInClip,
-          "noise is jvk-only: appears on LIVE pane only; clip SHAPE must match" },
+        { "Blend effect inside path clip",      &sceneBlendInClip,       nullptr },   // the reference models the grain
         { "Paths (fill / gradient / stroke)",   &scenePaths,             nullptr },
         { "Text (sizes + rotated/sheared)",     &sceneText,              nullptr },
         { "Gradients (linear / radial)",        &sceneGradients,         nullptr },

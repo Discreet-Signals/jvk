@@ -60,7 +60,9 @@ private:
 
     // Scene painters — pure juce::Graphics so both renderers accept them.
     // jvk-only extras (blur/saturate/noise) go through jvk::Graphics::create
-    // and no-op under the software renderer (stated in the scene's caveat).
+    // and no-op under the software renderer (stated in the scene's caveat),
+    // unless the reference models them: drawNoise's static grain is a hash of
+    // the device pixel, drawn on the CPU where jvk isn't (drawNoiseModel).
     static void sceneDeepClips        (juce::Graphics&, juce::Rectangle<float>);
     static void sceneBlendInClip      (juce::Graphics&, juce::Rectangle<float>);
     static void scenePaths            (juce::Graphics&, juce::Rectangle<float>);
@@ -77,6 +79,13 @@ private:
 
     static juce::Image makeTestImage(int w, int h);
 
+    // drawNoise(amount, true) on the CPU: jvk's hash12 of each device pixel,
+    // keyed to the LIVE pane's pixels (noiseOrigin_, noiseScale_), so the
+    // reference shows the same grain and the panes compare pixel for pixel.
+    static void drawNoiseModel(juce::Graphics&, juce::Rectangle<float> area, float amount);
+    static inline juce::Point<float> noiseOrigin_;
+    static inline float              noiseScale_ = 1.0f;
+
     void setScene(int index);
     void rebuildReference();
 
@@ -88,6 +97,7 @@ private:
     int         sceneIndex_ = 0;
     bool        vulkanOn_   = true;
     juce::Image reference_;
+    float       referenceScale_ = 0.0f;   // device pixels per point it was rendered at
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ComplianceEditor)
 };
