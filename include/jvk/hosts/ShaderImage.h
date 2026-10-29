@@ -30,14 +30,15 @@ namespace jvk
 // discovered from the fragment SPIR-V by reflection. Constants follow
 // shader_region.vert: (resolutionX, resolutionY, time, viewportW, viewportH,
 // regionX, regionY); a fragment shader only needs to declare the first three.
-// Needs a backend that takes SPIR-V.
+// Metal draws `fragmentMsl`, translated from the SPIR-V at build time (CMake:
+// jvk_msl); without the backend's form it draws nothing.
 // =============================================================================
 
 class ShaderImage : private juce::Timer
 {
 public:
     ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
-                int width, int height, int storageBufferSize = 0);
+                int width, int height, int storageBufferSize = 0, std::string_view fragmentMsl = {});
     ~ShaderImage() override;
 
     ShaderImage(const ShaderImage&) = delete;
@@ -82,6 +83,7 @@ private:
     bool pendingRead = false;   // a frame was submitted whose pixels aren't read yet
 
     std::vector<uint32_t>         fragmentSpirv_;
+    std::string                   fragmentMsl_;
     std::vector<Binding>          bindings_;
     std::vector<gpu::BindingDesc> nativeBindings_;
     uint8_t                       textureSlots_ = 0, storageSlots_ = 0;

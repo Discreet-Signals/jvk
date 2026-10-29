@@ -185,12 +185,12 @@ shaders/*.vert|frag (GLSL)
 ```
 
 A backend consumes the format named by `Caps::shaderFormat`. Reflection happens at
-build time, so no backend needs spirv-reflect at run time. User shaders go through the
-same CMake function. A user shader supplied only as SPIR-V at run time (today's
-`vk->shader(spirv)`) keeps working on the Vulkan backend, and on others wherever the
-host ships a runtime translator: the Metal backend does (`Caps::spirvPrograms`), with a
-vendored SPIRV-Cross (`backends/metal/vendor/spirv_cross`, its own translation unit
-`jvk_spirv_cross.cpp`) that maps each native binding to the slot `jvk::Shader` reflected.
+build time, so no backend needs spirv-reflect at run time. A user shader (`jvk::Shader`,
+`ShaderImage`) is GLSL compiled to SPIR-V, which Vulkan draws and jvk reflects at run
+time; for Metal the CMake function `jvk_msl` translates that SPIR-V to MSL at build
+time (`tools/jvk_msl.cpp`, a build-machine tool with the vendored SPIRV-Cross in
+`tools/spirv_cross`), and the application hands the MSL in beside the SPIR-V. Nothing
+translates at run time: a shader without its backend's form draws nothing and says so.
 
 Slang is worth evaluating later as the source language, since it emits all four
 formats itself. Moving to it would mean migrating the sources.
@@ -217,10 +217,11 @@ it a `std140` uniform block at binding 24, which SPIRV-Cross translates
 (`--msl-decoration-binding`, `--flip-vert-y`; MSL entry point `main0`). The Metal limits
 fit: textures 0–7, samplers 8–15, buffers 16–24, vertex buffers above.
 
-A program from elsewhere — a user's `jvk::Shader` or `ShaderImage`, SPIR-V at run
-time — names its native bindings instead (`gpu::BindingDesc`: set, binding and kind per
-slot, combined samplers and uniform buffers included). Only a backend that consumes
-SPIR-V takes those.
+A program from elsewhere — a user's `jvk::Shader` or `ShaderImage` — names its native
+bindings instead (`gpu::BindingDesc`: set, binding and kind per slot, combined samplers
+and uniform buffers included). Vulkan binds them where the SPIR-V declares them; Metal
+where `jvk_msl` put them, by one rule both share (`backends/metal/MslBindings.h`): a
+binding's rank by (set, binding) among the program's textures, or its blocks.
 
 ### Portable profile
 
@@ -296,9 +297,10 @@ include/jvk/
                        VulkanHost; Device, Memory, Resource, Formats, macos/, windows/, vendor/
   backends/metal/      MetalBackend (textures, programs, pipelines, staged and in-place
                        writes), MetalSurface (packet executor, CAMetalLayer, offscreen),
-                       MetalHost; SpirvToMsl + vendor/spirv_cross (jvk_spirv_cross.cpp)
+                       MetalHost; MslBindings (where a jvk::Shader binds, shared with jvk_msl)
   reflect/             spirv-reflect (jvk::Shader and ShaderImage reflect user SPIR-V)
 shaders/               GLSL sources, jvk_portable.glsl, compile.sh → core/shaders/Bundle.h
+tools/                 jvk_msl (a jvk::Shader's SPIR-V → MSL at build time) + spirv_cross/
 ```
 
 ---
@@ -335,9 +337,8 @@ benchmark numbers from a `main` build).
 3. **Public API that names Vulkan.** Done for `Target::clear` (`gpu::ClearColor`),
    `Shader::set` for a GPU-resident texture (a `gpu::TextureId`), and the editor
    (`getBackend()` replaces `getDevice()`). The user GLSL contract still uses
-   `push_constant` and Vulkan-style sets, so `jvk::Shader` and `ShaderImage` draw only
-   on a backend that takes SPIR-V; portable user shaders need the bundle's CMake
-   function (not built yet).
+   `push_constant` and Vulkan-style sets; `jvk_msl` carries that contract to Metal at
+   build time. Another backend needs its own build-time translation of it.
 4. **For eacp (Eyal):**
    - a depth/stencil texture that isn't a plane of one colour target, or a pass that
      can attach another texture's stencil. Clipped effects draw into the other half

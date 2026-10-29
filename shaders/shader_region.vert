@@ -1,6 +1,8 @@
 #version 450
+#include "jvk_portable.glsl"
 
-layout(push_constant) uniform PC {
+// The users' push constants begin with this view of them (Shader.h).
+JVK_CONSTANTS {
     float resolutionX;  // region width (pixels) — shared with fragment
     float resolutionY;  // region height (pixels) — shared with fragment
     float time;         // elapsed time — shared with fragment

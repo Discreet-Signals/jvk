@@ -95,23 +95,7 @@ gpu::ProgramId Context::createProgram(const shaders::Program& p)
 {
     gpu::ProgramDesc desc;
     desc.name = p.name;
-    desc.format = caps().shaderFormat;
-    if (caps().shaderFormat == gpu::ShaderFormat::MSL)
-    {
-        if (p.vertex.msl.empty() || p.fragment.msl.empty()) return {};
-        desc.vertex   = std::as_bytes(std::span<const char>(p.vertex.msl.data(), p.vertex.msl.size()));
-        desc.fragment = std::as_bytes(std::span<const char>(p.fragment.msl.data(), p.fragment.msl.size()));
-        desc.vertexEntry = desc.fragmentEntry = "main0";
-    }
-    else if (caps().shaderFormat == gpu::ShaderFormat::SPIRV)
-    {
-        desc.vertex   = std::as_bytes(p.vertex.spirv);
-        desc.fragment = std::as_bytes(p.fragment.spirv);
-    }
-    else
-    {
-        return {};   // the bundle has no HLSL or WGSL yet
-    }
+    if (!shaders::setStages(desc, caps().shaderFormat, p.vertex, p.fragment)) return {};
     desc.layout.textures       = p.textures;
     desc.layout.storageBuffers = p.storageBuffers;
     desc.layout.constantsBytes = p.constantsBytes;

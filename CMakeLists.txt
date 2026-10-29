@@ -94,10 +94,6 @@ if (NOT TARGET jvk)
     else()
         target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk.cpp")
     endif()
-    # The Metal backend's SPIR-V → MSL translator, its own TU.
-    if (JVK_METAL)
-        target_sources(jvk INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/jvk_spirv_cross.cpp")
-    endif()
 
     # C++20 required for std::span, std::optional
     target_compile_features(jvk INTERFACE cxx_std_20)
@@ -218,6 +214,34 @@ add_custom_target(jvk_shaders DEPENDS "${JVK_SHADER_HEADER}")
 # that compiles jvk.mm / jvk.cpp (which #include Bundle.h) inherits this
 # as a build-graph dependency, so CMake runs the custom command first.
 target_sources(jvk INTERFACE "${JVK_SHADER_HEADER}")
+
+# ==============================================================================
+# jvk_msl(<fragment.spv> <out.metal>) — a jvk::Shader's MSL, what the Metal
+# backend draws it with, translated at build time from its fragment stage's
+# SPIR-V by tools/jvk_msl.cpp (built for the build machine, with the vendored
+# SPIRV-Cross; nothing of it ships). Pass the file's text to Shader::load /
+# Graphics::shader beside the SPIR-V. A build without Metal writes it empty.
+# ==============================================================================
+
+if (JVK_METAL AND NOT TARGET jvk_msl)
+    add_executable(jvk_msl EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/jvk_msl.cpp")
+    target_compile_features(jvk_msl PRIVATE cxx_std_17)
+endif()
+
+function(jvk_msl SPIRV OUTPUT)
+    if (TARGET jvk_msl)
+        add_custom_command(OUTPUT "${OUTPUT}"
+            COMMAND jvk_msl "${SPIRV}" "${OUTPUT}"
+            DEPENDS "${SPIRV}" jvk_msl
+            COMMENT "jvk: ${SPIRV} → MSL"
+            VERBATIM)
+    else()
+        add_custom_command(OUTPUT "${OUTPUT}"
+            COMMAND ${CMAKE_COMMAND} -E touch "${OUTPUT}"
+            DEPENDS "${SPIRV}"
+            VERBATIM)
+    endif()
+endfunction()
 
 # ==============================================================================
 # Platform configuration

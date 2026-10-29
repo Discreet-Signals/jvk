@@ -122,11 +122,11 @@ public:
 
     GlyphAtlas& glyphAtlas() { return glyphAtlas_; }
 
-    // The context's shader cache: the Shader for `spirv` (keyed by its code's
-    // address: a program compiled into the binary), built on first ask and kept
-    // for this Renderer's life. Shared by every caller, so what differs per
-    // caller goes per draw (Shader::setDrawConstants, setDrawImage).
-    Shader& shader(std::span<const uint32_t> spirv);
+    // The context's shader cache: the Shader for `spirv` and its `msl` (keyed
+    // by the SPIR-V's address: a program compiled into the binary), built on
+    // first ask and kept for this Renderer's life. Shared by every caller, so
+    // what differs per caller goes per draw (Shader::setDrawConstants, setDrawImage).
+    Shader& shader(std::span<const uint32_t> spirv, std::string_view msl = {});
 
     // A DrawShader draw's capture (DrawShaderParams::shaderIndex), and the
     // uniform bytes its blocks point at.

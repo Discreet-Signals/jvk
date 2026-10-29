@@ -111,7 +111,8 @@ ShaderBgEditor::ShaderBgEditor(ShaderBgProcessor& p)
     background = std::make_unique<jvk::ShaderImage>(
         BinaryData::background_frag_spv,
         BinaryData::background_frag_spvSize,
-        400, 300, 1 // 1 float: saturation envelope
+        400, 300, 1, // 1 float: saturation envelope
+        { BinaryData::background_frag_metal, static_cast<size_t>(BinaryData::background_frag_metalSize) }
     );
     background->setFrameRate(30);
 

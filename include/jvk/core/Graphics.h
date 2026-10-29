@@ -1455,9 +1455,10 @@ public:
 
     Renderer& getRenderer() { return renderer_; }
 
-    // The Shader for `spirv` from this window's shader cache (Renderer::shader):
-    // built on first ask, kept with the context, shared by every caller.
-    Shader& shader(std::span<const uint32_t> spirv) { return renderer_.shader(spirv); }
+    // The Shader for `spirv` and its `msl` from this window's shader cache
+    // (Renderer::shader): built on first ask, kept with the context, shared by
+    // every caller.
+    Shader& shader(std::span<const uint32_t> spirv, std::string_view msl = {}) { return renderer_.shader(spirv, msl); }
 
 private:
     // drawShader's record-time step: captures the shader (Renderer::

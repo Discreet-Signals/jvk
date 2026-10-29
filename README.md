@@ -149,14 +149,16 @@ void main()
 }
 ```
 
-Compile it with the SDK's `glslc` and embed it:
+Compile it with the SDK's `glslc`, have `jvk_msl` translate that for Metal, and embed both. The translation happens at build time, so no shader translator ships in your plugin; in a build without Metal, `jvk_msl` writes an empty file.
 
 ```cmake
 set(spv "${CMAKE_CURRENT_BINARY_DIR}/meter.frag.spv")
+set(msl "${CMAKE_CURRENT_BINARY_DIR}/meter.frag.metal")
 add_custom_command(OUTPUT "${spv}"
     COMMAND "${Vulkan_GLSLC_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/Source/meter.frag" -o "${spv}"
     DEPENDS Source/meter.frag)
-juce_add_binary_data(MyPluginShaders SOURCES "${spv}")
+jvk_msl("${spv}" "${msl}")
+juce_add_binary_data(MyPluginShaders SOURCES "${spv}" "${msl}")
 target_link_libraries(MyPlugin PRIVATE MyPluginShaders)
 ```
 
@@ -172,7 +174,8 @@ void paint (juce::Graphics& g) override
 {
     if (auto* vk = jvk::Graphics::create (g))
     {
-        auto& meter = vk->shader (spirv (BinaryData::meter_frag_spv, BinaryData::meter_frag_spvSize));
+        auto& meter = vk->shader (spirv (BinaryData::meter_frag_spv, BinaryData::meter_frag_spvSize),
+                                  { BinaryData::meter_frag_metal, static_cast<size_t> (BinaryData::meter_frag_metalSize) });
         const float constants[] = { level };
         meter.setDrawConstants (constants);
         vk->drawShader (meter, meterArea);
@@ -180,7 +183,7 @@ void paint (juce::Graphics& g) override
 }
 ```
 
-`vk->shader()` keeps one compiled shader per window, keyed by the address of the SPIR-V, so pass data that lives for the whole program, such as `BinaryData`. `time` keeps counting on its own, so an animated shader needs no `repaint()`. For a uniform block, call `shader.set ("BlockName", values)`. For an image, call `shader.set ("sampler", image, vk->getRenderer())`, or `shader.update (...)` if the image changes every frame.
+`vk->shader()` keeps one compiled shader per window, keyed by the address of the SPIR-V, so pass data that lives for the whole program, such as `BinaryData`. A shader without the form its backend draws (no MSL on a Mac) draws nothing, and says so in jvk's log. `time` keeps counting on its own, so an animated shader needs no `repaint()`. For a uniform block, call `shader.set ("BlockName", values)`. For an image, call `shader.set ("sampler", image, vk->getRenderer())`, or `shader.update (...)` if the image changes every frame.
 
 ### Level 3: render targets
 

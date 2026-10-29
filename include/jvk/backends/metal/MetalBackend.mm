@@ -226,7 +226,6 @@ Backend::~Backend()
 void Backend::initCaps()
 {
     caps_.shaderFormat  = gpu::ShaderFormat::MSL;
-    caps_.spirvPrograms = true;   // jvk::Shader's SPIR-V, through SpirvToMsl
     const bool family16k = [device_ supportsFamily:MTLGPUFamilyMac2] || [device_ supportsFamily:MTLGPUFamilyApple3];
     caps_.maxTextureSize      = family16k ? 16384 : 8192;
     caps_.maxColorAttachments = gpu::kMaxColorAttachments;
@@ -615,38 +614,12 @@ bool Backend::readTexture(gpu::TextureId texture, gpu::IRect region, std::span<s
 
 // ---- Programs and pipelines ---------------------------------------------------------
 
-Strong<id<MTLFunction>> Backend::function(const gpu::ProgramDesc& desc, bool vertex, const ProgramSlot& slot,
-                                          std::span<const gpu::BindingDesc> bindings, juce::String& error)
+Strong<id<MTLFunction>> Backend::function(const gpu::ProgramDesc& desc, bool vertex, juce::String& error)
 {
+    if (desc.format != gpu::ShaderFormat::MSL) { error = "a shader format Metal can't take"; return {}; }
     const auto bytes = vertex ? desc.vertex : desc.fragment;
-    std::string source, entry;
-    if (desc.format == gpu::ShaderFormat::MSL)
-    {
-        source.assign(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        entry = vertex ? desc.vertexEntry : desc.fragmentEntry;
-    }
-    else if (desc.format == gpu::ShaderFormat::SPIRV)
-    {
-        if (bytes.size() % 4 != 0) { error = "SPIR-V is not whole words"; return {}; }
-        std::vector<uint32_t> words(bytes.size() / 4);
-        std::memcpy(words.data(), bytes.data(), bytes.size());
-        std::vector<MslResource> resources;
-        for (const auto& b : bindings)
-        {
-            const bool buffer = b.kind == gpu::BindingKind::StorageBuffer || b.kind == gpu::BindingKind::UniformBuffer;
-            resources.push_back({ b.set, b.binding, buffer,
-                                  static_cast<uint8_t>(buffer ? slot.storageIndex[b.slot] : slot.textureIndex[b.slot]) });
-        }
-        auto msl = spirvToMsl(words.data(), words.size(), vertex, resources.data(), resources.size(), kConstantsIndex);
-        if (!msl.error.empty()) { error = juce::String(msl.error); return {}; }
-        source = std::move(msl.source);
-        entry  = std::move(msl.entry);
-    }
-    else
-    {
-        error = "a shader format Metal can't take";
-        return {};
-    }
+    const std::string source(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    const std::string entry = vertex ? desc.vertexEntry : desc.fragmentEntry;
 
     const std::string key = entry + '\n' + source;
     {
@@ -691,29 +664,26 @@ gpu::ProgramId Backend::createProgram(const gpu::ProgramDesc& desc)
             p.textureIndex[i] = i;
             p.samplerIndex[i] = static_cast<uint8_t>(i < gpu::kPortableDrawTextures ? kSamplerBase + i : 0);
         }
-        for (uint8_t j = 0; j < gpu::kMaxDrawStorage; ++j) p.storageIndex[j] = static_cast<uint8_t>(kStorageBase + j);
+        for (uint8_t j = 0; j < gpu::kMaxDrawStorage; ++j) p.storageIndex[j] = static_cast<uint8_t>(kBlockBase + j);
     }
     else
     {
-        // A jvk::Shader's own bindings: texture slot s at [[texture(s)]] with
-        // [[sampler(s)]] (16 samplers, slots 0..15), block slot s at [[buffer(16 + s)]].
+        // A jvk::Shader's own bindings, where jvk_msl translated them (MslBindings.h).
+        std::vector<MslBinding> all;
         for (const auto& b : bindings)
+            all.push_back({ b.set, b.binding, b.kind == gpu::BindingKind::StorageBuffer || b.kind == gpu::BindingKind::UniformBuffer });
+        for (size_t i = 0; i < bindings.size(); ++i)
         {
-            if (b.kind == gpu::BindingKind::StorageBuffer || b.kind == gpu::BindingKind::UniformBuffer)
-            {
-                if (b.slot < gpu::kMaxDrawStorage) p.storageIndex[b.slot] = static_cast<uint8_t>(kStorageBase + b.slot);
-            }
-            else if (b.slot < gpu::kMaxDrawTextures)
-            {
-                p.textureIndex[b.slot] = b.slot;
-                p.samplerIndex[b.slot] = b.slot;
-            }
+            const auto slot  = bindings[i].slot;
+            const auto index = static_cast<uint8_t>(mslIndex(all.data(), all.size(), all[i]));
+            if (all[i].block) { if (slot < gpu::kMaxDrawStorage) p.storageIndex[slot] = index; }
+            else if (slot < gpu::kMaxDrawTextures) p.textureIndex[slot] = p.samplerIndex[slot] = index;
         }
     }
 
     juce::String error;
-    p.vertex = function(desc, true, p, bindings, error);
-    if (p.vertex) p.fragment = function(desc, false, p, bindings, error);
+    p.vertex = function(desc, true, error);
+    if (p.vertex) p.fragment = function(desc, false, error);
     if (!p.vertex || !p.fragment)
     {
         diag::log("metal: program " + juce::String(p.name) + " could not be created: " + error);

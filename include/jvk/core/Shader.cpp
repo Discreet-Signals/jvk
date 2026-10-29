@@ -160,11 +160,6 @@ bool Shader::ensureProgram(Renderer& r)
     }
     failed_ = true;   // cleared below once the program exists: a failure is never retried
 
-    const auto& caps = r.context().caps();
-    if (!caps.spirvPrograms) {
-        diag::log("jvk::Shader: this backend doesn't take SPIR-V; the shader draws nothing");
-        return false;
-    }
     if (textureSlots_ > gpu::kMaxDrawTextures || storageSlots_ > gpu::kMaxDrawStorage) {
         diag::log("jvk::Shader: " + juce::String(textureSlots_) + " textures and " + juce::String(storageSlots_)
                   + " blocks, a draw binds at most " + juce::String(gpu::kMaxDrawTextures) + " and "
@@ -178,8 +173,11 @@ bool Shader::ensureProgram(Renderer& r)
 
     gpu::ProgramDesc desc;
     desc.name = "jvk::Shader";
-    desc.vertex = std::as_bytes(shaders::bundle::shaderRegionVert.spirv);
-    desc.fragment = std::as_bytes(std::span<const uint32_t>(spirv_));
+    if (!shaders::setStages(desc, r.context().caps().shaderFormat, shaders::bundle::shaderRegionVert, { spirv_, msl_ })) {
+        diag::log("jvk::Shader: no form of it this backend draws (Metal: its MSL, jvk_msl); the shader draws nothing");
+        jassertfalse;
+        return false;
+    }
     desc.layout.textures = textureSlots_;
     desc.layout.storageBuffers = storageSlots_;
     desc.layout.constantsBytes = 32 + kShaderDrawConstants * 4;

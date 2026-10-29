@@ -60,26 +60,25 @@ import json, os, subprocess, sys, tempfile
 
 glslc, spirv_cross, spirv_val, out_path = sys.argv[1:5]
 
-# (source, glslc stage, C++ name, translated to MSL)
+# (source, glslc stage, C++ name)
 STAGES = [
-    ('ui2d.vert',          'vert', 'ui2d_vert',          True),
-    ('ui2d.frag',          'frag', 'ui2d_frag',          True),
-    ('noise.frag',         'frag', 'noise_frag',         True),
-    ('path_sdf.vert',      'vert', 'path_sdf_vert',      True),
-    ('path_sdf.frag',      'frag', 'path_sdf_frag',      True),
-    ('clip.vert',          'vert', 'clip_vert',          True),
-    ('clip.frag',          'frag', 'clip_frag',          True),
-    ('clip_mask.frag',     'frag', 'clip_mask_frag',     True),
-    ('blur.vert',          'vert', 'blur_vert',          True),
-    ('blur.frag',          'frag', 'blur_frag',          True),
-    ('copy.frag',          'frag', 'copy_frag',          True),
-    ('hsv.frag',           'frag', 'hsv_frag',           True),
-    ('shape_blur.frag',    'frag', 'shape_blur_frag',    True),
-    ('path_blur.frag',     'frag', 'path_blur_frag',     True),
-    # The vertex stage of user jvk::Shaders: SPIR-V for every backend (Metal
-    # translates it with the user's stage at run time), and its push-constant
-    # block is the users' native contract, so it stays as written.
-    ('shader_region.vert', 'vert', 'shader_region_vert', False),
+    ('ui2d.vert',          'vert', 'ui2d_vert'),
+    ('ui2d.frag',          'frag', 'ui2d_frag'),
+    ('noise.frag',         'frag', 'noise_frag'),
+    ('path_sdf.vert',      'vert', 'path_sdf_vert'),
+    ('path_sdf.frag',      'frag', 'path_sdf_frag'),
+    ('clip.vert',          'vert', 'clip_vert'),
+    ('clip.frag',          'frag', 'clip_frag'),
+    ('clip_mask.frag',     'frag', 'clip_mask_frag'),
+    ('blur.vert',          'vert', 'blur_vert'),
+    ('blur.frag',          'frag', 'blur_frag'),
+    ('copy.frag',          'frag', 'copy_frag'),
+    ('hsv.frag',           'frag', 'hsv_frag'),
+    ('shape_blur.frag',    'frag', 'shape_blur_frag'),
+    ('path_blur.frag',     'frag', 'path_blur_frag'),
+    # The vertex stage of user jvk::Shaders, with their fragment stages: SPIR-V,
+    # or MSL with what jvk_msl translates at build time (tools/jvk_msl.cpp).
+    ('shader_region.vert', 'vert', 'shader_region_vert'),
 ]
 
 # (program, vertex stage, fragment stage)
@@ -140,7 +139,7 @@ def offsets(types, t):
     return [(m['name'], m['type'], m['offset']) for m in types[t]['members']]
 
 stages = {}
-for src, kind, name, translate in STAGES:
+for src, kind, name in STAGES:
     info = { 'name': name, 'kind': kind, 'src': src }
 
     vk_spv = os.path.join(tmp, name + '.vk.spv')
@@ -158,32 +157,30 @@ for src, kind, name, translate in STAGES:
         info['constants'] = { 'size': struct_size(vk['types'], t),
                               'members': offsets(vk['types'], t) }
 
-    info['msl'] = ''
-    if translate:
-        x_spv = os.path.join(tmp, name + '.x.spv')
-        run([glslc, '-fshader-stage=' + kind, '-I.', src, '-o', x_spv])
-        run([spirv_val, x_spv])
-        x = json.loads(run([spirv_cross, x_spv, '--reflect']))
-        args = [spirv_cross, x_spv, '--msl', '--msl-version', '20100', '--msl-decoration-binding']
-        if kind == 'vert':
-            args.append('--flip-vert-y')   # Metal's clip space is y-up; the shaders are written y-down
-        info['msl'] = run(args)
+    x_spv = os.path.join(tmp, name + '.x.spv')
+    run([glslc, '-fshader-stage=' + kind, '-I.', src, '-o', x_spv])
+    run([spirv_val, x_spv])
+    x = json.loads(run([spirv_cross, x_spv, '--reflect']))
+    args = [spirv_cross, x_spv, '--msl', '--msl-version', '20100', '--msl-decoration-binding']
+    if kind == 'vert':
+        args.append('--flip-vert-y')   # Metal's clip space is y-up; the shaders are written y-down
+    info['msl'] = run(args)
 
-        # The two builds must agree on every constants member's offset
-        # (std430 push constants vs the std140 uniform block).
-        ubos = [u for u in x.get('ubos', []) if u['binding'] == CONSTANTS_BINDING]
-        if bool(ubos) != bool(info['constants']):
-            fail(src + ': the constants block differs between the two builds')
-        if ubos:
-            xo = offsets(x['types'], ubos[0]['type'])
-            if xo != info['constants']['members']:
-                fail(src + ': std140 and std430 disagree on the constants layout:\n  '
-                     + str(xo) + '\n  ' + str(info['constants']['members']))
-            info['constants']['size'] = max(info['constants']['size'], ubos[0]['block_size'])
-        if x.get('textures'):
-            fail(src + ': combined image samplers are not portable (use JVK_TEXTURE + JVK_SAMPLER)')
-        if any(u['binding'] != CONSTANTS_BINDING for u in x.get('ubos', [])):
-            fail(src + ': uniform blocks other than JVK_CONSTANTS are not portable')
+    # The two builds must agree on every constants member's offset
+    # (std430 push constants vs the std140 uniform block).
+    ubos = [u for u in x.get('ubos', []) if u['binding'] == CONSTANTS_BINDING]
+    if bool(ubos) != bool(info['constants']):
+        fail(src + ': the constants block differs between the two builds')
+    if ubos:
+        xo = offsets(x['types'], ubos[0]['type'])
+        if xo != info['constants']['members']:
+            fail(src + ': std140 and std430 disagree on the constants layout:\n  '
+                 + str(xo) + '\n  ' + str(info['constants']['members']))
+        info['constants']['size'] = max(info['constants']['size'], ubos[0]['block_size'])
+    if x.get('textures'):
+        fail(src + ': combined image samplers are not portable (use JVK_TEXTURE + JVK_SAMPLER)')
+    if any(u['binding'] != CONSTANTS_BINDING for u in x.get('ubos', [])):
+        fail(src + ': uniform blocks other than JVK_CONSTANTS are not portable')
     stages[name] = info
 
 def layout(stage):
@@ -276,19 +273,14 @@ namespace jvk::shaders::bundle
 
 """
 
-for src, kind, name, translate in STAGES:
+for src, kind, name in STAGES:
     s = stages[name]
     out += '// %s\n' % src
-    spirv = 'alignas(4) inline constexpr uint32_t %s_spv[] = {\n%s\n};\n' % (name, words(s['spirv']))
-    out += '#if JVK_VULKAN\n%s#endif\n' % spirv if translate else spirv
-    if translate:
-        out += '#if JVK_METAL\ninline constexpr char %s_msl[] =\n%s;\n#endif\n' % (name, msl_literal(s['msl']))
-    out += '\n'
+    out += '#if JVK_VULKAN\nalignas(4) inline constexpr uint32_t %s_spv[] = {\n%s\n};\n#endif\n' % (name, words(s['spirv']))
+    out += '#if JVK_METAL\ninline constexpr char %s_msl[] =\n%s;\n#endif\n\n' % (name, msl_literal(s['msl']))
 
 def stage_init(name):
-    if stages[name]['msl']:
-        return '{ JVK_BUNDLE_SPIRV(%s), JVK_BUNDLE_MSL(%s) }' % (name, name)
-    return '{ %s_spv, {} }' % name
+    return '{ JVK_BUNDLE_SPIRV(%s), JVK_BUNDLE_MSL(%s) }' % (name, name)
 
 out += """// =============================================================================
 // Programs: name, vertex, fragment, textures, storage buffers, constants
@@ -318,12 +310,12 @@ for p in programs:
         p['name'], p['name'], stage_init(p['vert']), stage_init(p['frag']),
         p['textures'], p['storage'], p['constants'], p['outputs'])
 
-out += """#undef JVK_BUNDLE_SPIRV
-#undef JVK_BUNDLE_MSL
-
-// The vertex stage of user jvk::Shaders (shader_region.vert): SPIR-V for every
-// backend, its push-constant block the users' native contract.
+out += """// The vertex stage of user jvk::Shaders (shader_region.vert), its constants
+// block the start of theirs.
 inline const Stage shaderRegionVert %s;
+
+#undef JVK_BUNDLE_SPIRV
+#undef JVK_BUNDLE_MSL
 
 } // namespace jvk::shaders::bundle
 """ % stage_init('shader_region_vert')

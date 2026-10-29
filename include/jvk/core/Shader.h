@@ -17,8 +17,10 @@ namespace jvk {
 // =============================================================================
 // Shader — a user fragment shader, drawn with jvk::Graphics::drawShader
 //
-// The GLSL contract (SPIR-V, Vulkan conventions; built at run time from the
-// SPIR-V, so a backend that consumes another shader format draws nothing):
+// The GLSL contract (Vulkan conventions), compiled to SPIR-V, the form the
+// Vulkan backend draws and reflection reads; Metal draws the MSL that jvk_msl
+// translates from that SPIR-V at build time (CMake: jvk_msl). A shader without
+// the backend's form draws nothing:
 //
 //   - The vertex stage is jvk's region quad (shaders/shader_region.vert):
 //     `layout(location = 0) in vec2 fragUV`, 0..1 over the draw's region.
@@ -56,9 +58,10 @@ public:
     Shader(const Shader&) = delete;
     Shader& operator=(const Shader&) = delete;
 
-    void load(std::span<const uint32_t> fragSpirv)
+    void load(std::span<const uint32_t> fragSpirv, std::string_view fragMsl = {})
     {
         spirv_.assign(fragSpirv.begin(), fragSpirv.end());
+        msl_.assign(fragMsl);
         reflectShader();
     }
 
@@ -244,6 +247,7 @@ private:
     static constexpr uint32_t kBlockAlign = 256;
 
     std::vector<uint32_t>     spirv_;
+    std::string               msl_;
     std::vector<BindingInfo>  bindings_;
     std::vector<std::byte>    uniformData_;
     std::vector<gpu::BindingDesc> nativeBindings_;  // the program's layout, by slot

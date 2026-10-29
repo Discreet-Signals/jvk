@@ -60,10 +60,6 @@ struct Caps
 
     bool independentBlend     = true;         // per-attachment blend state (render targets need it)
     bool textureCompressionBC = false;
-
-    // Whether createProgram takes SPIR-V with native bindings (a jvk::Shader's
-    // program), natively or through a run-time translator.
-    bool spirvPrograms = true;
 };
 
 // =============================================================================
@@ -100,8 +96,8 @@ struct ProgramLayout
     uint8_t  colorOutputs   = 1;
 
     // Empty: the portable convention. Otherwise every binding the program
-    // declares, where it is: a backend that can't honour native bindings
-    // (anything but the format they were written in) refuses the program.
+    // declares, where its SPIR-V puts it (a jvk::Shader's): Vulkan binds it
+    // there, Metal where jvk_msl translated it (backends/metal/MslBindings.h).
     std::span<const BindingDesc> bindings;
 };
 
@@ -109,10 +105,9 @@ struct ProgramDesc
 {
     const char* name = nullptr;          // debug name; may be null
 
-    // Both stages in `format`: the backend's Caps::shaderFormat (the bundle's
-    // programs), or SPIR-V with native bindings where Caps::spirvPrograms says
-    // the backend takes it. SPIR-V words, or source text (MSL, HLSL, WGSL). The
-    // bytes need only outlive createProgram().
+    // Both stages in `format`, the backend's Caps::shaderFormat: SPIR-V words,
+    // or source text (MSL, HLSL, WGSL). The bytes need only outlive
+    // createProgram().
     ShaderFormat format = ShaderFormat::SPIRV;
     std::span<const std::byte> vertex;
     std::span<const std::byte> fragment;

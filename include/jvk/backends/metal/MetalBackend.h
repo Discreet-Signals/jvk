@@ -44,10 +44,11 @@ namespace jvk::metal
 // =============================================================================
 
 // Where slots live (TRANSLATION_LAYER.md, "Binding convention"): the bundle's
-// texture i at [[texture(i)]] with its sampler at [[sampler(8 + i)]] (a
-// jvk::Shader's at [[sampler(i)]]: up to 16), storage j at [[buffer(16 + j)]],
-// the constants at [[buffer(24)]] on both stages, vertices at [[buffer(30)]].
-inline constexpr uint8_t kSamplerBase = 8, kStorageBase = 16, kConstantsIndex = 24, kVertexBufferIndex = 30;
+// texture i at [[texture(i)]] with its sampler at [[sampler(8 + i)]], storage j
+// at [[buffer(16 + j)]] (kBlockBase), the constants at [[buffer(24)]] on both
+// stages (kConstantsIndex), vertices at [[buffer(30)]]. A jvk::Shader's where
+// jvk_msl put them (MslBindings.h).
+inline constexpr uint8_t kSamplerBase = 8, kVertexBufferIndex = 30;
 
 // A strong reference to an Objective-C object under manual reference counting.
 template <typename T>
@@ -171,8 +172,7 @@ private:
     id<MTLDepthStencilState> depthStencilState(const gpu::StencilState& stencil);   // under tableMutex_
     bool     stage(TextureSlot& t, uint32_t handle, uint32_t layer, uint32_t mip, gpu::IRect region,
                    const std::byte* data, size_t rowBytes, size_t imageBytes);      // under writeMutex_
-    Strong<id<MTLFunction>> function(const gpu::ProgramDesc& desc, bool vertex, const ProgramSlot& slot,
-                                     std::span<const gpu::BindingDesc> bindings, juce::String& error);
+    Strong<id<MTLFunction>> function(const gpu::ProgramDesc& desc, bool vertex, juce::String& error);
 
     id<MTLDevice>       device_ = nil;   // owned (+1)
     id<MTLCommandQueue> queue_  = nil;   // owned (+1)

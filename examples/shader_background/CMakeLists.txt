@@ -27,8 +27,13 @@ add_custom_command(
     COMMENT "Compiling background.frag → SPIR-V"
 )
 
+# …and that to the MSL jvk's Metal backend draws (empty in a build without Metal)
+set(_frag_msl "${CMAKE_CURRENT_BINARY_DIR}/background.frag.metal")
+jvk_msl("${_frag_spv}" "${_frag_msl}")
+
 juce_add_binary_data(ShaderBackground_BinaryData SOURCES
     "${_frag_spv}"
+    "${_frag_msl}"
 )
 
 target_sources(ShaderBackground PRIVATE

@@ -155,12 +155,12 @@ gpu::TextureId Renderer::texture(const ImageSource& src)
     return context_->images().get(src, serial_);
 }
 
-Shader& Renderer::shader(std::span<const uint32_t> spirv)
+Shader& Renderer::shader(std::span<const uint32_t> spirv, std::string_view msl)
 {
     auto& s = shaders_[spirv.data()];
     if (s == nullptr) {
         s = std::make_unique<Shader>();
-        s->load(spirv);
+        s->load(spirv, msl);
     }
     return *s;
 }

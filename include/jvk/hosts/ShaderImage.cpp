@@ -29,9 +29,9 @@ namespace
 }
 
 ShaderImage::ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
-                         int width, int height, int storageBufSize)
+                         int width, int height, int storageBufSize, std::string_view fragmentMsl)
     : w(std::max(1, width)), h(std::max(1, height)),
-      storageSize(storageBufSize)
+      fragmentMsl_(fragmentMsl), storageSize(storageBufSize)
 {
     if (storageBufSize > 0)
     {
@@ -47,7 +47,7 @@ ShaderImage::ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
     std::memcpy(fragmentSpirv_.data(), fragmentSpv, fragmentSpirv_.size() * 4);
 
     backend_ = defaultBackend();
-    if (backend_ == nullptr || !backend_->caps().spirvPrograms) return;
+    if (backend_ == nullptr) return;
     context_ = Context::forBackend(backend_);
     const auto& caps = backend_->caps();
     builder_.setAlignments(caps.constantsAlignment, caps.storageAlignment);
@@ -63,8 +63,12 @@ ShaderImage::ShaderImage(const char* fragmentSpv, int fragmentSpvSize,
     }
     gpu::ProgramDesc desc;
     desc.name = "jvk::ShaderImage";
-    desc.vertex = std::as_bytes(shaders::bundle::shaderRegionVert.spirv);
-    desc.fragment = std::as_bytes(std::span<const uint32_t>(fragmentSpirv_));
+    if (!shaders::setStages(desc, caps.shaderFormat, shaders::bundle::shaderRegionVert, { fragmentSpirv_, fragmentMsl_ }))
+    {
+        diag::log("jvk::ShaderImage: no form of it this backend draws (Metal: its MSL, jvk_msl); it draws nothing");
+        jassertfalse;
+        return;
+    }
     desc.layout.textures = textureSlots_;
     desc.layout.storageBuffers = storageSlots_;
     desc.layout.constantsBytes = sizeof(RegionConstants);

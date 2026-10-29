@@ -39,6 +39,28 @@ struct Stage
     std::string_view          msl;     // Metal Shading Language, entry point "main0"; empty if not translated
 };
 
+// The two stages in `format` (a backend's Caps::shaderFormat) into `desc`:
+// false when either has no form in it.
+inline bool setStages(gpu::ProgramDesc& desc, gpu::ShaderFormat format, const Stage& vertex, const Stage& fragment)
+{
+    desc.format = format;
+    const auto text = [](std::string_view s) { return std::as_bytes(std::span<const char>(s.data(), s.size())); };
+    if (format == gpu::ShaderFormat::SPIRV && !vertex.spirv.empty() && !fragment.spirv.empty())
+    {
+        desc.vertex   = std::as_bytes(vertex.spirv);
+        desc.fragment = std::as_bytes(fragment.spirv);
+        return true;
+    }
+    if (format == gpu::ShaderFormat::MSL && !vertex.msl.empty() && !fragment.msl.empty())
+    {
+        desc.vertex   = text(vertex.msl);
+        desc.fragment = text(fragment.msl);
+        desc.vertexEntry = desc.fragmentEntry = "main0";
+        return true;
+    }
+    return false;   // the bundle has no HLSL or WGSL yet
+}
+
 struct Program
 {
     const char* name = nullptr;
