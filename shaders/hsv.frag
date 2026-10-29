@@ -1,4 +1,5 @@
 #version 450
+#include "jvk_portable.glsl"
 
 // Full-screen perceptual colour transform post-process (Oklab / Oklch).
 //
@@ -23,9 +24,10 @@
 // → sRGB. The sRGB↔linear step uses pow(2.2) to match the rest of the codebase,
 // which stores values in UNORM attachments and treats them as sRGB-encoded.
 
-layout(set = 0, binding = 0) uniform sampler2D inputTex;
+JVK_TEXTURE(0, inputTex);
+JVK_SAMPLER(0, inputSampler);
 
-layout(push_constant) uniform PC {
+JVK_CONSTANTS {
     vec2  viewportSize;
     float scaleH, scaleS, scaleV;
     float deltaH, deltaS, deltaV;

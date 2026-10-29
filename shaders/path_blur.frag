@@ -1,13 +1,13 @@
 #version 450
+#include "jvk_portable.glsl"
 
 // Path-SDF variable-radius Gaussian blur. Structurally a mashup:
 //   - shape_blur.frag's separable H/V blur + smoothstep falloff,
 //   - path_sdf.frag's analytical segment-loop distance + winding-number SDF.
 //
-// Set 0  → source scene texture (read/write via ping-pong like every other
-//          post-process effect).
-// Set 1  → the same per-frame segment SSBO PathPipeline owns (PathPipeline's
-//          descriptor is bound here so we read its already-uploaded segments).
+// Texture 0 → source scene texture (read/write via ping-pong like every other
+//             post-process effect).
+// Storage 0 → the frame's shared segment stream, as path_sdf.frag reads it.
 //
 // All distances in this shader are in physical pixels — the segments are
 // uploaded physical by Graphics::{draw,fill}BlurredPath (matching fillPath's
@@ -18,7 +18,7 @@
 // (`abs(d) - strokeHalfWidth`) so the blur band centres on the path's
 // stroke instead of the filled interior — what drawBlurredPath uses.
 
-layout(push_constant) uniform PC {
+JVK_CONSTANTS {
     vec2  viewportSize;     // physical pixels
     vec2  direction;        // (1,0) horizontal | (0,1) vertical
 
@@ -40,9 +40,10 @@ layout(push_constant) uniform PC {
     float invStripH;        // (pad kept the block at 64 bytes)
 } pc;
 
-layout(set = 0, binding = 0) uniform sampler2D srcTexture;
+JVK_TEXTURE(0, srcTexture);
+JVK_SAMPLER(0, srcSampler);
 
-layout(std430, set = 1, binding = 0) readonly buffer Segments {
+JVK_STORAGE(0) Segments {
     vec4 data[];
 } segments;
 
@@ -137,15 +138,17 @@ const int   MAX_POISSON_TAPS = 1024;
 // shape_blur.frag uses).
 vec4 sampleSrc(vec2 uv) {
     vec2 m = uv - 2.0 * floor(uv * 0.5 + 0.5);
-    return texture(srcTexture, abs(m));
+    return texture(sampler2D(srcTexture, srcSampler), abs(m));
 }
 
 void main() {
     vec2 fragCoord = fragUV * pc.viewportSize;
     float radius   = computeRadius(fragCoord);   // physical pixels
 
+    // TODO(WGSL uniformity): every sample below sits under branches on the
+    // per-pixel radius; sample with explicit LOD before a WGSL build.
     if (radius <= 0.5) {
-        outColor = texture(srcTexture, fragUV);
+        outColor = texture(sampler2D(srcTexture, srcSampler), fragUV);
         return;
     }
 
@@ -154,7 +157,7 @@ void main() {
     int   N     = int(ceil(radius));
 
     vec2  texelSize   = 1.0 / pc.viewportSize;
-    vec4  color       = texture(srcTexture, fragUV);
+    vec4  color       = texture(sampler2D(srcTexture, srcSampler), fragUV);
     float totalWeight = 1.0;
 
     if (pc.kernelType == 0) {

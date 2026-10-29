@@ -1,0 +1,741 @@
+#pragma once
+
+namespace jvk::ops {
+
+// =============================================================================
+// Unified fill model — "shape × color" composition
+//
+// Every draw op is the product of two independent sources:
+//   - A color source: solid vertex color, a 256x1 gradient LUT sampled by a
+//     per-vertex `gradientT`, or a tiled image fill's texture sampled at a
+//     per-vertex UV. Gradient LUTs are built at record time from
+//     juce::ColourGradient via getColourAtPosition(t), so N-stop gradients
+//     (start, middle colours added via addColour, end) work natively. As juce,
+//     a fill is placed by the paint's transform and its own, never by the
+//     transform of the thing drawn (a path's, a glyph run's).
+//   - A shape source: analytical SDF (rect / rounded rect / ellipse), MSDF
+//     atlas (text), or sampled image.
+//
+// Texture slot 0 holds the colour LUT, the fill's image, or the 1x1 default
+// for solid fills — unused when gradientInfo.z == 0), slot 1 holds the shape texture. Each op
+// computes per-vertex gradientT on CPU so radial/linear behave correctly under
+// arbitrary transforms.
+// =============================================================================
+
+struct GradientCtx {
+    float mode    = 0.0f;         // 0 = solid, 1 = linear, 2 = radial, 3 = tiled image
+    float rowNorm = 0.0f;         // normalised y into the GradientAtlas (row center)
+    float gx1 = 0, gy1 = 0;       // gradient origin in physical pixels
+    // linear projection
+    float dx = 0, dy = 0, invLen2 = 0;
+    // radial normalization
+    float invRadius = 0;
+    // tiled image: physical px -> image px, over the image's size; its texture and point sampling
+    juce::AffineTransform toImage;
+    float invW = 0, invH = 0, nearest = 0;
+    gpu::TextureId image;
+    bool invisible = false;       // an image fill with no image to draw: nothing, as juce
+
+    bool active() const { return mode > 0.0f; }
+};
+
+inline GradientCtx makeGradientCtx(Renderer& r, const juce::FillType& fill,
+                                   const juce::AffineTransform& physical)
+{
+    GradientCtx c;
+    if (!fill.isGradient() || !fill.gradient) return c;
+    auto& g = *fill.gradient;
+
+    // Idempotent w.r.t. the hash — if Graphics.h already registered the
+    // gradient during recording, this just re-reads the cached row.
+    c.rowNorm = r.registerGradient(g);
+
+    auto gradT = fill.transform.followedBy(physical);
+    float x1 = g.point1.x, y1 = g.point1.y;
+    float x2 = g.point2.x, y2 = g.point2.y;
+    gradT.transformPoint(x1, y1);
+    gradT.transformPoint(x2, y2);
+
+    c.gx1 = x1;
+    c.gy1 = y1;
+    if (g.isRadial) {
+        c.mode = 2.0f;
+        float radius = std::sqrt((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1));
+        c.invRadius = (radius > 0) ? 1.0f / radius : 0.0f;
+    } else {
+        c.mode = 1.0f;
+        c.dx = x2 - x1;
+        c.dy = y2 - y1;
+        float len2 = c.dx * c.dx + c.dy * c.dy;
+        c.invLen2 = (len2 > 0) ? 1.0f / len2 : 0.0f;
+    }
+    return c;
+}
+
+// The colour source of captured fill `fillIndex`: a tiled image fill (its texture
+// resolved at record time, Graphics::captureFill) as mode 3, any other as
+// makeGradientCtx. `physical` places the fill: the paint's transform, scaled.
+inline GradientCtx makeFillCtx(Renderer& r, uint32_t fillIndex, const juce::AffineTransform& physical)
+{
+    const auto& fill = r.getFill(fillIndex);
+    if (!fill.isTiledImage()) return makeGradientCtx(r, fill, physical);
+
+    GradientCtx c;
+    const auto& texture = r.getFillTexture(fillIndex);
+    if (!texture.texture) { c.invisible = true; return c; }
+    c.mode    = 3.0f;
+    c.image   = texture.texture;
+    c.nearest = texture.nearest ? 1.0f : 0.0f;
+    c.toImage = fill.transform.followedBy(physical).inverted();
+    c.invW    = 1.0f / static_cast<float>(fill.image.getWidth());
+    c.invH    = 1.0f / static_cast<float>(fill.image.getHeight());
+    return c;
+}
+
+// Produces the vertex gradientInfo: (t.x, t.y, mode, rowNorm); a tiled image's
+// (u, v, 3, nearest), the UV unbounded (the shader wraps it).
+// Shader reads t.x for linear, length(t.xy) for radial; samples the colour
+// atlas at (t, rowNorm).
+inline glm::vec4 gradientAt(const GradientCtx& c, float px, float py)
+{
+    if (c.mode == 3.0f) {
+        const auto q = juce::Point<float>(px, py).transformedBy(c.toImage);
+        return glm::vec4(q.x * c.invW, q.y * c.invH, 3.0f, c.nearest);
+    }
+    if (c.mode == 2.0f) {
+        return glm::vec4((px - c.gx1) * c.invRadius,
+                         (py - c.gy1) * c.invRadius, 2.0f, c.rowNorm);
+    }
+    if (c.mode == 1.0f) {
+        float t = ((px - c.gx1) * c.dx + (py - c.gy1) * c.dy) * c.invLen2;
+        return glm::vec4(t, 0.0f, 1.0f, c.rowNorm);
+    }
+    return glm::vec4(0.0f);
+}
+
+// Effective color attribute: for solid, carries the colour + opacity; for
+// gradient, white with opacity (the LUT sample already supplies RGB, opacity
+// multiplies in the shader). `solid` is the fill's colour either way: juce's
+// FillType::setOpacity writes its alpha, for a gradient fill too, so a
+// gradient under g.setOpacity(0.3f) renders at 30% (it used to render opaque).
+inline glm::vec4 fillColorAttr(const GradientCtx& grad, juce::Colour solid, float opacity)
+{
+    if (grad.invisible)
+        return glm::vec4(0.0f);
+    if (grad.active())
+        return glm::vec4(1.0f, 1.0f, 1.0f, solid.getFloatAlpha() * opacity);
+    return { solid.getFloatRed(), solid.getFloatGreen(),
+             solid.getFloatBlue(), solid.getFloatAlpha() * opacity };
+}
+
+// Every built-in texture samples filtered and clamped; point sampling is the
+// shader's (it snaps UVs to texel centres), never a second sampler.
+inline constexpr gpu::SamplerDesc kLinearClamp {};
+
+inline gpu::TextureBinding colorDescFor(const GradientCtx& grad, Renderer& r)
+{
+    // A tiled image samples its own texture. All active gradients share the
+    // atlas; solids get the 1x1 default which the shader doesn't sample when
+    // gradientInfo.z == 0.
+    if (grad.mode == 3.0f) return { grad.image, kLinearClamp };
+    return { grad.active() ? r.gradientTexture() : r.defaultTexture(), kLinearClamp };
+}
+
+// =============================================================================
+// Quad emitters — each vertex gets its own gradientT based on its physical pos
+// =============================================================================
+
+inline void emitQuad(Emitter& state, const DrawCommand& cmd,
+                     float x, float y, float w, float h,
+                     glm::vec4 color, glm::vec4 shape = glm::vec4(0),
+                     const GradientCtx* grad = nullptr)
+{
+    auto gi = [&](float px, float py) {
+        return (grad && grad->active()) ? gradientAt(*grad, px, py) : glm::vec4(0.0f);
+    };
+    UIVertex verts[6] = {
+        { {x,     y    }, color, {0, 0}, shape, gi(x,     y    ) },
+        { {x + w, y    }, color, {1, 0}, shape, gi(x + w, y    ) },
+        { {x + w, y + h}, color, {1, 1}, shape, gi(x + w, y + h) },
+        { {x,     y    }, color, {0, 0}, shape, gi(x,     y    ) },
+        { {x + w, y + h}, color, {1, 1}, shape, gi(x + w, y + h) },
+        { {x,     y + h}, color, {0, 1}, shape, gi(x,     y + h) },
+    };
+    state.draw(cmd, verts, 6);
+}
+
+// Emit a quad with custom UVs (e.g. for SDF AA-fringe padding)
+inline void emitQuadUV(Emitter& state, const DrawCommand& cmd,
+                       float x, float y, float w, float h,
+                       float u0, float v0, float u1, float v1,
+                       glm::vec4 color, glm::vec4 shape,
+                       const GradientCtx* grad = nullptr)
+{
+    auto gi = [&](float px, float py) {
+        return (grad && grad->active()) ? gradientAt(*grad, px, py) : glm::vec4(0.0f);
+    };
+    UIVertex verts[6] = {
+        { {x,     y    }, color, {u0, v0}, shape, gi(x,     y    ) },
+        { {x + w, y    }, color, {u1, v0}, shape, gi(x + w, y    ) },
+        { {x + w, y + h}, color, {u1, v1}, shape, gi(x + w, y + h) },
+        { {x,     y    }, color, {u0, v0}, shape, gi(x,     y    ) },
+        { {x + w, y + h}, color, {u1, v1}, shape, gi(x + w, y + h) },
+        { {x,     y + h}, color, {u0, v1}, shape, gi(x,     y + h) },
+    };
+    state.draw(cmd, verts, 6);
+}
+
+// An axis-aligned rectangle as the rounded-rect SDF with no radius (shape type
+// 1), padded a pixel for the coverage ramp: a fractional edge takes juce's
+// anti-aliasing (for an axis-aligned edge the ramp IS the pixel's covered
+// share), an integer edge whole pixels, exactly as a flat quad took them. UVs
+// anchor to the unpadded rect (the shader's halfSize). Six vertices.
+template <typename GradientAt>
+inline void rectSdfVertices(UIVertex* v, const juce::Rectangle<float>& phys,
+                            glm::vec4 color, GradientAt&& gi)
+{
+    const float x = phys.getX(), y = phys.getY(), w = phys.getWidth(), h = phys.getHeight();
+    const glm::vec4 shape(1.0f, w * 0.5f, h * 0.5f, 0.0f);
+    const float pad = 1.0f, uPad = pad / w, vPad = pad / h;
+    const float x0 = x - pad, y0 = y - pad, x1 = x + w + pad, y1 = y + h + pad;
+    const float u0 = -uPad, v0 = -vPad, u1 = 1.0f + uPad, v1 = 1.0f + vPad;
+    v[0] = { {x0, y0}, color, {u0, v0}, shape, gi(x0, y0) };
+    v[1] = { {x1, y0}, color, {u1, v0}, shape, gi(x1, y0) };
+    v[2] = { {x1, y1}, color, {u1, v1}, shape, gi(x1, y1) };
+    v[3] = { {x0, y0}, color, {u0, v0}, shape, gi(x0, y0) };
+    v[4] = { {x1, y1}, color, {u1, v1}, shape, gi(x1, y1) };
+    v[5] = { {x0, y1}, color, {u0, v1}, shape, gi(x0, y1) };
+}
+
+inline void emitRectSdf(Emitter& state, const DrawCommand& cmd, const juce::Rectangle<float>& phys,
+                        glm::vec4 color, const GradientCtx* grad = nullptr)
+{
+    if (phys.getWidth() <= 0.0f || phys.getHeight() <= 0.0f) return;   // juce fills nothing
+    UIVertex verts[6];
+    rectSdfVertices(verts, phys, color, [&](float px, float py) {
+        return (grad && grad->active()) ? gradientAt(*grad, px, py) : glm::vec4(0.0f);
+    });
+    state.draw(cmd, verts, 6);
+}
+
+inline void emitTransformedQuad(Emitter& state, const DrawCommand& cmd,
+                                juce::Point<float> p00, juce::Point<float> p10,
+                                juce::Point<float> p11, juce::Point<float> p01,
+                                glm::vec4 color, glm::vec4 shape = glm::vec4(0),
+                                const GradientCtx* grad = nullptr)
+{
+    auto gi = [&](juce::Point<float> p) {
+        return (grad && grad->active()) ? gradientAt(*grad, p.x, p.y) : glm::vec4(0.0f);
+    };
+    UIVertex verts[6] = {
+        { {p00.x, p00.y}, color, {0, 0}, shape, gi(p00) },
+        { {p10.x, p10.y}, color, {1, 0}, shape, gi(p10) },
+        { {p11.x, p11.y}, color, {1, 1}, shape, gi(p11) },
+        { {p00.x, p00.y}, color, {0, 0}, shape, gi(p00) },
+        { {p11.x, p11.y}, color, {1, 1}, shape, gi(p11) },
+        { {p01.x, p01.y}, color, {0, 1}, shape, gi(p01) },
+    };
+    state.draw(cmd, verts, 6);
+}
+
+inline juce::AffineTransform toPhysical(const juce::AffineTransform& t, float scale)
+{
+    return t.scaled(scale);
+}
+
+// Pack two floats into a single float via half-precision encoding.
+// Lossless for values whose magnitude fits in fp16 (~65k). Used by stroke
+// shape codes (type 8 / 9) to carry cornerSize + strokeWidth in shapeInfo.w,
+// which the shader recovers with unpackHalf2x16(floatBitsToUint(w)).
+inline float packHalf2(float x, float y)
+{
+    uint32_t packed = glm::packHalf2x16(glm::vec2(x, y));
+    float result;
+    memcpy(&result, &packed, sizeof(float));
+    return result;
+}
+
+inline juce::Rectangle<float> toPixels(const juce::Rectangle<float>& rect,
+                                       const juce::AffineTransform& t, float scale)
+{
+    auto transformed = rect.transformedBy(t);
+    return { transformed.getX() * scale, transformed.getY() * scale,
+             transformed.getWidth() * scale, transformed.getHeight() * scale };
+}
+
+// =============================================================================
+// The 2D draws: fills, strokes, images, text, lines (the ui2d program)
+// =============================================================================
+
+inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
+{
+    const auto& arena = r.arena();
+    const gpu::TextureBinding def { r.defaultTexture(), kLinearClamp };
+
+    switch (cmd.op) {
+        case DrawOp::FillRect: {
+            auto& p    = arena.read<FillRectParams>(cmd.dataOffset);
+            auto& fill = r.getFill(p.fillIndex);
+            auto  tx   = toPhysical(p.transform, p.scale);
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
+
+            state.setResources(colorDescFor(grad, r), def);
+            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            // Axis-aligned by construction: Graphics::fillRect takes a rotated or
+            // sheared rectangle as a path. The SDF rect gives fractional edges
+            // juce's anti-aliasing (a flat quad snapped them to whole pixels).
+            emitRectSdf(state, cmd, toPixels(p.rect, p.transform, p.scale), color, &grad);
+            break;
+        }
+
+        case DrawOp::FillRectList: {
+            // One command for a whole RectangleList: shared fill/descriptors,
+            // vertices batched into as few draws as possible (the record side
+            // used to explode the list into one command + draw per rect).
+            auto& p    = arena.read<FillRectListParams>(cmd.dataOffset);
+            uint32_t rectsOffset =
+                (cmd.dataOffset + static_cast<uint32_t>(sizeof(FillRectListParams)) + 3u) & ~3u;
+            auto rects = arena.readSpan<juce::Rectangle<float>>(rectsOffset, p.rectCount);
+
+            auto& fill = r.getFill(p.fillIndex);
+            auto  tx   = toPhysical(p.transform, p.scale);
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
+            state.setResources(colorDescFor(grad, r), def);
+            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+
+            auto gi = [&](float px, float py) {
+                return grad.active() ? gradientAt(grad, px, py) : glm::vec4(0.0f);
+            };
+
+            constexpr uint32_t kMaxBatchRects = 32;
+            UIVertex batch[kMaxBatchRects * 6];
+            uint32_t batched = 0;
+            auto flush = [&] {
+                if (batched == 0) return;
+                state.draw(cmd, batch, batched * 6);
+                batched = 0;
+            };
+
+            // Axis-aligned by construction (a rotated list is a path, Graphics::
+            // fillRectList); each rect an SDF rect like FillRect's.
+            for (auto& rect : rects) {
+                const auto phys = toPixels(rect, p.transform, p.scale);
+                if (phys.getWidth() <= 0.0f || phys.getHeight() <= 0.0f) continue;
+                if (batched == kMaxBatchRects) flush();
+                rectSdfVertices(batch + batched * 6, phys, color, gi);
+                batched++;
+            }
+            flush();
+            break;
+        }
+
+        case DrawOp::FillRoundedRect: {
+            auto& p    = arena.read<FillRoundedRectParams>(cmd.dataOffset);
+            auto& fill = r.getFill(p.fillIndex);
+            auto  tx   = toPhysical(p.transform, p.scale);
+            auto  phys = toPixels(p.rect, p.transform, p.scale);
+            // cornerSize is in LOGICAL pixels — scale it by the composed
+            // transform (affine × displayScale) so corners grow with the
+            // rect under any transform zoom. Using p.scale alone only
+            // covers displayScale and leaves corners under-sized whenever
+            // the caller set a scale > 1 on Graphics::addTransform.
+            float cs   = p.cornerSize * tx.getScaleFactor();
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
+
+            state.setResources(colorDescFor(grad, r), def);
+            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            glm::vec4 shape(1.0f, phys.getWidth() * 0.5f, phys.getHeight() * 0.5f, cs);
+
+            // Expand quad by `pad` on each side. UV must stay anchored to the
+            // unpadded extents so that UV=(0,0)/(1,1) map to the rect corners
+            // in the shader's local frame. That means uPad = pad / phys.w, not
+            // pad / (phys.w + 2*pad) — the shader's halfSize is unpadded.
+            float pad = 1.0f;
+            float ex = phys.getX() - pad, ey = phys.getY() - pad;
+            float ew = phys.getWidth() + pad * 2, eh = phys.getHeight() + pad * 2;
+            float uPad = pad / phys.getWidth(), vPad = pad / phys.getHeight();
+            emitQuadUV(state, cmd, ex, ey, ew, eh,
+                       -uPad, -vPad, 1.0f + uPad, 1.0f + vPad,
+                       color, shape, &grad);
+            break;
+        }
+
+        case DrawOp::FillEllipse: {
+            auto& p    = arena.read<FillEllipseParams>(cmd.dataOffset);
+            auto& fill = r.getFill(p.fillIndex);
+            auto  tx   = toPhysical(p.transform, p.scale);
+            auto  phys = toPixels(p.area, p.transform, p.scale);
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
+
+            state.setResources(colorDescFor(grad, r), def);
+            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            glm::vec4 shape(2.0f, phys.getWidth() * 0.5f, phys.getHeight() * 0.5f, 0.0f);
+
+            float pad = 1.0f;
+            float ex = phys.getX() - pad, ey = phys.getY() - pad;
+            float ew = phys.getWidth() + pad * 2, eh = phys.getHeight() + pad * 2;
+            float uPad = pad / phys.getWidth(), vPad = pad / phys.getHeight();
+            emitQuadUV(state, cmd, ex, ey, ew, eh,
+                       -uPad, -vPad, 1.0f + uPad, 1.0f + vPad,
+                       color, shape, &grad);
+            break;
+        }
+
+        case DrawOp::StrokeRoundedRect: {
+            auto& p    = arena.read<StrokeRoundedRectParams>(cmd.dataOffset);
+            auto& fill = r.getFill(p.fillIndex);
+            auto  tx   = toPhysical(p.transform, p.scale);
+            auto  phys = toPixels(p.rect, p.transform, p.scale);
+            // Both cornerSize and lineWidth are logical pixels — scale by
+            // the composed transform so they track the rect under zoom.
+            float cs   = p.cornerSize * tx.getScaleFactor();
+            float sw   = p.lineWidth  * tx.getScaleFactor();
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
+
+            state.setResources(colorDescFor(grad, r), def);
+            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            // Type 8 = stroked rounded rect. Shader: abs(roundedRectSDF) - sw/2.
+            glm::vec4 shape(8.0f, phys.getWidth() * 0.5f, phys.getHeight() * 0.5f,
+                            packHalf2(cs, sw));
+
+            // Expand quad by sw/2 (to contain outer stroke edge) + 1px AA fringe.
+            // UV stays anchored to the unpadded rect so the shader sees the
+            // outer edge at localP = ±(halfW + sw/2).
+            float pad = sw * 0.5f + 1.0f;
+            float ex = phys.getX() - pad, ey = phys.getY() - pad;
+            float ew = phys.getWidth() + pad * 2, eh = phys.getHeight() + pad * 2;
+            float uPad = pad / phys.getWidth(), vPad = pad / phys.getHeight();
+            emitQuadUV(state, cmd, ex, ey, ew, eh,
+                       -uPad, -vPad, 1.0f + uPad, 1.0f + vPad,
+                       color, shape, &grad);
+            break;
+        }
+
+        case DrawOp::StrokeEllipse: {
+            auto& p    = arena.read<StrokeEllipseParams>(cmd.dataOffset);
+            auto& fill = r.getFill(p.fillIndex);
+            auto  tx   = toPhysical(p.transform, p.scale);
+            auto  phys = toPixels(p.area, p.transform, p.scale);
+            // lineWidth is in logical pixels — use the composed transform
+            // scale (matches DrawLine's convention).
+            float sw   = p.lineWidth * tx.getScaleFactor();
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
+
+            state.setResources(colorDescFor(grad, r), def);
+            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+            // Type 9 = stroked ellipse. Shader: abs(ellipseSDF) - sw/2.
+            glm::vec4 shape(9.0f, phys.getWidth() * 0.5f, phys.getHeight() * 0.5f,
+                            packHalf2(0.0f, sw));
+
+            float pad = sw * 0.5f + 1.0f;
+            float ex = phys.getX() - pad, ey = phys.getY() - pad;
+            float ew = phys.getWidth() + pad * 2, eh = phys.getHeight() + pad * 2;
+            float uPad = pad / phys.getWidth(), vPad = pad / phys.getHeight();
+            emitQuadUV(state, cmd, ex, ey, ew, eh,
+                       -uPad, -vPad, 1.0f + uPad, 1.0f + vPad,
+                       color, shape, &grad);
+            break;
+        }
+
+        case DrawOp::DrawImage: {
+            auto& p     = arena.read<DrawImageParams>(cmd.dataOffset);
+            // The texture was resolved at record time (see
+            // Graphics::drawImage); no shared-cache lookup from the worker.
+            const gpu::TextureBinding shapeDesc = p.texture ? gpu::TextureBinding { p.texture, kLinearClamp } : def;
+            // Images are self-colored; color LUT is ignored (solid white tint).
+            state.setResources(def, shapeDesc);
+            auto  tx = toPhysical(p.transform, p.scale);
+            // shapeInfo.y on image shape types = the point-sampling flag.
+            const float nearest = static_cast<float>(p.nearest);
+            float w = static_cast<float>(p.imageWidth);
+            float h = static_cast<float>(p.imageHeight);
+            auto p00 = juce::Point<float>(0, 0).transformedBy(tx);
+            auto p10 = juce::Point<float>(w, 0).transformedBy(tx);
+            auto p11 = juce::Point<float>(w, h).transformedBy(tx);
+            auto p01 = juce::Point<float>(0, h).transformedBy(tx);
+            // Mask fills (clipToImageAlpha + fill) tint by the brush and use
+            // the image's alpha as coverage (shape type 5): solid brushes
+            // ride `tint`; gradient brushes (alphaMaskFill == 2) rebuild the
+            // gradient ctx so sampleColor() shades the quad and the mask
+            // alpha gates it. Plain draws sample the image (type 3)
+            // modulated by opacity.
+            if (p.alphaMaskFill == 2) {
+                auto& mfill = r.getFill(p.fillIndex);
+                GradientCtx mg = makeGradientCtx(r, mfill,
+                                     toPhysical(p.gradientTransform, p.scale));
+                state.setResources(colorDescFor(mg, r), shapeDesc);
+                emitTransformedQuad(state, cmd, p00, p10, p11, p01,
+                                    p.tint, glm::vec4(5.0f, nearest, 0, 0), &mg);
+                break;
+            }
+            const bool maskFill = p.alphaMaskFill != 0;
+            emitTransformedQuad(state, cmd, p00, p10, p11, p01,
+                                maskFill ? p.tint
+                                         : glm::vec4(1, 1, 1, p.opacity),
+                                glm::vec4(maskFill ? 5.0f : 3.0f, nearest, 0, 0));
+            break;
+        }
+
+        case DrawOp::FillTiledImage: {
+            auto& p = arena.read<FillTiledImageParams>(cmd.dataOffset);
+            const gpu::TextureBinding shapeDesc = p.texture ? gpu::TextureBinding { p.texture, kLinearClamp } : def;
+            state.setResources(def, shapeDesc);
+            // Corners + UVs precomputed at record time (shape type 6 wraps
+            // the unbounded UVs with fract()).
+            auto mkv = [&](int i) {
+                return UIVertex {
+                    { p.pos[i].x, p.pos[i].y }, p.tint,
+                    { p.uv[i].x, p.uv[i].y },
+                    glm::vec4(6.0f, static_cast<float>(p.nearest), 0, 0),
+                    glm::vec4(0.0f)
+                };
+            };
+            UIVertex verts[6] = { mkv(0), mkv(1), mkv(2), mkv(0), mkv(2), mkv(3) };
+            state.draw(cmd, verts, 6);
+            break;
+        }
+
+        case DrawOp::DrawGlyphs: {
+            // ================================================================
+            // MSDF extensions roadmap (jvk::Graphics surface, beyond juce::Graphics)
+            //
+            // The atlas stores a true multi-channel signed distance field per
+            // glyph, which gives us several rendering knobs for free — no
+            // atlas re-rasterization, just per-draw shader parameters. All
+            // of these currently live in shaders/ui2d.frag (type 4 branch);
+            // exposing them requires extending DrawGlyphsParams + Graphics.h:
+            //
+            //   - Weight / stroke width
+            //       shift the MSDF 0.5 threshold (already wired as
+            //       WEIGHT_SHIFT in the shader) to render variable-weight
+            //       text: light/regular/bold/black from ONE atlas page.
+            //   - Outline / stroke
+            //       render `abs(signedDist - threshold) - halfStroke < 0`
+            //       to draw a stroked glyph outline of arbitrary thickness.
+            //   - Drop shadow / glow
+            //       sample the MSDF at an offset UV with a smoother
+            //       falloff; composite shadow then glyph in one draw.
+            //   - Glyph-space gradient fills
+            //       already works via the unified gradient path — per-glyph
+            //       gradient shading with no extra code.
+            //
+            // These are all juce::Graphics-surface-incompatible (JUCE has no
+            // concept of variable text weight or glyph outline), so they'd
+            // ship as jvk::Graphics extensions callable via
+            // Graphics::create(g)->drawTextWeighted(...) etc., matching the
+            // darken/brighten/tint/blur extension pattern.
+            // ================================================================
+            auto& p = arena.read<DrawGlyphsParams>(cmd.dataOffset);
+            auto& atlas = r.glyphAtlas();
+            uint32_t afterParams = cmd.dataOffset + static_cast<uint32_t>(sizeof(DrawGlyphsParams));
+            auto glyphIds = arena.readSpan<uint16_t>(afterParams, p.glyphCount);
+            uint32_t posOffset = afterParams + p.glyphCount * static_cast<uint32_t>(sizeof(uint16_t));
+            posOffset = (posOffset + 3u) & ~3u;
+            auto positions = arena.readSpan<juce::Point<float>>(posOffset, p.glyphCount);
+
+            auto& font = r.getFont(p.fontIndex);
+            auto& fill = r.getFill(p.fillIndex);
+            auto  tx   = toPhysical(p.transform, p.scale);
+            // The fill by the paint's transform alone: the run's own (drawText's
+            // translation to its area) places the glyphs, never the fill.
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, toPhysical(p.fillTransform, p.scale));
+
+            // Color LUT is shared across every glyph of this draw; shape
+            // texture varies per glyph (atlas page).
+            state.setColorResource(colorDescFor(grad, r));
+
+            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+
+            const float fontH   = font.getHeight();   // logical: the quad is built there, then transformed
+            const float hScale  = font.getHorizontalScale();
+            const float txScale = tx.getScaleFactor();
+            const bool  rotated = tx.mat01 != 0.0f || tx.mat10 != 0.0f;
+            constexpr int PAD = GlyphAtlas::GLYPH_PADDING;
+
+            // Hoisted out of the loop: getTypefacePtr() is an atomic
+            // refcount bump — the old code paid it PER GLYPH. The key is
+            // likewise built ONCE and its glyphId mutated per iteration, so
+            // the loop does zero refcount traffic.
+            GlyphAtlas::GlyphKey key { font.getTypefacePtr(), 0,
+                                       static_cast<int>(font.getMetricsKind()) };
+
+            // Batch glyphs into as few draws as possible: every glyph of a
+            // run shares the pipeline, color descriptor, and (usually) the
+            // atlas page — the ONLY thing that forces a flush is a page
+            // switch (and the emitter merges consecutive batches of one page).
+            constexpr uint32_t kMaxBatchGlyphs = 32;
+            UIVertex batch[kMaxBatchGlyphs * 6];
+            uint32_t batched = 0;
+            gpu::TextureId batchDesc;
+            auto flushBatch = [&] {
+                if (batched == 0) return;
+                state.setShapeResource({ batchDesc, kLinearClamp });
+                state.draw(cmd, batch, batched * 6);
+                batched = 0;
+            };
+
+            for (uint32_t i = 0; i < p.glyphCount; i++) {
+                key.glyphId = glyphIds[i];
+                // Find-only: rasterization happened at record time
+                // (Graphics::drawGlyphs), so the page was written before
+                // this frame. Rasterizing here would sample a page the
+                // frame never uploaded.
+                auto* entry = atlas.peekGlyph(key);
+                if (!entry) continue;
+
+                const gpu::TextureId glyphDesc = atlas.pageTexture(entry->atlasIndex);
+                if (!glyphDesc) continue;
+                if (glyphDesc != batchDesc || batched == kMaxBatchGlyphs) {
+                    flushBatch();
+                    batchDesc = glyphDesc;
+                }
+
+                // The atlas tile (its padding included) placed in the paint's
+                // LOGICAL space by the glyph's bounds at the font's height...
+                const int innerTexW = entry->w - PAD * 2, innerTexH = entry->h - PAD * 2;
+                const float innerW = entry->boundsW * fontH * hScale, innerH = entry->boundsH * fontH;
+                const float lw = static_cast<float>(entry->w) * innerW / static_cast<float>(innerTexW);
+                const float lh = static_cast<float>(entry->h) * innerH / static_cast<float>(innerTexH);
+                const float lx = positions[i].x + entry->boundsX * fontH * hScale - PAD * innerW / static_cast<float>(innerTexW);
+                const float ly = positions[i].y + entry->boundsY * fontH - PAD * innerH / static_cast<float>(innerTexH);
+                // ...then every corner through the whole transform, so rotated or
+                // sheared text draws rotated or sheared (juce rasterizes the glyph
+                // transformed; upright quads along a slanted baseline it was).
+                // Unrotated, the baseline lands on a whole pixel row, as juce's
+                // software renderer puts it (fractional baselines blurred text).
+                float dy = 0.0f;
+                if (!rotated) {
+                    const float baseline = positions[i].transformedBy(tx).y;
+                    dy = std::round(baseline) - baseline;
+                }
+                auto corner = [&](float cx, float cy) {
+                    auto q = juce::Point<float>(cx, cy).transformedBy(tx);
+                    q.y += dy;
+                    return q;
+                };
+                const auto p00 = corner(lx, ly),      p10 = corner(lx + lw, ly);
+                const auto p11 = corner(lx + lw, ly + lh), p01 = corner(lx, ly + lh);
+
+                const float gwPhys = lw * txScale;   // the tile's width on screen
+                float screenPxRange = std::max(1.0f,
+                    static_cast<float>(GlyphAtlas::MSDF_PIXEL_RANGE) * (gwPhys / static_cast<float>(entry->w)));
+                glm::vec4 shape(4.0f, screenPxRange, 0, 0);
+
+                auto gi = [&](juce::Point<float> q) {
+                    return grad.active() ? gradientAt(grad, q.x, q.y) : glm::vec4(0.0f);
+                };
+                UIVertex* v = batch + batched * 6;
+                v[0] = { {p00.x, p00.y}, color, {entry->u0, entry->v0}, shape, gi(p00) };
+                v[1] = { {p10.x, p10.y}, color, {entry->u1, entry->v0}, shape, gi(p10) };
+                v[2] = { {p11.x, p11.y}, color, {entry->u1, entry->v1}, shape, gi(p11) };
+                v[3] = { {p00.x, p00.y}, color, {entry->u0, entry->v0}, shape, gi(p00) };
+                v[4] = { {p11.x, p11.y}, color, {entry->u1, entry->v1}, shape, gi(p11) };
+                v[5] = { {p01.x, p01.y}, color, {entry->u0, entry->v1}, shape, gi(p01) };
+                batched++;
+            }
+            flushBatch();
+            break;
+        }
+
+        case DrawOp::DrawLine: {
+            auto& p    = arena.read<DrawLineParams>(cmd.dataOffset);
+            auto& fill = r.getFill(p.fillIndex);
+            auto  tx   = toPhysical(p.transform, p.scale);
+            GradientCtx grad = makeFillCtx(r, p.fillIndex, tx);
+
+            state.setResources(colorDescFor(grad, r), def);
+            auto color = fillColorAttr(grad, fill.colour, p.opacity);
+
+            float x1 = p.line.getStartX(), y1 = p.line.getStartY();
+            float x2 = p.line.getEndX(),   y2 = p.line.getEndY();
+            tx.transformPoint(x1, y1);
+            tx.transformPoint(x2, y2);
+
+            float dx = x2 - x1, dy = y2 - y1;
+            float len = std::sqrt(dx * dx + dy * dy);
+            if (len < 0.001f) break;
+
+            // A box the line's length and thickness (butt caps: juce's
+            // Path::addLineSegment is a rectangle, so a dash ends where it ends
+            // and a polyline's joints don't double up as capsules did), as a quad
+            // oriented along the line. Local axes: along = +X, perp = +Y.
+            float halfLen = len * 0.5f;
+            float radius  = p.lineWidth * tx.getScaleFactor() * 0.5f;
+            float pad     = 1.0f; // AA fringe only
+
+            float ax = dx / len,  ay = dy / len;    // along
+            float px = -ay,       py = ax;          // perpendicular
+            float cx = (x1 + x2) * 0.5f, cy = (y1 + y2) * 0.5f;
+
+            // Quad corners in physical pixels, extended by pad on each axis.
+            float ah = halfLen + pad;
+            float rh = radius  + pad;
+            auto at = [&](float a, float s) {
+                return juce::Point<float> { cx + ax * a + px * s, cy + ay * a + py * s };
+            };
+            auto p00 = at(-ah, -rh);
+            auto p10 = at(+ah, -rh);
+            auto p11 = at(+ah, +rh);
+            auto p01 = at(-ah, +rh);
+
+            // Type 10 = line box. Shader: the box SDF of half sizes (halfLen, radius).
+            // shapeInfo.yz = (halfLen, radius) in the line's local frame. UV is
+            // anchored to the unpadded extents — uPad = pad / (2*halfLen) — so the
+            // shader's localP = (UV-0.5)*halfSize*2 reaches ±(halfLen+pad, radius+pad)
+            // exactly at the quad corners.
+            glm::vec4 shape(10.0f, halfLen, radius, 0.0f);
+            float uPad = pad / (halfLen * 2.0f);
+            float vPad = pad / (radius  * 2.0f);
+
+            auto gi = [&](juce::Point<float> q) {
+                return grad.active() ? gradientAt(grad, q.x, q.y) : glm::vec4(0.0f);
+            };
+            UIVertex verts[6] = {
+                { {p00.x, p00.y}, color, {-uPad,         -vPad        }, shape, gi(p00) },
+                { {p10.x, p10.y}, color, {1.0f + uPad,   -vPad        }, shape, gi(p10) },
+                { {p11.x, p11.y}, color, {1.0f + uPad,   1.0f + vPad  }, shape, gi(p11) },
+                { {p00.x, p00.y}, color, {-uPad,         -vPad        }, shape, gi(p00) },
+                { {p11.x, p11.y}, color, {1.0f + uPad,   1.0f + vPad  }, shape, gi(p11) },
+                { {p01.x, p01.y}, color, {-uPad,         1.0f + vPad  }, shape, gi(p01) },
+            };
+            state.draw(cmd, verts, 6);
+            break;
+        }
+
+        default: break;
+    }
+}
+
+// =============================================================================
+// Multiply blend (Graphics::darken / warmth / tint: the ui2d program under the
+// Multiply blend) and the white-noise overlay (the noise program, alpha
+// blended)
+// =============================================================================
+
+inline void lowerBlend(Renderer& r, Emitter& state, const DrawCommand& cmd)
+{
+    const gpu::TextureBinding def { r.defaultTexture(), kLinearClamp };
+    state.setResources(def, def);
+    auto& p = r.arena().read<EffectBlendParams>(cmd.dataOffset);
+    float x = p.region.getX() * p.scale;
+    float y = p.region.getY() * p.scale;
+    float w = p.region.getWidth() * p.scale;
+    float h = p.region.getHeight() * p.scale;
+    glm::vec4 color(p.r, p.g, p.b, 1.0f);
+    emitQuad(state, cmd, x, y, w, h, color);
+}
+
+inline void lowerNoise(Renderer& r, Emitter& state, const DrawCommand& cmd)
+{
+    state.setTextureCount(0);
+    auto& p = r.arena().read<NoiseParams>(cmd.dataOffset);
+    float x = p.region.getX()     * p.scale;
+    float y = p.region.getY()     * p.scale;
+    float w = p.region.getWidth()  * p.scale;
+    float h = p.region.getHeight() * p.scale;
+    // colour.r carries the per-frame time offset (0 = static), colour.a the amount.
+    glm::vec4 color(p.timeOffset, 0.0f, 0.0f, p.amount);
+    emitQuad(state, cmd, x, y, w, h, color);
+}
+
+} // namespace jvk::ops

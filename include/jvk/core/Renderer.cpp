@@ -1,60 +1,158 @@
+/*
+ ----------------------------------------------------------------------------
+ Copyright (c) 2026 Discreet Signals LLC
+
+ Licensed under the MIT License. See LICENSE file in the project root
+ for full license text.
+ ------------------------------------------------------------------------------
+ File: Renderer.cpp
+ Author: Gavin Payne
+ ------------------------------------------------------------------------------
+*/
+
 namespace jvk {
 
+namespace
+{
+    std::atomic<int> g_liveRenderers { 0 };
+
+    // The main colour's format: the two halves the scene ping-pongs between.
+    constexpr PixelFormat kSceneFormat = PixelFormat::BGRA8;
+
+    // A jvk::Shader draw's constants: jvk's 7 floats (and one reserved), then
+    // the draw's own (Shader::setDrawConstants). 128 bytes, the push-constant
+    // size every Vulkan device has.
+    struct ShaderConstants
+    {
+        float resolutionX = 0, resolutionY = 0;   // the region's size (pixels)
+        float time = 0;
+        float viewportW = 0, viewportH = 0;
+        float regionX = 0, regionY = 0;
+        float reserved = 0;
+        float draw[kShaderDrawConstants] {};
+    };
+    static_assert(sizeof(ShaderConstants) == 128);
+}
+
+int Renderer::liveCount() { return g_liveRenderers.load(std::memory_order_relaxed); }
+
 // =============================================================================
-// Construction / destruction — starts and stops the worker thread.
+// Construction / destruction — starts and stops the worker thread
 // =============================================================================
 
-// Process-wide registry of live Renderer instances. Maintained on the
-// message thread (Renderer ctor/dtor are message-thread-only) but read
-// from FrameRetained destructors that may run on the same thread; the
-// CriticalSection is there for hygiene rather than contention.
-juce::CriticalSection& Renderer::registryLock()
-{
-    static juce::CriticalSection lk;
-    return lk;
-}
-
-std::vector<Renderer*>& Renderer::registry()
-{
-    static std::vector<Renderer*> r;
-    return r;
-}
-
-int Renderer::liveCount()
-{
-    const juce::ScopedLock lk(registryLock());
-    return static_cast<int>(registry().size());
-}
-
-Renderer::Renderer(Device& device, RenderTarget& target)
-    : device_(device), target_(target),
-      vertices_(device.physicalDevice(), device.device()),
-      staging_(device.physicalDevice(), device.device()),
-      gradientAtlas_(std::make_unique<GradientAtlas>()),
+Renderer::Renderer(std::shared_ptr<Context> context, gpu::Surface& surface, std::vector<Target> targets)
+    : context_(std::move(context)), surface_(surface),
       worker_(std::make_unique<Worker>(*this))
 {
-    // Init the per-Renderer gradient atlas now that Device is ready (it
-    // allocates a backing Image from device.pool() and a descriptor set
-    // from device.bindings()).
-    gradientAtlas_->init(device);
-
-    {
-        const juce::ScopedLock lk(registryLock());
-        registry().push_back(this);
-    }
+    gradientAtlas_.init(context_->backend());
+    glyphAtlas_.init(context_->backend());
+    validateTargets(std::move(targets));
+    const auto& caps = context_->caps();
+    builder_.setAlignments(caps.constantsAlignment, caps.storageAlignment);
+    context_->addRenderer(pending_);
+    g_liveRenderers.fetch_add(1, std::memory_order_relaxed);
     worker_->startThread();
 }
 
-// ---- Gradient-atlas accessors (out-of-line; header forward-declares type) --
+// The worker is joined first, so nothing it touches goes before it. Then
+// every texture this Renderer made is retired through the Context: frames
+// already submitted may still read them on the GPU, which the backend waits
+// out before freeing them.
+Renderer::~Renderer()
+{
+    worker_.reset();
+    Context::endFrame(pending_);
+    shaders_.clear();
+    releaseFrameTextures();
+    context_->retire(gradientAtlas_.release(), serial_);
+    glyphAtlas_.clear([this](gpu::TextureId t) { context_->retire(t, serial_); });
+    context_->removeRenderer(pending_);
+    g_liveRenderers.fetch_sub(1, std::memory_order_relaxed);
+}
+
+// =============================================================================
+// The frame
+// =============================================================================
+
+bool Renderer::beginRecord()
+{
+    jassert(!isBusy());
+    const auto e = surface_.extent();
+    if (e.width == 0 || e.height == 0) return false;
+    if (!ensureFrameTextures(e)) return false;
+    extent_ = e;
+    serial_ = context_->beginRecord(pending_);
+    recorder_.reset(scaledTargets());
+    shaderCaptures_.clear();
+    shaderData_.clear();
+    return true;
+}
+
+void Renderer::abandonRecord()
+{
+    Context::endFrame(pending_);
+}
+
+void Renderer::submit()
+{
+    // Release here publishes every CPU-side write made during record to the
+    // worker's acquire load at the top of runFrame().
+    workerBusy_.store(true, std::memory_order_release);
+    if (worker_) worker_->notify();
+}
+
+void Renderer::waitForIdle()
+{
+    // Used only for resize and teardown — both rare. Yield rather than burn a
+    // CPU core; the wait is bounded by one frame.
+    while (workerBusy_.load(std::memory_order_acquire))
+        juce::Thread::yield();
+}
+
+void Renderer::runFrame()
+{
+    // A frame that can't begin (minimised, mid-resize, swapchain out of date)
+    // is dropped: what it recorded is gone, but nothing it needs is lost — the
+    // texture writes made while recording land before the next frame
+    // submitted anywhere, and the atlases' dirty pages stay dirty until a
+    // frame writes them.
+    // A begun frame is always submitted: its output must be presented. One
+    // whose output changed size between record and acquire (a live resize)
+    // still draws the recorded frame, stretched over the output by the final
+    // copy for that one frame, rather than presenting an unwritten image.
+    gpu::FrameInfo info;
+    if (surface_.beginFrame(info))
+    {
+        if (info.output)
+            lower(info);
+        else
+            builder_.reset(++frameNumber_);
+        surface_.submit(builder_.packet());
+    }
+    Context::endFrame(pending_);
+}
+
+// =============================================================================
+// Recording helpers
+// =============================================================================
 
 float Renderer::registerGradient(const juce::ColourGradient& g)
 {
-    return gradientAtlas_->getRow(g, ResourceCaches::hashGradient(g));
+    return gradientAtlas_.getRow(g, GradientAtlas::hash(g));
 }
 
-VkDescriptorSet Renderer::gradientDescriptor() const
+gpu::TextureId Renderer::texture(const juce::Image& img)
 {
-    return gradientAtlas_->descriptorSet();
+    if (!img.isValid()) return {};
+    // A jvk image keeps its own texture (ImageType): no cache entry.
+    if (auto* jvkImage = dynamic_cast<PixelData*>(img.getPixelData().get()))
+        if (auto t = jvkImage->prepareForDraw(*this)) return t;
+    return context_->images().get(img, serial_);
+}
+
+gpu::TextureId Renderer::texture(const ImageSource& src)
+{
+    return context_->images().get(src, serial_);
 }
 
 Shader& Renderer::shader(std::span<const uint32_t> spirv)
@@ -67,907 +165,783 @@ Shader& Renderer::shader(std::span<const uint32_t> spirv)
     return *s;
 }
 
-void Renderer::reset()
-{
-    commands_.clear();
-    arena_.reset();
-    fonts_.clear();
-    fills_.clear();
-    fillTextures_.clear();
-    recordTarget_ = 0;   // every frame starts drawing into the main colour
-    scaledTargets_ = target_.scaledTargets();
-    std::fill(std::begin(targetReadEnd_), std::end(targetReadEnd_), 0u);   // no target read yet
-    // Per-frame gradient atlas reset. Runs on the message thread (called from
-    // the editor's render timer) — same thread that does registerGradient
-    // during paint, so no sync needed.
-    gradientAtlas_->beginFrame();
-}
-
-// Worker is the last-declared member, so under default destruction it would
-// be the first destroyed (stopThread + notify + join), letting its final
-// execute() run against still-valid Renderer members. We need an explicit
-// body so we can also drop ourselves from the global registry FIRST (so
-// no FrameRetained dtor running concurrently can see us mid-teardown),
-// then join the worker, then drain the FrameRetained pin counts. The
-// caller is contractually required to have vkDeviceWaitIdle'd before
-// destroying us (see teardownVulkan), so the GPU is also done with
-// everything we're about to release the pin on.
-Renderer::~Renderer()
-{
-    {
-        const juce::ScopedLock lk(registryLock());
-        auto& r = registry();
-        r.erase(std::remove(r.begin(), r.end(), this), r.end());
-    }
-    if (worker_) worker_.reset();
-    flushRetains();
-    shaders_.clear();   // its frames are done: no draw of them is in flight
-    // Return slot-parked staging blocks to the belt so ~L2 frees them —
-    // Block is a plain handle struct, so destroying the vectors alone would
-    // leak the VkBuffer/VkDeviceMemory. GPU is idle per the dtor contract.
-    // (retiredImages vectors destroy via ~Image below, same contract.)
-    for (auto& slot : frameSlots_)
-        staging_.recycle(slot.staging);
-}
-
 // =============================================================================
-// Threaded-execute control
+// Targets and frame textures
 // =============================================================================
 
-void Renderer::submit()
+void Renderer::validateTargets(std::vector<Target> requested)
 {
-    // Release here publishes every CPU-side write made during record (command
-    // list, arena, path SSBO, mapped Vulkan buffers) to the worker's acquire
-    // load at the top of execute().
-    workerBusy_.store(true, std::memory_order_release);
-    if (worker_) worker_->notify();
-}
+    droppedTargets_.clear();
+    targets_.clear();
+    if (requested.empty())
+        return;
 
-void Renderer::waitForIdle()
-{
-    // Used only for resize and teardown — both rare. Yield rather than burn
-    // a CPU core; the wait is bounded by one execute duration (~16 ms on
-    // VSync, longer only under DWM drag stalls).
-    while (workerBusy_.load(std::memory_order_acquire))
-        juce::Thread::yield();
-}
-
-void Renderer::flushRetains()
-{
-    // Gather under the lock, unpin outside it — unpin is an atomic decrement
-    // but keeping the critical section minimal costs nothing.
-    std::vector<FrameRetained*> pins;
-    {
-        const juce::ScopedLock lk(uploadLock_);
-        for (auto& slot : frameSlots_)
-        {
-            pins.insert(pins.end(), slot.pins.begin(), slot.pins.end());
-            slot.pins.clear();
-        }
-        pins.insert(pins.end(), recordingRetains_.begin(), recordingRetains_.end());
-        recordingRetains_.clear();
-    }
-    for (auto* obj : pins) obj->unpin();
-}
-
-void Renderer::forceDrainAll()
-{
-    // Snapshot the registry under lock so we don't iterate while a
-    // sibling Renderer ctor/dtor mutates it. After this point we operate
-    // on the snapshot — any Renderer destroyed concurrently has already
-    // removed itself, so the snapshot can only contain still-live ones
-    // (the assumption is registry mutation runs on the message thread,
-    // same as our caller — destructors can't interleave on a single
-    // thread).
-    std::vector<Renderer*> snapshot;
-    {
-        const juce::ScopedLock lk(registryLock());
-        snapshot = registry();
-    }
-
-    // Phase 1: idle every worker. Once each workerBusy_ goes false, no
-    // further pin/unpin will happen via execute() — we have a stable
-    // view of every FrameSlot pin bucket.
-    for (auto* r : snapshot) r->waitForIdle();
-
-    // Phase 2: vkDeviceWaitIdle once per unique Device. After this every
-    // submission referencing pinned objects has retired on the GPU, so
-    // dropping the pins below can't strand the GPU mid-sample of a
-    // freed VkPipeline / VkDescriptorSet.
-    std::set<VkDevice> seen;
-    for (auto* r : snapshot)
-    {
-        VkDevice d = r->device().device();
-        if (d != VK_NULL_HANDLE && seen.insert(d).second)
-        {
-            // Device-idle is queue-use on every queue — same external-sync
-            // rule as submits. The workers are idle (phase 1) but ANOTHER
-            // message-thread path (ShaderImage, submitImmediate) could be
-            // mid-submit.
-            const juce::ScopedLock queueSync(queueLock());
-            vkDeviceWaitIdle(d);
-        }
-    }
-
-    // Phase 3: drop every pin. After this the in-flight counter on every
-    // FrameRetained is zero and the destructor that called us can fall
-    // straight through.
-    for (auto* r : snapshot) r->flushRetains();
-}
-
-// =============================================================================
-// FrameRetained — out-of-line so waitUntilUnretained can call into Renderer
-// without forcing FrameRetained.h to know Renderer's full definition.
-// =============================================================================
-
-FrameRetained::~FrameRetained()
-{
-    waitUntilUnretained();
-}
-
-void FrameRetained::waitUntilUnretained() const noexcept
-{
-    if (inFlight_.load(std::memory_order_acquire) == 0) return;
-
-    // Pins are still held — typically because the destructor is running
-    // on the message thread between render ticks, and the per-slot
-    // drain inside Renderer::execute() can't fire because we're the
-    // very thread that would have queued the next frame. Force every
-    // live Renderer to drain synchronously (worker idle + GPU idle +
-    // flushRetains) so the count drops to zero.
-    Renderer::forceDrainAll();
-
-    // Safety net: forceDrainAll should have brought us to zero. Spin
-    // briefly just in case a Renderer joined the registry after our
-    // snapshot and pinned us in a frame already in flight (extremely
-    // unlikely on the single-message-thread plugin model, but cheap to
-    // cover).
-    while (inFlight_.load(std::memory_order_acquire) > 0)
-        juce::Thread::yield();
-}
-
-// =============================================================================
-// Deferred uploads (L2 staging → image / buffer, flushed into the frame's
-// command buffer just before the scene render pass).
-// =============================================================================
-
-void Renderer::upload(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height)
-{
-    const juce::ScopedLock lk(uploadLock_);
-    staging_.commit(src);   // allocation now visible to the flush that records it
-    pendingUploads_.push_back({ dst, width, height, src.buffer, src.offset });
-}
-
-void Renderer::uploadDynamic(Memory::L2::Allocation src, VkImage dst, uint32_t width, uint32_t height)
-{
-    const juce::ScopedLock lk(uploadLock_);
-    staging_.commit(src);
-    pendingUploads_.push_back({ dst, width, height, src.buffer, src.offset, true });
-}
-
-void Renderer::uploadRect(Memory::L2::Allocation src, VkImage dst,
-                          int32_t x, int32_t y, uint32_t width, uint32_t height)
-{
-    const juce::ScopedLock lk(uploadLock_);
-    staging_.commit(src);
-    pendingUploads_.push_back({ dst, width, height, src.buffer, src.offset,
-                                /*dynamicContent*/ false, /*partial*/ true, x, y });
-}
-
-void Renderer::initializeImage(const Image& dst, VkClearColorValue clear)
-{
-    if (dst.image() == VK_NULL_HANDLE) return;
-    const juce::ScopedLock lk(uploadLock_);
-    PendingUpload u { dst.image(), dst.width(), dst.height(), VK_NULL_HANDLE, 0 };
-    u.layer = dst.layers();
-    u.mip   = dst.mips();
-    u.clear = true;
-    u.clearValue = clear;
-    pendingUploads_.push_back(u);
-}
-
-void Renderer::uploadRegion(Memory::L2::Allocation src, const Image& dst,
-                            uint32_t layer, uint32_t mip,
-                            int32_t x, int32_t y, uint32_t width, uint32_t height)
-{
-    if (dst.image() == VK_NULL_HANDLE || layer >= dst.layers() || mip >= dst.mips()) return;
-    const juce::ScopedLock lk(uploadLock_);
-    staging_.commit(src);
-    PendingUpload u { dst.image(), width, height, src.buffer, src.offset,
-                      /*dynamicContent*/ false, /*partial*/ true, x, y };
-    u.layer = layer;
-    u.mip   = mip;
-    pendingUploads_.push_back(u);
-}
-
-void Renderer::cancelUploads(VkImage dst)
-{
-    const juce::ScopedLock lk(uploadLock_);
-    std::erase_if(pendingUploads_,
-                  [dst](const PendingUpload& u) { return u.dstImage == dst; });
-}
-
-// Drop queued uploads for `dst` on EVERY live Renderer. Used by ~Shader,
-// which has no Renderer back-pointer: a queued dynamic-feed upload must not
-// survive the destruction of its target image, or the next flushUploads
-// records vkCmdCopyBufferToImage into a freed VkImage.
-void Renderer::cancelUploadsAllRenderers(VkImage dst)
-{
-    std::vector<Renderer*> snapshot;
-    {
-        const juce::ScopedLock lk(registryLock());
-        snapshot = registry();
-    }
-    for (auto* r : snapshot) r->cancelUploads(dst);
-}
-
-void Renderer::recordImageClear(VkCommandBuffer cmd, VkImage dst,
-                                 uint32_t layers, uint32_t mips,
-                                 VkClearColorValue clear)
-{
-    const VkImageSubresourceRange all { VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers };
-
-    // UNDEFINED discards whatever was there, which is the point of a clear.
-    // FRAGMENT_SHADER as the source stage orders the clear after any earlier
-    // frame's reads, should the image already be in use.
-    VkImageMemoryBarrier barrier {};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = dst;
-    barrier.subresourceRange = all;
-    barrier.srcAccessMask = 0;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-    vkCmdClearColorImage(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &all);
-
-    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier);
-}
-
-void Renderer::recordImageUpload(VkCommandBuffer cmd, Memory::L2::Allocation src,
-                                  VkImage dst, uint32_t width, uint32_t height,
-                                  bool dynamicContent, bool partial,
-                                  int32_t dstX, int32_t dstY,
-                                  uint32_t layer, uint32_t mip)
-{
-    VkImageMemoryBarrier barrier {};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    // Partial uploads must PRESERVE the untouched texels, so the transition
-    // must name the image's actual layout (SHADER_READ_ONLY) — UNDEFINED
-    // permits the driver to discard contents. Full uploads rewrite every
-    // texel, so UNDEFINED is fine (and cheaper) there.
-    barrier.oldLayout = partial ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-                                : VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = dst;
-    // Only the target subresource changes layout; every other layer and mip
-    // of a user texture stays SHADER_READ_ONLY (and sampleable) throughout.
-    barrier.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, layer, 1 };
-    barrier.srcAccessMask = 0;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-
-    // Fresh images (cache inserts) have never been read — TOP_OF_PIPE orders
-    // nothing and lets the copy overlap prior GPU work. Dynamic re-uploads
-    // and partial updates of live images must wait for every previously
-    // submitted frame's fragment reads of this image (pipeline barriers
-    // order against ALL earlier commands on the queue, across command
-    // buffers). Write-after-read only needs the execution dependency, so
-    // srcAccessMask stays 0.
-    vkCmdPipelineBarrier(cmd,
-        (dynamicContent || partial) ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-                                    : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-    VkBufferImageCopy region {};
-    region.bufferOffset = src.offset;      // bufferRowLength 0 = tightly packed
-    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, mip, layer, 1 };
-    region.imageOffset = { dstX, dstY, 0 };
-    region.imageExtent = { width, height, 1 };
-
-    vkCmdCopyBufferToImage(cmd, src.buffer, dst,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &barrier);
-}
-
-void Renderer::flushUploads(VkCommandBuffer cmd)
-{
-    // Swap the queue out under the lock, record from the local copy — the
-    // message thread can keep queueing next frame's uploads while we record.
-    // uploadScratch_ is a member so its capacity survives across frames.
-    {
-        const juce::ScopedLock lk(uploadLock_);
-        uploadScratch_.swap(pendingUploads_);
-
-        // Park staging blocks against THIS slot inside the SAME lock hold as
-        // the queue swap. A block is parked only when (a) it is not the
-        // current write target and (b) it has no uncommitted allocations —
-        // an alloc whose matching upload() push hasn't landed yet keeps its
-        // block active, so a message-thread alloc+memcpy straddling this
-        // swap can never have its block filed one frame early and recycled
-        // under a copy that still reads it (the old moveActiveTo-in-execute
-        // had exactly that window). upload()/uploadDynamic() commit the
-        // allocation, clearing the hold.
-        staging_.parkAllButCurrent(frameSlots_[activeRetireSlot_].staging);
-    }
-
-    for (auto& u : uploadScratch_) {
-        if (u.clear) {
-            recordImageClear(cmd, u.dstImage, u.layer, u.mip, u.clearValue);
-            continue;
-        }
-        // The pending-upload struct carries the L2 allocation broken out into
-        // (srcBuffer, srcOffset); repack so we can share recordImageUpload.
-        Memory::L2::Allocation src { nullptr, u.srcBuffer, u.srcOffset };
-        recordImageUpload(cmd, src, u.dstImage, u.width, u.height,
-                          u.dynamicContent, u.partial, u.dstX, u.dstY,
-                          u.layer, u.mip);
-    }
-    uploadScratch_.clear();
-}
-
-// =============================================================================
-// Pipeline registration
-// =============================================================================
-
-void Renderer::registerPipeline(Pipeline& pipeline)
-{
-    auto ops = pipeline.supportedOps();
-    for (auto op : ops)
-        pipelineForOp_[static_cast<size_t>(op)] = &pipeline;
-}
-
-// =============================================================================
-// Execute — sort + beginFrame + flush + render pass + replay + endFrame
-// =============================================================================
-
-void Renderer::execute()
-{
-    auto frame = target_.beginFrame();
-    if (frame.cmd == VK_NULL_HANDLE) {
-        // Swapchain acquire returned VK_NULL_HANDLE — typically
-        // VK_ERROR_OUT_OF_DATE_KHR during a resize / DPI-change / window
-        // minimise. Pins and STATIC uploads must survive the skip:
-        // `getTexture` inserts a CachedImage into the process-wide texture
-        // cache, pins it, and queues its upload — dropping the pin lets a
-        // sibling editor's evict destroy the entry while its VkImage sits
-        // in our queue (use-after-free at the next flushUploads), and
-        // dropping the upload leaves the cache entry permanently
-        // UNDEFINED-layout (UB when a later hit samples it).
-        //
-        // What must NOT survive unboundedly is the per-tick refresh work: a
-        // window with no swapchain (minimised, a failed create) used to sit
-        // in this state at 60 Hz, and each tick a dynamic feed
-        // (Shader::update) or a repainted Vulkan-backed image (ImageType)
-        // staged a fresh full-image block. Unbounded, that grew L2 by ~8 MB
-        // per tick (~500 MB/s) — the same append-only-belt failure the slot
-        // rotation fixed on the happy path. The editor now records nothing
-        // while its target can't begin (RenderTarget::canBegin), so this
-        // path is reached only for a frame or two around a resize or
-        // acquire failure; still, bound it: only the LATEST full-image
-        // upload of an image matters (each rewrites every texel, whether a
-        // dynamic feed or a static re-upload), so drop superseded entries
-        // and hand their never-recorded staging blocks straight back to the
-        // free list. Partial uploads (glyph rects, image regions) and clears
-        // are bounded by content and survive untouched.
-        const juce::ScopedLock lk(uploadLock_);
-
-        if (!pendingUploads_.empty()) {
-            auto* base = pendingUploads_.data();
-            auto  n    = pendingUploads_.size();
-            std::vector<PendingUpload> kept;
-            kept.reserve(n);
-            auto full = [](const PendingUpload& u) { return !u.partial && !u.clear; };
-            for (size_t i = 0; i < n; i++) {
-                auto& u = base[i];
-                if (full(u)) {
-                    bool superseded = false;
-                    for (size_t j = i + 1; j < n; j++)
-                        if (full(base[j]) && base[j].dstImage == u.dstImage) {
-                            superseded = true;
-                            break;
-                        }
-                    if (superseded) continue;
-                }
-                kept.push_back(u);
-            }
-            pendingUploads_.swap(kept);
-
-            // Blocks created since the last flush whose every allocation is
-            // committed and unreferenced by the surviving queue were never
-            // recorded into any command buffer — recycle them immediately.
-            std::vector<VkBuffer> referenced;
-            referenced.reserve(pendingUploads_.size());
-            for (auto& u : pendingUploads_) referenced.push_back(u.srcBuffer);
-            staging_.recycleUnrecorded(referenced);
-        }
+    const auto& caps = context_->caps();
+    if (!caps.independentBlend) {
+        diag::log("render targets unavailable: the device lacks independent blending");
+        for (auto& c : requested) droppedTargets_.push_back(c.name);
         return;
     }
 
-    // target_.beginFrame() above waited on this slot's fence, so the GPU
-    // has now finished every command buffer it submitted the LAST time this
-    // slot was used. Drain the slot's ENTIRE lifetime bucket in one place:
-    // unpin FrameRetained objects, destroy retired images, recycle staging
-    // blocks. Swap out under the lock, release outside it. Subsequent
-    // retire()/retain()/staging traffic during this execute goes into THIS
-    // slot's bucket and isn't touched until the slot next comes around.
-    {
-        const juce::ScopedLock lk(uploadLock_);
-        activeRetireSlot_ = frame.frameSlot % kFrameSlots;
-        auto& slot = frameSlots_[activeRetireSlot_];
-        flushScratch_.pins.swap(slot.pins);
-        flushScratch_.retiredImages.swap(slot.retiredImages);
-        flushScratch_.staging.swap(slot.staging);
-    }
-    for (auto* obj : flushScratch_.pins) obj->unpin();
-    flushScratch_.pins.clear();
-    flushScratch_.retiredImages.clear();       // ~Image frees the GPU handles
-    staging_.recycle(flushScratch_.staging);   // returns blocks to the free list
+    // The scene passes carry the targets at scale 1, target i at location
+    // i + 1, and the built-in fragment shaders write locations 0..7: such a
+    // target is among the first 7 (fewer where the device allows fewer colour
+    // attachments: the Vulkan minimum is 4). Scaled ones are no attachment of
+    // theirs: up to kMaxTargets in all.
+    const size_t sceneLimit = std::min<size_t>(kMaxSceneTargets, caps.maxColorAttachments - 1);
 
-    // Snapshot the device clock once per frame so every shader dispatched
-    // during this execute() sees an identical `time` value — guarantees
-    // deterministic per-frame motion and prevents drift between e.g. two
-    // DrawShader ops in the same frame reading slightly different clocks.
-    const float frameTime = device_.time();
-
-    vertices_.beginFrame(frame.frameSlot);
-
-    // Pipeline prepare (atlas dirty pages, etc.) and gradient/texture uploads.
-    // Each pipeline pushes its pending uploads onto *this* Renderer's queue,
-    // not Device's — so two editors' workers never share the upload vector.
-    {
-        Pipeline* seen[static_cast<size_t>(DrawOp::COUNT)] = {};
-        int n = 0;
-        for (auto* p : pipelineForOp_) {
-            if (!p) continue;
-            bool dup = false;
-            for (int i = 0; i < n; i++) if (seen[i] == p) { dup = true; break; }
-            if (!dup) { seen[n++] = p; p->prepare(*this); }
+    for (auto& c : requested) {
+        // Every built-in draw into a target blends (as into the main colour),
+        // and so does paint clearing it (clearedByMain); the paint shaders
+        // write floats. So a target's format must render, sample AND blend:
+        // never an integer or block-compressed one, whatever its Blend says.
+        const auto info = formatInfo(c.format);
+        if (info.integer || info.compressed || !context_->backend().canRenderTo(c.format)) {
+            diag::log("render target '" + c.name.toString()
+                      + "' dropped: its format cannot be rendered, sampled and blended");
+            droppedTargets_.push_back(c.name);
+            continue;
         }
+        if (targets_.size() == kMaxTargets) {
+            diag::log("render target '" + c.name.toString() + "' dropped: more than "
+                      + juce::String((int) kMaxTargets) + " targets");
+            jassertfalse;   // the application declares more than jvk carries: a programming error
+            droppedTargets_.push_back(c.name);
+            continue;
+        }
+        if (!c.isScaled() && targets_.size() >= sceneLimit) {
+            diag::log("render target '" + c.name.toString() + "' dropped: a target at scale 1 must be among the first "
+                      + juce::String((int) sceneLimit));
+            droppedTargets_.push_back(c.name);
+            continue;
+        }
+        if (!(c.scale > 0.0f) || c.height < 0) {
+            diag::log("render target '" + c.name.toString() + "' dropped: its size is not positive");
+            droppedTargets_.push_back(c.name);
+            continue;
+        }
+        if (c.isScaled() && c.clearedByMain) {
+            diag::log("render target '" + c.name.toString() + "': a scaled target isn't cleared by main");
+            c.clearedByMain = false;
+        }
+        targets_.push_back(std::move(c));
     }
-    gradientAtlas_->stageUploads(*this);
-    // Flush record-phase path/clip segments into THIS frame slot's SSBO.
-    // Safe now because target_.beginFrame() above waited on this slot's
-    // fence, so the GPU is done reading this slot's buffer from 2 frames
-    // ago. The OTHER slot's buffer may still be in flight (frame N-1)
-    // and is not touched.
-    if (pathPipeline_) pathPipeline_->flushToGPU(frame.frameSlot);
-    // flushUploads records the queued copies AND parks the consumed staging
-    // blocks against this slot under one lock hold (see body).
-    flushUploads(frame.cmd);
+}
 
-    auto const& sb = target_.sceneBuffers(frame.frameSlot);
+TargetMask Renderer::scaledTargets() const
+{
+    TargetMask mask = 0;
+    for (size_t i = 0; i < targets_.size(); ++i)
+        if (targets_[i].isScaled()) mask |= static_cast<TargetMask>(1u << i);
+    return mask;
+}
 
-    // =========================================================================
-    // Ping-pong model (synchronous, one active buffer at a time).
-    //
-    //   pp[0] is half A, pp[1] is half B. `cur` is the index of the half
-    //   that is currently the active scene target. Normal draws write pp[cur].
-    //
-    //   When a post-process effect runs:
-    //     1. End the active scene RP (finalLayout transitions pp[cur] color
-    //        to SHADER_READ_ONLY; stencil transitions to DS_ATT_OPTIMAL).
-    //     2. Run the effect pass in its own RP: sample pp[cur] color, write
-    //        pp[1-cur] color.
-    //     3. Swap: cur ^= 1. The active half is now the one we just wrote.
-    //     4. Resume scene RP LOAD on pp[cur].sceneFB. Stencil image is the
-    //        SAME physical image (shared between framebufferA and
-    //        framebufferB) so LOAD_OP_LOAD restores the clip state we left.
-    //
-    //   Separable effects (Gaussian blur) do two effect passes and therefore
-    //   two swaps — they naturally land back on the half they started on.
-    //   Non-separable effects (HSV, 2D-kernel blurs): FULL-window regions do
-    //   one pass + one swap (cheapest — dst is fully covered; pre-copy seeds
-    //   outside-clip when clipped); PARTIAL regions do a region pass plus a
-    //   region-bounded identity copy-back so pixels outside the ROI keep the
-    //   original scene without any full-screen seeding pass.
-    //
-    //   At end of frame we blit pp[cur] → swapchain. There is never a race
-    //   between the effect writing and the scene RP LOAD because they target
-    //   DIFFERENT halves; the scene RP LOAD reads the half the effect just
-    //   wrote, whose writes are made visible by the effect RP's outgoing
-    //   subpass dependency.
-    // =========================================================================
-    struct Half {
-        VkFramebuffer   sceneFB;
-        VkFramebuffer   effectFB;
-        VkDescriptorSet sampler;
-        VkImage         image;
-    };
-    Half pp[2] = {
-        { sb.framebufferA, sb.effectFBtoA, sb.samplerA, sb.colorA.image() },
-        { sb.framebufferB, sb.effectFBtoB, sb.samplerB, sb.colorB.image() },
-    };
+float Renderer::targetScale(size_t i) const
+{
+    if (i >= targets_.size()) return 1.0f;
+    const auto& t = targets_[i];
+    return t.height > 0 ? static_cast<float>(t.height) / static_cast<float>(std::max(1u, textureExtent_.height)) : t.scale;
+}
+
+gpu::Extent Renderer::targetExtent(size_t i) const
+{
+    const auto e = textureExtent_;
+    if (i >= targets_.size() || !targets_[i].isScaled()) return e;
+    const float s = targetScale(i);
+    const auto h = targets_[i].height > 0 ? static_cast<uint32_t>(targets_[i].height)
+                                          : static_cast<uint32_t>(std::ceil(static_cast<float>(e.height) * s));
+    return { std::max(1u, static_cast<uint32_t>(std::ceil(static_cast<float>(e.width) * s))), std::max(1u, h) };
+}
+
+bool Renderer::ensureFrameTextures(gpu::Extent extent)
+{
+    if (extent == textureExtent_ && halves_[0] && halves_[1] && stencil_)
+        return true;
+
+    releaseFrameTextures();
+    textureExtent_ = extent;
+    auto& backend = context_->backend();
+
+    gpu::TextureDesc d;
+    d.format = kSceneFormat;
+    d.usage  = gpu::TextureUsage::Sampled | gpu::TextureUsage::RenderTarget;
+    d.width  = extent.width;
+    d.height = extent.height;
+    d.label  = "jvk scene A";
+    halves_[0] = backend.createTexture(d);
+    d.label  = "jvk scene B";
+    halves_[1] = backend.createTexture(d);
+
+    gpu::TextureDesc ds;
+    ds.kind   = gpu::TextureKind::DepthStencil;
+    ds.usage  = gpu::TextureUsage::RenderTarget;
+    ds.width  = extent.width;
+    ds.height = extent.height;
+    ds.label  = "jvk clip stencil";
+    stencil_ = backend.createTexture(ds);
+
+    targetTextures_.assign(targets_.size(), {});
+    targetScratches_.assign(targets_.size(), {});
+    for (size_t i = 0; i < targets_.size(); ++i)
+    {
+        const auto te = targetExtent(i);
+        gpu::TextureDesc td;
+        td.format = targets_[i].format;
+        td.usage  = gpu::TextureUsage::Sampled | gpu::TextureUsage::RenderTarget;
+        td.width  = te.width;
+        td.height = te.height;
+        td.label  = "jvk render target";
+        targetTextures_[i] = backend.createTexture(td);
+    }
+
+    if (!halves_[0] || !halves_[1] || !stencil_)
+    {
+        releaseFrameTextures();
+        return false;
+    }
+    return true;
+}
+
+void Renderer::releaseFrameTextures()
+{
+    for (auto& t : halves_) { context_->retire(t, serial_); t = {}; }
+    context_->retire(stencil_, serial_);
+    stencil_ = {};
+    for (auto t : targetTextures_)  context_->retire(t, serial_);
+    for (auto t : targetScratches_) context_->retire(t, serial_);
+    targetTextures_.clear();
+    targetScratches_.clear();
+    textureExtent_ = {};
+}
+
+// A target's scratch: a texture of its size and format, versioning it when a
+// pass reads and writes it. Made on first use (worker).
+gpu::TextureId Renderer::targetScratch(size_t i)
+{
+    if (i >= targetScratches_.size()) return {};
+    if (!targetScratches_[i])
+    {
+        const auto te = targetExtent(i);
+        gpu::TextureDesc td;
+        td.format = targets_[i].format;
+        td.usage  = gpu::TextureUsage::Sampled | gpu::TextureUsage::RenderTarget;
+        td.width  = te.width;
+        td.height = te.height;
+        td.label  = "jvk render target scratch";
+        targetScratches_[i] = context_->backend().createTexture(td);
+    }
+    return targetScratches_[i];
+}
+
+// =============================================================================
+// Pipelines
+// =============================================================================
+
+gpu::AttachmentFormats Renderer::sceneFormats() const
+{
+    gpu::AttachmentFormats f;
+    const size_t slots = sceneSlots(targets_);
+    f.colorCount = static_cast<uint8_t>(slots);
+    f.colorFormats[0] = kSceneFormat;
+    for (size_t i = 0; i + 1 < slots; ++i)
+    {
+        if (targets_[i].isScaled()) f.unusedMask |= static_cast<uint8_t>(1u << (1 + i));
+        else                        f.colorFormats[1 + i] = targets_[i].format;
+    }
+    f.depthStencil = true;
+    return f;
+}
+
+const Renderer::PaintVariant* Renderer::paintPipeline(Paint kind, uint8_t attachment, bool clip, TargetMask live)
+{
+    const bool paint = kind == Paint::Color || kind == Paint::Path;
+    const TargetMask clears = paintClears(targets_, attachment, paint, live);
+    for (const auto& v : paintVariants_)
+        if (v.kind == kind && v.attachment == attachment && v.clip == clip && v.clears == clears)
+            return v.id ? &v : nullptr;
+    if (attachment >= sceneSlots(targets_)) return nullptr;   // a target the pass doesn't have
+
+    const auto& programs = context_->programs();
+    gpu::PipelineDesc d;
+    d.vertexLayout = ops::uiVertexLayout();
+    d.attachments = sceneFormats();
+    gpu::BlendState blend;
+    switch (kind)
+    {
+        case Paint::Color:
+            d.program = programs.ui2d;
+            blend = gpu::BlendState::premultiplied();
+            break;
+        case Paint::Blend:
+            // Multiply (colour grading): result = src * dst.
+            d.program = programs.ui2d;
+            blend = { true, gpu::BlendFactor::DstColor, gpu::BlendFactor::Zero, gpu::BlendOp::Add,
+                            gpu::BlendFactor::Zero,     gpu::BlendFactor::One,  gpu::BlendOp::Add, gpu::WriteAll };
+            break;
+        case Paint::Noise:
+            d.program = programs.noise;
+            blend = gpu::BlendState::over();
+            break;
+        case Paint::Path:
+            d.program = programs.path;
+            blend = gpu::BlendState::over();
+            break;
+    }
+    const bool paintsMain = drawTargets(targets_, attachment, blend, clears, d);
+    if (clip)
+        d.stencil = { true, gpu::CompareOp::Equal, gpu::StencilOp::Keep, gpu::StencilOp::Keep, 0xFF, 0xFF };
+
+    paintVariants_.push_back({ kind, attachment, clip, clears, context_->pipeline(d), paintsMain });
+    return paintVariants_.back().id ? &paintVariants_.back() : nullptr;
+}
+
+// =============================================================================
+// Lowering — the render graph
+//
+// The recorded frame becomes passes of draws, in recording order (a painter's
+// order, never reordered). Every command names what it reads and writes
+// (DrawShaderParams, the recording target of an effect), and the lowering
+// places it: inside the scene pass when everything it writes is attached
+// there and nothing it reads is (the cheapest: no pass boundary, no load or
+// store), else as a pass of its own attached to exactly what it writes, at
+// that point in paint order. So the graph is one linear walk: pass boundaries
+// only where a read needs one, every dead write and every load or store of a
+// dead target dropped (Recorder::liveTargets), scaled targets cleared lazily,
+// each pass's render area the region it touches (a tile GPU skips the tiles
+// outside). A resource both read and written in one pass is VERSIONED, never
+// aliased: the main colour through its two halves (effectPassAndSwap), a
+// target through its scratch (drawn into the scratch while the pass samples
+// the target, then copied back over the region it touched).
+//
+// Ping-pong model: halves_[0] is half A, halves_[1] half B; `cur` is the half
+// that currently holds the scene. A post-process effect ends the scene pass,
+// draws from the current half into the other, and swaps; the next scene pass
+// loads the half the effect wrote. The stencil is one texture attached to
+// every pass of either half, LOADED, so clips persist across effects.
+// Separable effects (Gaussian blur) do two passes and so land back on the
+// half they started on; non-separable ones over a PARTIAL region add a
+// region-bounded identity copy-back so pixels outside the region keep the
+// original scene; full-window ones swap once (the destination is fully
+// covered). The frame ends with a copy of the current half into its output.
+// =============================================================================
+
+void Renderer::lower(const gpu::FrameInfo& info)
+{
+    using namespace ops;
+    using gpu::LoadOp;
+    using gpu::StoreOp;
+
+    auto& ctx = *context_;
+    const auto& programs = ctx.programs();
+    const auto& commands = recorder_.commands();
+    const auto& arena = recorder_.arena();
+    const gpu::Extent fe = extent_;
+    const float fw = static_cast<float>(fe.width), fh = static_cast<float>(fe.height);
+    // One clock reading per frame: every shader this frame sees the same
+    // `time` (two DrawShader ops never drift apart).
+    const float frameTime = ctx.time();
+
+    builder_.reset(++frameNumber_);
+    gradientAtlas_.stageUploads();
+    glyphAtlas_.stageDirtyPages();
+
+    // The frame's storage: the path segments every path fill, clip and path
+    // blur indexes into, and the targets' clear colours the paint reads.
+    const auto segmentBytes = recorder_.segments();
+    const gpu::Range segments = builder_.pushStorage(segmentBytes.data(), static_cast<uint32_t>(segmentBytes.size()));
+    FrameData frameDataValues;
+    for (size_t i = 0; i < targets_.size() && i < kMaxSceneTargets; ++i)
+    {
+        frameDataValues.targetClear[i][0] = targets_[i].clear.r;
+        frameDataValues.targetClear[i][1] = targets_[i].clear.g;
+        frameDataValues.targetClear[i][2] = targets_[i].clear.b;
+        frameDataValues.targetClear[i][3] = targets_[i].clear.a;
+    }
+    const gpu::Range frameData = builder_.pushStorage(&frameDataValues, sizeof(frameDataValues));
+
+    emitter_.beginFrame(builder_, fe);
+
+    const gpu::TextureBinding defaultBinding { ctx.defaultTexture(), kLinearClamp };
+    auto bind = [](gpu::TextureId t) { return gpu::TextureBinding { t, kLinearClamp }; };
+
     int cur = 0;
+    const size_t slots = sceneSlots(targets_);
+    const TargetMask scaled = scaledTargets();
+    TargetMask scaledWritten = 0;
+    TargetMask live = TargetMask(~0u);   // liveTargets of the command being lowered
 
-    VkRenderPass sceneBuildRP  = target_.sceneRenderPassClear(); // compat for build
+    // ---- Passes -------------------------------------------------------------
 
-    // A scene pass, beginning at command `firstCommand`: clearing at the
-    // frame start, loading after an effect. A target with no reader from
-    // here on is neither loaded nor stored (see Renderer::liveTargets): it
-    // can only die at a reader, and a reader always ends the scene pass, so
-    // whatever is live where a pass begins stays live to its end.
-    // The scene pass is open (beginSceneRP) or not: a pass of its own ends it (endScene),
-    // and it reopens only for the next command that draws into it (the replay loop), so a
-    // run of passes pays no empty scene segments in between.
+    // A scene pass, beginning at command `firstCommand`: clearing at the frame
+    // start, loading after an effect. A target with no reader from here on is
+    // neither loaded nor stored: it can only die at a reader, and a reader
+    // always ends the scene pass, so whatever is live where a pass begins
+    // stays live to its end. The scene pass is open or not: a pass of its own
+    // ends it (endScene), and it reopens only for the next command that draws
+    // into it, so a run of passes pays no empty scene segments in between.
     bool sceneOpen = false;
-    auto beginSceneRP = [&](bool withClears, size_t firstCommand) {
-        VkRenderPassBeginInfo rpbi {};
-        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rpbi.renderPass = target_.sceneRenderPass(withClears, liveTargets(firstCommand));
-        rpbi.framebuffer = pp[cur].sceneFB;
-        rpbi.renderArea.extent = frame.extent;
-
-        // The main colour, the targets at scale 1 (each its own clear
-        // value), depth/stencil: the scene pass's attachments in order.
-        clearScratch_.assign(1, VkClearValue {});
-        clearScratch_[0].color = {{ 0.0f, 0.0f, 0.0f, 0.0f }};
-        for (const auto& t : target_.targets())
-            if (!t.isScaled()) clearScratch_.emplace_back().color = t.clear;
-        clearScratch_.emplace_back().depthStencil = { 1.0f, 0 };
-        if (withClears) {
-            rpbi.clearValueCount = static_cast<uint32_t>(clearScratch_.size());
-            rpbi.pClearValues = clearScratch_.data();
+    auto beginScene = [&](bool withClears, size_t firstCommand) {
+        auto& p = builder_.beginPass(withClears ? "scene (clear)" : "scene");
+        const TargetMask liveHere = recorder_.liveTargets(firstCommand);
+        p.colorCount = static_cast<uint8_t>(slots);
+        p.color[0] = { halves_[cur], withClears ? LoadOp::Clear : LoadOp::Load, StoreOp::Store, {} };
+        for (size_t i = 0; i + 1 < slots; ++i)
+        {
+            const auto& t = targets_[i];
+            if (t.isScaled()) { p.color[1 + i] = {}; continue; }   // not a scene attachment
+            const bool isLive = (liveHere & (1u << i)) != 0;
+            p.color[1 + i] = { targetTextures_[i],
+                               !isLive ? LoadOp::DontCare : withClears ? LoadOp::Clear : LoadOp::Load,
+                               isLive ? StoreOp::Store : StoreOp::DontCare, t.clear };
         }
-        vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+        p.depthStencil = { stencil_, withClears ? LoadOp::Clear : LoadOp::Load, StoreOp::Store, 0 };
+        p.renderArea = { 0, 0, static_cast<int32_t>(fe.width), static_cast<int32_t>(fe.height) };
         sceneOpen = true;
-
-        VkViewport vp {};
-        vp.width    = static_cast<float>(frame.extent.width);
-        vp.height   = static_cast<float>(frame.extent.height);
-        vp.maxDepth = 1.0f;
-        vkCmdSetViewport(frame.cmd, 0, 1, &vp);
-        VkRect2D sc {}; sc.extent = frame.extent;
-        vkCmdSetScissor(frame.cmd, 0, 1, &sc);
-
-        state_.invalidate();
+        emitter_.invalidate();
     };
     auto endScene = [&] {
-        if (sceneOpen) vkCmdEndRenderPass(frame.cmd);
+        if (sceneOpen) builder_.endPass();
         sceneOpen = false;
     };
 
-    // Commands that run as passes of their own (each ends the scene pass if it's open).
-    auto runsOwnPass = [&](const DrawCommand& c) {
-        switch (c.op) {
-            case DrawOp::EffectKernel: case DrawOp::EffectHSV: case DrawOp::BlurShape: case DrawOp::BlurPath:
-                return true;
-            case DrawOp::DrawShader: {
-                const auto& sp = arena_.read<DrawShaderParams>(c.dataOffset);
-                return sp.shader == nullptr || !sp.inScene;
-            }
-            default:
-                return false;
-        }
+    enum class StencilTest { None, Inside, Outside };
+
+    // A pass of one fullscreen-triangle draw of `program`, writing `dst` (of
+    // `format`) within `sc`, which is also its render area: pixels outside it
+    // are untouched. With a stencil test (the main colour's passes) only the
+    // pixels inside the clip (Inside: stencil == ref) or outside it (Outside:
+    // !=, the pre-copy) are written; the rest keep what `dst` held (Load).
+    auto fullscreenPass = [&](const char* label, gpu::ProgramId program, gpu::TextureId dst, PixelFormat format,
+                              StencilTest test, std::initializer_list<gpu::TextureBinding> textures,
+                              std::initializer_list<gpu::Range> storage, gpu::Range constants,
+                              gpu::IRect sc, uint8_t stencilRef, LoadOp load = LoadOp::Load)
+    {
+        if (sc.isEmpty() || !dst) return;
+        const bool ds = test != StencilTest::None;
+        gpu::PipelineDesc d;
+        d.program = program;
+        d.attachments.colorCount = 1;
+        d.attachments.colorFormats[0] = format;
+        d.attachments.depthStencil = ds;
+        d.blend[0] = gpu::BlendState::replace();
+        if (ds)
+            d.stencil = { true, test == StencilTest::Inside ? gpu::CompareOp::Equal : gpu::CompareOp::NotEqual,
+                          gpu::StencilOp::Keep, gpu::StencilOp::Keep, 0xFF, 0x00 };
+        const auto pipeline = ctx.pipeline(d);
+        if (!pipeline) return;
+
+        auto& p = builder_.beginPass(label);
+        p.colorCount = 1;
+        p.color[0] = { dst, load, StoreOp::Store, {} };
+        if (ds) p.depthStencil = { stencil_, LoadOp::Load, StoreOp::Store, 0 };
+        p.renderArea = sc;
+
+        gpu::Draw dr;
+        dr.pipeline = pipeline;
+        dr.scissor = sc;
+        dr.stencilRef = stencilRef;
+        for (const auto& t : textures) dr.textures[dr.textureCount++] = t;
+        for (const auto& s : storage)  dr.storage[dr.storageCount++] = s;
+        dr.constants = constants;
+        dr.vertexCount = 3;
+        builder_.draw(dr);
+        builder_.endPass();
     };
 
-    // SCALED targets (Target::scale) aren't scene attachments: they hold their clear value
-    // until their first write in a frame. That write's pass clears them first; a pass that
-    // reads one before then clears it here (outside any render pass).
-    const TargetMask scaled = target_.scaledTargets();
-    TargetMask scaledWritten = 0;
-    auto clearScaled = [&](TargetMask reads) {
-        const TargetMask pending = reads & scaled & static_cast<TargetMask>(~scaledWritten);
-        for (size_t i = 0; pending != 0 && i < target_.targets().size(); ++i) {
-            if ((pending & (1u << i)) == 0) continue;
-            VkImageMemoryBarrier b {};
-            b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            b.image = target_.targetImage(i)->image();
-            b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            vkCmdPipelineBarrier(frame.cmd, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &b);
-            const VkClearColorValue clear = target_.targets()[i].clear;
-            vkCmdClearColorImage(frame.cmd, b.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &b.subresourceRange);
-            b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-            vkCmdPipelineBarrier(frame.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &b);
-            scaledWritten |= static_cast<TargetMask>(1u << i);
-        }
+    auto effectConstants = [&](gpu::Extent e, float dirX, float dirY, float radius) {
+        EffectConstants c;
+        c.viewportW = static_cast<float>(e.width);
+        c.viewportH = static_cast<float>(e.height);
+        c.dirX = dirX; c.dirY = dirY; c.radius = radius;
+        return builder_.pushConstants(c);
     };
 
-    // Runs a single post-process pass (caller provides the dispatch via
-    // `applyPass`) and swaps the active half. Must be called between a
-    // vkCmdEndRenderPass and the matching resume of the scene RP.
+    // Runs a single post-process pass (`applyPass(src, dst)`) and swaps the
+    // active half. Only between scene passes (endScene first).
     auto effectPassAndSwap = [&](auto applyPass) {
-        int dst = cur ^ 1;
-        applyPass(pp[cur].sampler, pp[dst].effectFB);
+        const int dst = cur ^ 1;
+        applyPass(halves_[cur], halves_[dst]);
         cur = dst;
     };
 
-    // ---- Effect ROI (region-of-interest back-propagation) -----------------
+    // ---- Effect ROI (region-of-interest back-propagation) -------------------
     //
-    // The standardized per-pass read-margin walk: each pass's scissor is the
-    // NEXT pass's input requirement — the final output region expanded by
-    // each intermediate pass's kernel apron — clamped to the framebuffer.
-    // Every chain is arranged to end on the half it STARTED on (even number
-    // of swaps; single-pass effects append a region-bounded identity
-    // copy-back), so pixels outside the region / outside the clip simply
-    // keep the original scene in place. That deletes the old FULL-SCREEN
-    // pre-copy seeding passes: a small blurred knob now costs region-sized
-    // passes instead of 2+ full-screen ones.
+    // Each pass's scissor is the NEXT pass's input requirement — the final
+    // output region expanded by each intermediate pass's kernel apron —
+    // clamped to the frame. Every chain is arranged to end on the half it
+    // STARTED on (even number of swaps; single-pass effects append a
+    // region-bounded identity copy-back), so pixels outside the region /
+    // outside the clip simply keep the original scene in place: a small
+    // blurred knob costs region-sized passes, not full-screen ones.
 
     // Final output region: recorded effect region ∩ recorded clip. Empty
-    // region param = whole clip (legacy / inverted blurs).
-    auto roiFinal = [](const juce::Rectangle<float>& region,
-                       const juce::Rectangle<int>& clip) {
+    // region param = whole clip (inverted blurs).
+    auto roiFinal = [](const juce::Rectangle<float>& region, const juce::Rectangle<int>& clip) {
         auto c = clip.toFloat();
         return region.isEmpty() ? c : region.getIntersection(c);
     };
 
-    // Rect (+ per-axis apron) → framebuffer-clamped scissor.
-    auto roiScissor = [&](juce::Rectangle<float> r, float padX, float padY) -> VkRect2D {
+    // Rect (+ per-axis apron) → frame-clamped scissor.
+    auto roiScissor = [&](juce::Rectangle<float> r, float padX, float padY) -> gpu::IRect {
         r = r.expanded(padX, padY);
-        int x0 = std::max(0, (int) std::floor(r.getX()));
-        int y0 = std::max(0, (int) std::floor(r.getY()));
-        int x1 = std::min((int) frame.extent.width,  (int) std::ceil(r.getRight()));
-        int y1 = std::min((int) frame.extent.height, (int) std::ceil(r.getBottom()));
-        if (x1 <= x0 || y1 <= y0) return { { 0, 0 }, { 0, 0 } };
-        return { { x0, y0 },
-                 { static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0) } };
+        const int x0 = std::max(0, (int) std::floor(r.getX()));
+        const int y0 = std::max(0, (int) std::floor(r.getY()));
+        const int x1 = std::min((int) fe.width,  (int) std::ceil(r.getRight()));
+        const int y1 = std::min((int) fe.height, (int) std::ceil(r.getBottom()));
+        if (x1 <= x0 || y1 <= y0) return {};
+        return { x0, y0, x1 - x0, y1 - y0 };
+    };
+    auto coversFrame = [&](const gpu::IRect& sc) {
+        return sc.x == 0 && sc.y == 0
+            && sc.width == (int32_t) fe.width && sc.height == (int32_t) fe.height;
     };
 
-    // Separable chains still need outside-clip pixels of the INTERMEDIATE
-    // half seeded with source (pass 2's taps cross the clip edge and read
-    // pass 1's stencil-discarded pixels otherwise) — but only within the
-    // intermediate pass's scissor, not full-screen.
-    auto preCopyIfClipped = [&](uint8_t stencilDepth, const VkRect2D* scissor) {
-        if (stencilDepth == 0 || !copyEffect_) return;
-        int dst = cur ^ 1;
-        copyEffect_->applyPass(frame.cmd,
-            pp[cur].sampler, pp[dst].effectFB, target_.effectRenderPass(),
-            frame.extent,
-            /*dir unused*/ 0.0f, 0.0f,
-            /*radius unused*/ 0.0f,
-            /*stencilRef*/ stencilDepth,
-            scissor);
+    // Separable chains still need outside-clip pixels of the INTERMEDIATE half
+    // seeded with source (pass 2's taps cross the clip edge and read pass 1's
+    // stencil-discarded pixels otherwise) — but only within the intermediate
+    // pass's scissor, not full-screen.
+    auto preCopyIfClipped = [&](uint8_t stencilDepth, const gpu::IRect& sc) {
+        if (stencilDepth == 0) return;
+        fullscreenPass("pre-copy", programs.copy, halves_[cur ^ 1], kSceneFormat, StencilTest::Outside,
+                       { bind(halves_[cur]) }, {}, effectConstants(fe, 0, 0, 0), sc, stencilDepth);
     };
 
     // Region-bounded identity pass (HSV with identity constants): copies the
     // effect's output back onto the original half so the chain's swap count
     // is even. Stencil-inside like the effect itself, so outside-clip pixels
-    // of the ORIGINAL half are never touched.
-    //
-    // ONLY for PARTIAL regions. A full-framebuffer single-pass effect fully
-    // covers the destination half (pre-copy seeds outside-clip when
-    // clipped), so the old single-swap behavior is correct there — and the
-    // copy-back would DOUBLE the cost of every full-window saturate/hue
-    // (measured as a general slowdown in the benchmark). `cur` ending on
-    // either half is fine: the blit reads pp[cur].
-    auto copyBackAndSwap = [&](const VkRect2D& sc, uint8_t stencilDepth) {
-        if (hsvPipeline_ == nullptr) return;   // callers skip partial-region effects without it
-        effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-            hsvPipeline_->applyPass(frame.cmd, src, dst,
-                target_.effectRenderPass(), frame.extent,
-                HSVPipeline::identity(),
-                static_cast<uint32_t>(stencilDepth), &sc);
+    // of the ORIGINAL half are never touched. ONLY for PARTIAL regions: a
+    // full-frame single-pass effect fully covers the destination half
+    // (pre-copy seeds outside-clip when clipped), and a copy-back there would
+    // double the cost of every full-window saturate/hue. `cur` ending on
+    // either half is fine: the final copy reads halves_[cur].
+    auto copyBackAndSwap = [&](const gpu::IRect& sc, uint8_t stencilDepth) {
+        effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) {
+            fullscreenPass("copy back", programs.hsv, dst, kSceneFormat, StencilTest::Inside,
+                           { bind(src) }, {}, builder_.pushConstants(HSVConstants::identity(fw, fh)),
+                           sc, stencilDepth);
         });
     };
-    auto coversFrame = [&](const VkRect2D& sc) {
-        return sc.offset.x == 0 && sc.offset.y == 0
-            && sc.extent.width == frame.extent.width
-            && sc.extent.height == frame.extent.height;
+
+    // SCALED targets (Target::scale) aren't scene attachments: they hold their
+    // clear value until their first write in a frame. That write's pass clears
+    // them first; a pass that reads one before then clears it here, as a pass
+    // of its own with no draws.
+    auto clearScaled = [&](TargetMask reads) {
+        const TargetMask pendingClear = reads & scaled & static_cast<TargetMask>(~scaledWritten);
+        for (size_t i = 0; pendingClear != 0 && i < targets_.size(); ++i) {
+            if ((pendingClear & (1u << i)) == 0) continue;
+            const auto te = targetExtent(i);
+            auto& p = builder_.beginPass("clear target");
+            p.colorCount = 1;
+            p.color[0] = { targetTextures_[i], LoadOp::Clear, StoreOp::Store, targets_[i].clear };
+            p.renderArea = { 0, 0, static_cast<int32_t>(te.width), static_cast<int32_t>(te.height) };
+            builder_.endPass();
+            scaledWritten |= static_cast<TargetMask>(1u << i);
+        }
     };
 
-    // ---- The render graph: passes of their own ------------------------------
-    //
-    // Every command names what it reads and writes (DrawShaderParams, the
-    // recording target of an effect), and the replay places it: inside the
-    // scene pass when everything it writes is attached there and nothing it
-    // reads is (the cheapest: no pass boundary, no load or store), else as a
-    // pass of its own attached to exactly what it writes, at that point in
-    // paint order. Commands replay in recording order (a painter's order, never
-    // reordered), so the graph is one linear walk: what a recorded frame graph
-    // (Frostbite's FrameGraph, Unreal's RDG) compiles, it does in place — pass
-    // boundaries only where a read needs one, every dead write and every load
-    // or store of a dead target dropped (liveTargets), scaled targets cleared
-    // lazily, each pass scissored to the region it touches (render area =
-    // scissor, so a tile GPU skips the tiles outside). A resource both read and
-    // written in one pass is VERSIONED, never aliased: the main colour through
-    // its two halves (effectPassAndSwap), a target through its scratch (an
-    // image of its size and format): drawn into the scratch while the pass
-    // samples the target, then copied back over the region it touched — only
-    // what changed moves.
-
-    // Target t into its scratch (`toScratch`) or back, over `sc` in its pixels: a plain
-    // copy draw (copy.frag; a target pass has no stencil, so it writes the whole scissor).
-    auto copyTarget = [&](size_t t, bool toScratch, const VkRect2D& sc) {
-        if (copyEffect_ == nullptr || sc.extent.width == 0 || sc.extent.height == 0) return;
-        const VkRenderPass rp = target_.targetEffectPass(t);
-        const VkDescriptorSet src = target_.targetSampler(t, !toScratch, frame.cmd);
-        const VkFramebuffer dst = target_.targetEffectFramebuffer(t, toScratch, frame.cmd);
-        if (rp == VK_NULL_HANDLE || src == VK_NULL_HANDLE || dst == VK_NULL_HANDLE) return;
-        copyEffect_->applyPass(frame.cmd, src, dst, rp, target_.targetExtent(t), 0.0f, 0.0f, 0.0f, 0, &sc);
+    // Target t into its scratch (`toScratch`) or back, over `sc` in its pixels:
+    // a plain copy draw (a target pass has no stencil, so it writes the whole
+    // scissor).
+    auto copyTarget = [&](size_t t, bool toScratch, const gpu::IRect& sc) {
+        if (sc.isEmpty()) return;
+        const auto scratch = targetScratch(t);
+        if (!scratch) return;
+        const auto src = toScratch ? targetTextures_[t] : scratch;
+        const auto dst = toScratch ? scratch : targetTextures_[t];
+        fullscreenPass("copy target", programs.copy, dst, targets_[t].format, StencilTest::None,
+                       { bind(src) }, {}, effectConstants(targetExtent(t), 0, 0, 0), sc, 0);
     };
-    // The targets of `mask` copied in (before a pass: a Replace target too, since a
-    // stencil-clipped or discarding shader leaves pixels of the rect unwritten, and the
-    // copy back takes the whole rect) or back (after it).
-    auto copyTargets = [&](TargetMask mask, bool in, const VkRect2D& sc) {
-        for (size_t t = 0; mask != 0 && t < target_.targets().size(); ++t)
+    // The targets of `mask` copied in (before a pass: a Replace target too,
+    // since a stencil-clipped or discarding shader leaves pixels of the rect
+    // unwritten, and the copy back takes the whole rect) or back (after it).
+    auto copyTargets = [&](TargetMask mask, bool in, const gpu::IRect& sc) {
+        for (size_t t = 0; mask != 0 && t < targets_.size(); ++t)
             if ((mask & (1u << t)) != 0)
                 copyTarget(t, in, sc);
     };
     // `r` (frame px) in a target's pixels at scale `s`, padded, clamped to its extent `e`.
-    auto inPixels = [](juce::Rectangle<float> r, float s, float padX, float padY, VkExtent2D e) -> VkRect2D {
+    auto inPixels = [](juce::Rectangle<float> r, float s, float padX, float padY, gpu::Extent e) -> gpu::IRect {
         r = (r * s).expanded(padX, padY);
         const int x0 = std::max(0, (int) std::floor(r.getX())), y0 = std::max(0, (int) std::floor(r.getY()));
         const int x1 = std::min((int) e.width, (int) std::ceil(r.getRight())), y1 = std::min((int) e.height, (int) std::ceil(r.getBottom()));
-        if (x1 <= x0 || y1 <= y0) return { { 0, 0 }, { 0, 0 } };
-        return { { x0, y0 }, { static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0) } };
+        if (x1 <= x0 || y1 <= y0) return {};
+        return { x0, y0, x1 - x0, y1 - y0 };
     };
 
-    // A TARGET PASS: a shader writing targets (one size) and not the main colour, in their
-    // pixels (its region and clip scale with them). A scene reader reads the current half.
-    auto targetPass = [&](const DrawCommand& c, const DrawShaderParams& sp, Shader& shader) {
+    // ---- jvk::Shader draws ----------------------------------------------------
+
+    // The pipeline of a Shader draw in a pass whose colour attachments are
+    // `formats`: location L blends as its attachment takes it (location 0:
+    // Replace for a scene reader, which REPLACES its region; else Over; a
+    // target location: that target's Blend), nothing where it doesn't write.
+    // `locationTarget(L)`: the target at location L (-1: none).
+    auto shaderPipeline = [&](const ShaderCapture& sc, const gpu::AttachmentFormats& formats,
+                              auto&& locationTarget, bool clip) -> gpu::PipelineId
+    {
+        gpu::PipelineDesc d;
+        d.program = sc.program;
+        d.attachments = formats;
+        for (uint32_t l = 0; l < formats.colorCount; ++l)
+        {
+            const bool writes = (sc.outputs & (1u << l)) != 0 && (formats.unusedMask & (1u << l)) == 0;
+            if (!writes)  { d.blend[l] = gpu::BlendState::none(); continue; }
+            if (l == 0)   { d.blend[0] = sc.readsScene ? gpu::BlendState::replace() : gpu::BlendState::over(); continue; }
+            const int t = locationTarget(l);
+            d.blend[l] = t >= 0 ? targetBlend(targets_[static_cast<size_t>(t)].blend) : gpu::BlendState::none();
+        }
+        if (clip && formats.depthStencil)
+            d.stencil = { true, gpu::CompareOp::Equal, gpu::StencilOp::Keep, gpu::StencilOp::Keep, 0xFF, 0xFF };
+        return ctx.pipeline(d);
+    };
+
+    // One Shader draw into the open pass: the region quad (one triangle
+    // covering twice the region; the scissor — the clip within the region —
+    // keeps it there), in a pass of `viewport` pixels. `scene`: the half a
+    // scene reader reads (none: a reader draws nothing). Targets it samples
+    // are bound by slot (`targetTexture(t)`: the texture it reads target t
+    // through).
+    auto shaderDraw = [&](const ShaderCapture& sc, const DrawShaderParams& sp, gpu::PipelineId pipeline,
+                          juce::Rectangle<float> region, gpu::Extent viewport,
+                          const juce::Rectangle<int>& clip, uint8_t stencilRef, gpu::TextureId scene)
+    {
+        if (!pipeline || (sc.readsScene && !scene)) return;
+        gpu::Draw d;
+        d.pipeline = pipeline;
+        const auto c = clip.getIntersection(region.getSmallestIntegerContainer());
+        d.scissor = Emitter::clamp(c, viewport);
+        if (d.scissor.isEmpty()) return;
+        d.stencilRef = stencilRef;
+        d.textureCount = sc.textureCount;
+        for (uint32_t i = 0; i < sc.textureCount; ++i)
+        {
+            auto b = sc.textures[i];
+            if (static_cast<int>(i) == sc.sceneSlot) b = bind(scene ? scene : ctx.defaultTexture());
+            else if (sc.slotTarget[i] >= 0 && static_cast<size_t>(sc.slotTarget[i]) < targetTextures_.size())
+                b = bind(targetTextures_[static_cast<size_t>(sc.slotTarget[i])]);
+            if (!b.texture) b = defaultBinding;
+            d.textures[i] = b;
+        }
+        d.storageCount = sc.storageCount;
+        for (uint32_t i = 0; i < sc.storageCount; ++i)
+            d.storage[i] = builder_.pushStorage(shaderData_.data() + sc.storage[i].offset, sc.storage[i].size);
+        ShaderConstants k;
+        k.resolutionX = region.getWidth();
+        k.resolutionY = region.getHeight();
+        k.time        = frameTime;
+        k.viewportW   = static_cast<float>(viewport.width);
+        k.viewportH   = static_cast<float>(viewport.height);
+        k.regionX     = region.getX();
+        k.regionY     = region.getY();
+        for (uint32_t i = 0; i < sp.constantCount && i < static_cast<uint32_t>(kShaderDrawConstants); ++i)
+            k.draw[i] = sp.constants[i];
+        d.constants = builder_.pushConstants(k);
+        d.vertexCount = 3;
+        builder_.draw(d);
+    };
+
+    // The colour formats of a TARGET PASS / a MAIN PASS: location L = the
+    // target its shader writes there (TargetSlots), location 0 the main colour
+    // (a main pass) or nothing (a target pass); the stencil with the main colour.
+    auto slotFormats = [&](TargetSlots tslots, bool withMain) {
+        gpu::AttachmentFormats f;
+        f.colorCount = static_cast<uint8_t>(std::max<uint32_t>(slotCount(tslots), 1u));
+        if (withMain) f.colorFormats[0] = kSceneFormat;
+        else          f.unusedMask |= 1u;
+        for (uint32_t l = 1; l < f.colorCount; ++l)
+        {
+            const int t = slotTarget(tslots, l);
+            if (t < 0) f.unusedMask |= static_cast<uint8_t>(1u << l);
+            else       f.colorFormats[l] = targets_[static_cast<size_t>(t)].format;
+        }
+        f.depthStencil = withMain;
+        return f;
+    };
+
+    // A TARGET PASS: a shader writing targets (one size) and not the main
+    // colour, in their pixels (its region and clip scale with them). A scene
+    // reader reads the current half.
+    auto targetPass = [&](const DrawCommand& c, const DrawShaderParams& sp, const ShaderCapture& sc) {
         int first = -1;
         for (uint32_t l = 1; l < 8 && first < 0; ++l)
             first = slotTarget(sp.targetSlots, l);
         if (first < 0) return;
-        const auto e = target_.targetExtent(static_cast<size_t>(first));
-        const float s = target_.targetScale(static_cast<size_t>(first));
-        // The ONE rect of this pass, in the targets' pixels: the shader's scissor (what
-        // dispatchTarget derives from `regionT` and `clipT`), the copies' rect and the
-        // render area, so no pixel the shader writes escapes the copy back.
+        const auto e = targetExtent(static_cast<size_t>(first));
+        const float s = targetScale(static_cast<size_t>(first));
+        // The ONE rect of this pass, in the targets' pixels: the shader's
+        // scissor, the copies' rect and the render area, so no pixel the
+        // shader writes escapes the copy back.
         const auto regionT = sp.region * s;
         const auto clipT   = (c.clipBounds.toFloat() * s).getSmallestIntegerContainer();
         const auto cT      = clipT.getIntersection(regionT.getSmallestIntegerContainer());
-        const int x0 = std::max(0, cT.getX()), y0 = std::max(0, cT.getY());
-        const int x1 = std::max(x0, std::min(cT.getRight(),  static_cast<int>(e.width)));
-        const int y1 = std::max(y0, std::min(cT.getBottom(), static_cast<int>(e.height)));
-        const VkRect2D sc { { x0, y0 }, { static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0) } };
-        if (sc.extent.width == 0 || sc.extent.height == 0) return;
+        const gpu::IRect sc0 = Emitter::clamp(cT, e);
+        if (sc0.isEmpty()) return;
         endScene();
         clearScaled(sp.targetsRead);
         const TargetMask written = sp.targetsWritten, versioned = sp.targetsRead & written;
         const TargetMask clears = written & scaled & static_cast<TargetMask>(~scaledWritten);
-        copyTargets(versioned, true, sc);
-        VkRenderPass rp = target_.targetPass(sp.targetSlots, clears);
-        VkFramebuffer fb = target_.shaderFramebuffer(frame.frameSlot, -1, sp.targetSlots, versioned, frame.cmd);
-        if (rp == VK_NULL_HANDLE || fb == VK_NULL_HANDLE) return;
+        copyTargets(versioned, true, sc0);
 
-        // Its attachments in location order, each target's own clear value.
-        clearScratch_.clear();
-        for (uint32_t l = 1; l < 8; ++l)
+        const auto formats = slotFormats(sp.targetSlots, false);
+        const auto pipeline = shaderPipeline(sc, formats, [&](uint32_t l) { return slotTarget(sp.targetSlots, l); }, false);
+        auto& p = builder_.beginPass("shader → targets");
+        p.colorCount = formats.colorCount;
+        for (uint32_t l = 1; l < formats.colorCount; ++l)
             if (const int t = slotTarget(sp.targetSlots, l); t >= 0)
-                clearScratch_.emplace_back().color = target_.targets()[static_cast<size_t>(t)].clear;
-        VkRenderPassBeginInfo rpbi {};
-        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        rpbi.renderPass = rp;
-        rpbi.framebuffer = fb;
-        // Whole while a target clears (a clear covers the attachment), else the rect the
-        // pass touches: the tiles outside it are neither loaded nor stored.
-        rpbi.renderArea = clears != 0 ? VkRect2D { { 0, 0 }, e } : sc;
-        rpbi.clearValueCount = static_cast<uint32_t>(clearScratch_.size());
-        rpbi.pClearValues = clearScratch_.data();
-        vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-        shaderPipeline_->dispatchTarget(frame.cmd, shader, rp, sp.targetSlots, regionT,
-            static_cast<float>(e.width), static_cast<float>(e.height), clipT,
-            frameTime, frame.frameSlot, { sp.constants, sp.constantCount }, { sp.images, sp.imageCount },
-            shader.readsScene() ? pp[cur].sampler : VK_NULL_HANDLE);
-        vkCmdEndRenderPass(frame.cmd);
+            {
+                const auto ti = static_cast<size_t>(t);
+                const bool clear = (clears & (1u << ti)) != 0;
+                p.color[l] = { (versioned & (1u << ti)) != 0 ? targetScratch(ti) : targetTextures_[ti],
+                               clear ? LoadOp::Clear : LoadOp::Load, StoreOp::Store, targets_[ti].clear };
+            }
+        // Whole while a target clears (a clear covers the attachment), else the
+        // rect the pass touches: the tiles outside it are neither loaded nor stored.
+        p.renderArea = clears != 0 ? gpu::IRect { 0, 0, (int32_t) e.width, (int32_t) e.height } : sc0;
+        shaderDraw(sc, sp, pipeline, regionT, e, clipT, 0, sc.readsScene ? halves_[cur] : gpu::TextureId {});
+        builder_.endPass();
         scaledWritten |= written & scaled;
-        copyTargets(versioned, false, sc);
+        copyTargets(versioned, false, sc0);
     };
 
-    // A pass writing the main colour AND targets at scale 1: the main colour's half and the
-    // targets attached together, with the stencil, so the clip applies to both. A scene
-    // reader samples the current half and REPLACES its region in the other, as every scene
-    // reader does (pre-copy, copy-back); any other blends over the current half in place.
-    auto mainPass = [&](const DrawCommand& c, const DrawShaderParams& sp, Shader& shader) {
+    // A pass writing the main colour AND targets at scale 1: the main colour's
+    // half and the targets attached together, with the stencil, so the clip
+    // applies to both. A scene reader samples the current half and REPLACES
+    // its region in the other, as every scene reader does (pre-copy,
+    // copy-back); any other blends over the current half in place.
+    auto mainPass = [&](const DrawCommand& c, const DrawShaderParams& sp, const ShaderCapture& sc) {
         const auto R = roiFinal(sp.region, c.clipBounds);
         if (R.isEmpty()) return;
-        const VkRect2D sc = roiScissor(R, 0.0f, 0.0f);
-        VkRenderPass rp = target_.shaderPass(sp.targetSlots, 0, true);
-        if (sc.extent.width == 0 || sc.extent.height == 0 || rp == VK_NULL_HANDLE) return;
-        // A partial scene read needs the copy back (an HSV identity pass): without it the
-        // frame would end on a half holding the region alone.
-        if (shader.readsScene() && !coversFrame(sc) && hsvPipeline_ == nullptr) return;
+        const gpu::IRect sc0 = roiScissor(R, 0.0f, 0.0f);
+        if (sc0.isEmpty()) return;
         endScene();
         clearScaled(sp.targetsRead);
         const TargetMask versioned = sp.targetsRead & sp.targetsWritten;
-        copyTargets(versioned, true, sc);
-        auto pass = [&](VkDescriptorSet scene, int half) {
-            VkFramebuffer fb = target_.shaderFramebuffer(frame.frameSlot, half, sp.targetSlots, versioned, frame.cmd);
-            if (fb == VK_NULL_HANDLE) return;
-            VkRenderPassBeginInfo rpbi {};
-            rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            rpbi.renderPass = rp;
-            rpbi.framebuffer = fb;
-            rpbi.renderArea = sc;
-            vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-            shaderPipeline_->dispatchTarget(frame.cmd, shader, rp, sp.targetSlots, sp.region,
-                static_cast<float>(frame.extent.width), static_cast<float>(frame.extent.height),
-                c.clipBounds, frameTime, frame.frameSlot, { sp.constants, sp.constantCount },
-                { sp.images, sp.imageCount }, scene, c.stencilDepth);
-            vkCmdEndRenderPass(frame.cmd);
+        copyTargets(versioned, true, sc0);
+        const auto formats = slotFormats(sp.targetSlots, true);
+        const bool clip = c.stencilDepth > 0;
+        const auto pipeline = shaderPipeline(sc, formats, [&](uint32_t l) { return slotTarget(sp.targetSlots, l); }, clip);
+        auto pass = [&](gpu::TextureId scene, int half) {
+            auto& p = builder_.beginPass("shader → main + targets");
+            p.colorCount = formats.colorCount;
+            p.color[0] = { halves_[half], LoadOp::Load, StoreOp::Store, {} };
+            for (uint32_t l = 1; l < formats.colorCount; ++l)
+                if (const int t = slotTarget(sp.targetSlots, l); t >= 0)
+                {
+                    const auto ti = static_cast<size_t>(t);
+                    p.color[l] = { (versioned & (1u << ti)) != 0 ? targetScratch(ti) : targetTextures_[ti],
+                                   LoadOp::Load, StoreOp::Store, targets_[ti].clear };
+                }
+            p.depthStencil = { stencil_, LoadOp::Load, StoreOp::Store, 0 };
+            p.renderArea = sc0;
+            shaderDraw(sc, sp, pipeline, sp.region, fe, c.clipBounds, c.stencilDepth, scene);
+            builder_.endPass();
         };
-        if (shader.readsScene()) {
-            const bool whole = coversFrame(sc);
-            if (whole) preCopyIfClipped(c.stencilDepth, &sc);
-            pass(pp[cur].sampler, cur ^ 1);
+        if (sc.readsScene) {
+            const bool whole = coversFrame(sc0);
+            if (whole) preCopyIfClipped(c.stencilDepth, sc0);
+            pass(halves_[cur], cur ^ 1);
             cur ^= 1;
-            if (!whole) copyBackAndSwap(sc, c.stencilDepth);
+            if (!whole) copyBackAndSwap(sc0, c.stencilDepth);
         } else {
-            pass(VK_NULL_HANDLE, cur);
+            pass({}, cur);
         }
-        copyTargets(versioned, false, sc);
+        copyTargets(versioned, false, sc0);
     };
 
-    // An EFFECT ON A TARGET (Graphics::setTarget, then a blur, a blurred shape or path, an
-    // hsv transform): read and written, so it runs through the target's scratch — a
-    // separable blur across into the scratch and down back into the target; anything else
-    // copies what it reads into the scratch, then draws from there back over its region.
-    // In the target's pixels: the recorded region, clip and radii scale with it, and the
-    // clip is its bounds (a target has no stencil). A blurred path, whose segments are in
-    // frame pixels, runs on a target at scale 1 only. `k`: its command index.
+    // A shader writing the main colour alone, as a pass of its own: a scene
+    // reader (ping-ponged) or a target reader (blended Over the current half).
+    auto shaderMainOnly = [&](const DrawCommand& c, const DrawShaderParams& sp, const ShaderCapture& sc) {
+        gpu::AttachmentFormats formats;
+        formats.colorCount = 1;
+        formats.colorFormats[0] = kSceneFormat;
+        formats.depthStencil = true;
+        const auto pipeline = shaderPipeline(sc, formats, [](uint32_t) { return -1; }, c.stencilDepth > 0);
+        auto pass = [&](gpu::TextureId scene, gpu::TextureId dst, const gpu::IRect& area) {
+            auto& p = builder_.beginPass("shader → main");
+            p.colorCount = 1;
+            p.color[0] = { dst, LoadOp::Load, StoreOp::Store, {} };
+            p.depthStencil = { stencil_, LoadOp::Load, StoreOp::Store, 0 };
+            p.renderArea = area;
+            shaderDraw(sc, sp, pipeline, sp.region, fe, c.clipBounds, c.stencilDepth, scene);
+            builder_.endPass();
+        };
+        const gpu::IRect whole { 0, 0, (int32_t) fe.width, (int32_t) fe.height };
+        if (sc.readsScene) {
+            // A SCENE READER (it may read targets too): a non-separable effect,
+            // ROI-walked like EffectHSV. One region pass samples the current half
+            // as its `scene` and REPLACES the region in the other; a partial
+            // region is copied back so the chain ends on the starting half.
+            const auto R = roiFinal(sp.region, c.clipBounds);
+            if (R.isEmpty()) return;
+            const gpu::IRect sc0 = roiScissor(R, 0.0f, 0.0f);
+            if (sc0.isEmpty()) return;
+            endScene();
+            clearScaled(sp.targetsRead);
+            if (coversFrame(sc0)) {
+                preCopyIfClipped(c.stencilDepth, sc0);
+                effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) { pass(src, dst, whole); });
+            } else {
+                effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) { pass(src, dst, whole); });
+                copyBackAndSwap(sc0, c.stencilDepth);
+            }
+        } else {
+            // A TARGET READER writing the main colour alone, blended Over the
+            // current half in place.
+            endScene();
+            clearScaled(sp.targetsRead);
+            pass({}, halves_[cur], whole);
+        }
+    };
+
+    // ---- Effects on a target ------------------------------------------------
+    //
+    // An EFFECT ON A TARGET (Graphics::setTarget, then a blur, a blurred shape
+    // or path, an hsv transform): read and written, so it runs through the
+    // target's scratch — a separable blur across into the scratch and down
+    // back into the target; anything else copies what it reads into the
+    // scratch, then draws from there back over its region. In the target's
+    // pixels: the recorded region, clip and radii scale with it, and the clip
+    // is its bounds (a target has no stencil). A blurred path, whose segments
+    // are in frame pixels, runs on a target at scale 1 only. `k`: its index.
     auto targetEffect = [&](const DrawCommand& c, size_t k) {
         const auto t = static_cast<size_t>(c.target - 1);
-        if (t >= target_.targets().size() || (liveTargets(k + 1) & (1u << t)) == 0)
+        if (t >= targets_.size() || (recorder_.liveTargets(k + 1) & (1u << t)) == 0)
             return;   // what it would make, nothing reads
-        const float s = target_.targetScale(t);
-        const VkExtent2D e = target_.targetExtent(t);
-        const VkRenderPass rp = target_.targetEffectPass(t);
-        if (rp == VK_NULL_HANDLE) return;
+        const float s = targetScale(t);
+        const gpu::Extent e = targetExtent(t);
+        const auto format = targets_[t].format;
         endScene();
         clearScaled(static_cast<TargetMask>(1u << t));   // not drawn this frame: its clear value
-        const VkFramebuffer toTarget = target_.targetEffectFramebuffer(t, false, frame.cmd);
-        const VkFramebuffer toScratch = target_.targetEffectFramebuffer(t, true, frame.cmd);
-        const VkDescriptorSet fromTarget = target_.targetSampler(t, false, frame.cmd);
-        const VkDescriptorSet fromScratch = target_.targetSampler(t, true, frame.cmd);
-        if (toTarget == VK_NULL_HANDLE || toScratch == VK_NULL_HANDLE
-            || fromTarget == VK_NULL_HANDLE || fromScratch == VK_NULL_HANDLE) return;
-        auto empty = [](const VkRect2D& r) { return r.extent.width == 0 || r.extent.height == 0; };
+        const auto target = targetTextures_[t], scratch = targetScratch(t);
+        if (!target || !scratch) return;
 
-        if (c.op == DrawOp::EffectKernel && postProcess_) {
-            const auto& bp = arena_.read<BlurParams>(c.dataOffset);
+        if (c.op == DrawOp::EffectKernel) {
+            const auto& bp = arena.read<BlurParams>(c.dataOffset);
             const auto R = roiFinal(bp.region, c.clipBounds);
             const float m = std::ceil(bp.radius * std::max(1.0f, bp.scale) * s) + 2.0f;
-            const VkRect2D scH = inPixels(R, s, 0.0f, m, e), scV = inPixels(R, s, 0.0f, 0.0f, e);
-            if (empty(scV)) return;
-            postProcess_->applyPass(frame.cmd, fromTarget, toScratch, rp, e, 1.0f, 0.0f, bp.radius * s, 0, &scH);
-            postProcess_->applyPass(frame.cmd, fromScratch, toTarget, rp, e, 0.0f, 1.0f, bp.radius * s, 0, &scV);
+            const gpu::IRect scH = inPixels(R, s, 0.0f, m, e), scV = inPixels(R, s, 0.0f, 0.0f, e);
+            if (scV.isEmpty()) return;
+            fullscreenPass("blur H", programs.blur, scratch, format, StencilTest::None,
+                           { bind(target) }, {}, effectConstants(e, 1.0f, 0.0f, bp.radius * s), scH, 0);
+            fullscreenPass("blur V", programs.blur, target, format, StencilTest::None,
+                           { bind(scratch) }, {}, effectConstants(e, 0.0f, 1.0f, bp.radius * s), scV, 0);
         }
-        else if (c.op == DrawOp::EffectHSV && hsvPipeline_) {
-            const auto& hp = arena_.read<HSVParams>(c.dataOffset);
-            const VkRect2D sc = inPixels(roiFinal(hp.region, c.clipBounds), s, 0.0f, 0.0f, e);
-            if (empty(sc)) return;
-            HSVPipeline::PushConstants pc {};
-            pc.scaleH = hp.scaleH; pc.scaleS = hp.scaleS; pc.scaleV = hp.scaleV;
-            pc.deltaH = hp.deltaH; pc.deltaS = hp.deltaS; pc.deltaV = hp.deltaV;
+        else if (c.op == DrawOp::EffectHSV) {
+            const auto& hp = arena.read<HSVParams>(c.dataOffset);
+            const gpu::IRect sc = inPixels(roiFinal(hp.region, c.clipBounds), s, 0.0f, 0.0f, e);
+            if (sc.isEmpty()) return;
+            HSVConstants k2;
+            k2.viewportW = (float) e.width; k2.viewportH = (float) e.height;
+            k2.scaleH = hp.scaleH; k2.scaleS = hp.scaleS; k2.scaleV = hp.scaleV;
+            k2.deltaH = hp.deltaH; k2.deltaS = hp.deltaS; k2.deltaV = hp.deltaV;
             copyTarget(t, true, sc);
-            hsvPipeline_->applyPass(frame.cmd, fromScratch, toTarget, rp, e, pc, 0, &sc);
+            fullscreenPass("hsv", programs.hsv, target, format, StencilTest::None,
+                           { bind(scratch) }, {}, builder_.pushConstants(k2), sc, 0);
         }
-        else if (c.op == DrawOp::BlurShape && shapeBlur_) {
-            const auto& sp = arena_.read<BlurShapeParams>(c.dataOffset);
-            ShapeBlurPipeline::PushConstants pc {};
+        else if (c.op == DrawOp::BlurShape) {
+            const auto& sp = arena.read<BlurShapeParams>(c.dataOffset);
+            ShapeBlurConstants pc;
+            pc.viewportW = (float) e.width; pc.viewportH = (float) e.height;
             // Frame px = target px / s: the inverse transform takes the target's pixels.
             pc.invCol0X = sp.invXform[0] / s; pc.invCol0Y = sp.invXform[1] / s;
             pc.invCol1X = sp.invXform[2] / s; pc.invCol1Y = sp.invXform[3] / s;
@@ -983,19 +957,26 @@ void Renderer::execute()
             pc.kernelType = sp.mode == 0 ? 0 : sp.mode == 1 ? 1 : 2;
             const auto R = roiFinal(sp.region, c.clipBounds);
             const float m = std::ceil(sp.maxRadius * pc.blurStep) + 2.0f;
-            const VkRect2D scR = inPixels(R, s, 0.0f, 0.0f, e);
-            if (empty(scR)) return;
+            const gpu::IRect scR = inPixels(R, s, 0.0f, 0.0f, e);
+            if (scR.isEmpty()) return;
             if (pc.kernelType == 0) {
-                shapeBlur_->applyPass(frame.cmd, fromTarget, toScratch, rp, e, inPixels(R, s, 0.0f, m, e), 1.0f, 0.0f, pc);
-                shapeBlur_->applyPass(frame.cmd, fromScratch, toTarget, rp, e, scR, 0.0f, 1.0f, pc);
+                pc.dirX = 1.0f; pc.dirY = 0.0f;
+                fullscreenPass("shape blur H", programs.shapeBlur, scratch, format, StencilTest::None,
+                               { bind(target) }, {}, builder_.pushConstants(pc), inPixels(R, s, 0.0f, m, e), 0);
+                pc.dirX = 0.0f; pc.dirY = 1.0f;
+                fullscreenPass("shape blur V", programs.shapeBlur, target, format, StencilTest::None,
+                               { bind(scratch) }, {}, builder_.pushConstants(pc), scR, 0);
             } else {
                 copyTarget(t, true, inPixels(R, s, m, m, e));
-                shapeBlur_->applyPass(frame.cmd, fromScratch, toTarget, rp, e, scR, 1.0f, 0.0f, pc);
+                pc.dirX = 1.0f; pc.dirY = 0.0f;
+                fullscreenPass("shape blur", programs.shapeBlur, target, format, StencilTest::None,
+                               { bind(scratch) }, {}, builder_.pushConstants(pc), scR, 0);
             }
         }
-        else if (c.op == DrawOp::BlurPath && pathBlur_ && pathPipeline_ && s == 1.0f) {
-            const auto& bp = arena_.read<BlurPathParams>(c.dataOffset);
-            PathBlurPipeline::PushConstants pc {};
+        else if (c.op == DrawOp::BlurPath && s == 1.0f) {
+            const auto& bp = arena.read<BlurPathParams>(c.dataOffset);
+            PathBlurConstants pc;
+            pc.viewportW = (float) e.width; pc.viewportH = (float) e.height;
             pc.maxRadius = bp.maxRadius;          pc.falloff = bp.falloff;
             pc.strokeHalfWidth = bp.strokeHalfWidth;
             pc.segmentStart = bp.segmentStart;    pc.segmentCount = bp.segmentCount;
@@ -1005,369 +986,242 @@ void Renderer::execute()
             pc.stripCount = bp.stripCount;        pc.stripMinY = bp.stripMinY;
             pc.invStripH = bp.invStripH;
             pc.kernelType = bp.mode == 0 ? 0 : bp.mode == 1 ? 1 : 2;
-            const VkDescriptorSet pathDesc = pathPipeline_->ssboDescriptorSet();
             const auto R = roiFinal(bp.region, c.clipBounds);
             const float m = std::ceil(bp.maxRadius) + 2.0f;
-            const VkRect2D scR = inPixels(R, 1.0f, 0.0f, 0.0f, e);
-            if (empty(scR)) return;
+            const gpu::IRect scR = inPixels(R, 1.0f, 0.0f, 0.0f, e);
+            if (scR.isEmpty()) return;
             if (pc.kernelType == 0) {
-                pathBlur_->applyPass(frame.cmd, fromTarget, pathDesc, toScratch, rp, e, inPixels(R, 1.0f, 0.0f, m, e), 1.0f, 0.0f, pc);
-                pathBlur_->applyPass(frame.cmd, fromScratch, pathDesc, toTarget, rp, e, scR, 0.0f, 1.0f, pc);
+                pc.dirX = 1.0f; pc.dirY = 0.0f;
+                fullscreenPass("path blur H", programs.pathBlur, scratch, format, StencilTest::None,
+                               { bind(target) }, { segments }, builder_.pushConstants(pc), inPixels(R, 1.0f, 0.0f, m, e), 0);
+                pc.dirX = 0.0f; pc.dirY = 1.0f;
+                fullscreenPass("path blur V", programs.pathBlur, target, format, StencilTest::None,
+                               { bind(scratch) }, { segments }, builder_.pushConstants(pc), scR, 0);
             } else {
                 copyTarget(t, true, inPixels(R, 1.0f, m, m, e));
-                pathBlur_->applyPass(frame.cmd, fromScratch, pathDesc, toTarget, rp, e, scR, 1.0f, 0.0f, pc);
+                pc.dirX = 1.0f; pc.dirY = 0.0f;
+                fullscreenPass("path blur", programs.pathBlur, target, format, StencilTest::None,
+                               { bind(scratch) }, { segments }, builder_.pushConstants(pc), scR, 0);
             }
         }
     };
 
-    // A scaled target an in-scene shader reads before any pass writes it this frame holds
-    // its clear value: cleared here, before the first scene pass, rather than by breaking
-    // the scene pass at the read (a pass that reads one clears it at its own boundary).
+    // ---- Scene draws ----------------------------------------------------------
+
+    // Binds the pipeline, constants and storage of a built-in scene draw.
+    // False (draw nothing) when its pipeline couldn't be made.
+    auto setPaint = [&](Paint kind, const DrawCommand& cmd) -> const PaintVariant* {
+        const auto* v = paintPipeline(kind, cmd.target, emitter_.stencilDepth() > 0, live);
+        if (v == nullptr) return nullptr;
+        emitter_.invalidate();
+        emitter_.setPipeline(v->id);
+        if (kind != Paint::Path)
+        {
+            PaintConstants k;
+            k.viewportW = fw; k.viewportH = fh;
+            k.paintsMain = v->paintsMain ? 1 : 0;
+            emitter_.setConstants(builder_.pushConstants(k));
+            if (kind == Paint::Noise) emitter_.setStorage({});
+            else                      emitter_.setStorage({ frameData });
+        }
+        return v;
+    };
+
+    // The pipeline of a clip draw: colour writes off on every scene attachment;
+    // the stencil compared EQUAL against the reference under `readMask` and
+    // `passOp` where it passes.
+    auto clipPipeline = [&](gpu::ProgramId program, gpu::StencilOp passOp, uint8_t readMask) {
+        gpu::PipelineDesc d;
+        d.program = program;
+        d.vertexLayout = uiVertexLayout();
+        d.attachments = sceneFormats();
+        for (uint32_t i = 0; i < d.attachments.colorCount; ++i)
+            d.blend[i] = gpu::BlendState::none();
+        d.stencil = { true, gpu::CompareOp::Equal, passOp, gpu::StencilOp::Keep, readMask, 0xFF };
+        return ctx.pipeline(d);
+    };
+
+    // Rasterizes a clip shape's cover quad (physical px) with `pipeline`:
+    // fragments the clip shader keeps apply the stencil op at `reference`.
+    auto coverQuad = [&](const DrawCommand& cmd, const juce::Rectangle<float>& coverRect, uint8_t reference) {
+        const float x = coverRect.getX(), y = coverRect.getY();
+        const float w = coverRect.getWidth(), h = coverRect.getHeight();
+        auto mkv = [](float px, float py) {
+            return UIVertex { glm::vec2 { px, py }, glm::vec4 { 0.0f }, glm::vec2 { 0.0f },
+                              glm::vec4 { 0.0f }, glm::vec4 { 0.0f } };
+        };
+        const UIVertex verts[6] = { mkv(x, y), mkv(x + w, y), mkv(x + w, y + h),
+                                    mkv(x, y), mkv(x + w, y + h), mkv(x, y + h) };
+        emitter_.draw(cmd, verts, 6, reference);
+    };
+
+    auto clipShape = [&](const DrawCommand& cmd, bool push) {
+        const auto& p = arena.read<ClipShapeParams>(cmd.dataOffset);
+        emitter_.invalidate();
+        if (p.shapeType == 3u)
+        {
+            // An image-alpha clip: the mask's alpha, at least one half, is inside.
+            if (!p.mask) return;
+            emitter_.setPipeline(clipPipeline(programs.clipMask,
+                push ? gpu::StencilOp::IncrementWrap : gpu::StencilOp::DecrementWrap, 0xFF));
+            emitter_.setResources(bind(p.mask), defaultBinding);
+            emitter_.setTextureCount(1);
+            ClipMaskConstants k;
+            k.viewportW = fw; k.viewportH = fh;
+            std::copy(std::begin(p.toMask), std::end(p.toMask), k.toMask);
+            k.maskW = p.maskW; k.maskH = p.maskH;
+            k.nearest = p.maskNearest;
+            emitter_.setConstants(builder_.pushConstants(k));
+            coverQuad(cmd, p.coverRect, cmd.stencilDepth);
+        }
+        else
+        {
+            emitter_.setPipeline(clipPipeline(programs.clip,
+                push ? gpu::StencilOp::IncrementWrap : gpu::StencilOp::DecrementWrap, 0xFF));
+            emitter_.setTextureCount(0);
+            emitter_.setStorage({ segments });
+            ClipConstants k;
+            k.viewportW = fw; k.viewportH = fh;
+            k.shapeType    = p.shapeType;
+            k.centerX      = p.centerX;      k.centerY = p.centerY;
+            k.halfW        = p.halfW;        k.halfH   = p.halfH;
+            k.cornerRadius = p.cornerRadius;
+            k.segmentStart = p.segmentStart; k.segmentCount = p.segmentCount;
+            k.fillRule     = p.fillRule;
+            k.stripCount   = p.stripCount;   k.stripMinY = p.stripMinY; k.invStripH = p.invStripH;
+            emitter_.setConstants(builder_.pushConstants(k));
+            coverQuad(cmd, p.coverRect, cmd.stencilDepth);
+        }
+        emitter_.invalidate();
+    };
+
+    // ---- The walk -------------------------------------------------------------
+
+    // Commands that run as passes of their own (each ends the scene pass if it's open).
+    auto runsOwnPass = [&](const DrawCommand& c) {
+        switch (c.op) {
+            case DrawOp::EffectKernel: case DrawOp::EffectHSV: case DrawOp::BlurShape: case DrawOp::BlurPath:
+                return true;
+            case DrawOp::DrawShader: {
+                const auto& sp = arena.read<DrawShaderParams>(c.dataOffset);
+                return sp.shaderIndex == ~0u || !sp.inScene;
+            }
+            default:
+                return false;
+        }
+    };
+
+    // A scaled target an in-scene shader reads before any pass writes it this
+    // frame holds its clear value: cleared before the first scene pass, rather
+    // than by breaking the scene pass at the read (a pass that reads one
+    // clears it at its own boundary).
     {
         TargetMask writtenAhead = 0, preclear = 0;
-        for (const auto& c : commands_) {
+        for (const auto& c : commands) {
             if (c.op != DrawOp::DrawShader) continue;
-            const auto& sp = arena_.read<DrawShaderParams>(c.dataOffset);
-            if (sp.shader == nullptr) continue;
+            const auto& sp = arena.read<DrawShaderParams>(c.dataOffset);
+            if (sp.shaderIndex == ~0u) continue;
             if (sp.inScene) preclear     |= sp.targetsRead & scaled & static_cast<TargetMask>(~writtenAhead);
             else            writtenAhead |= sp.targetsWritten & scaled;
         }
         clearScaled(preclear);
     }
 
-    beginSceneRP(/*withClears=*/true, 0);
-    state_.begin(frame.cmd, vertices_,
-        static_cast<float>(frame.extent.width),
-        static_cast<float>(frame.extent.height));
+    beginScene(/*withClears=*/true, 0);
 
-    for (size_t k = 0; k < commands_.size(); ++k) {
-        const auto& cmd = commands_[k];
-        replayLive_ = liveTargets(k);
+    for (size_t k = 0; k < commands.size(); ++k) {
+        const auto& cmd = commands[k];
+        live = recorder_.liveTargets(k);
         // A draw INTO a target nothing reads from here on is a dead store.
         // (Clip ops keep the stencil balanced whatever the target — a missing
         // one included, kNoTarget: tested before the shift; a shader draw
         // writes the locations its shader declares, judged below.)
-        if (cmd.target > 0 && !isClipOp(cmd.op) && cmd.op != DrawOp::DrawShader
-            && cmd.target != kNoTarget && (replayLive_ & (1u << (cmd.target - 1))) == 0)
+        if (cmd.target > 0 && !Recorder::isClipOp(cmd.op) && cmd.op != DrawOp::DrawShader
+            && cmd.target != kNoTarget && (live & (1u << (cmd.target - 1))) == 0)
             continue;
-        // A shader inside the scene pass that reads a scaled target before its first write
-        // this frame: that target is cleared first, outside any render pass.
+        // A shader inside the scene pass that reads a scaled target before its
+        // first write this frame: that target is cleared first.
         if (cmd.op == DrawOp::DrawShader) {
-            const auto& sp = arena_.read<DrawShaderParams>(cmd.dataOffset);
+            const auto& sp = arena.read<DrawShaderParams>(cmd.dataOffset);
             if (sp.inScene && (sp.targetsRead & scaled & static_cast<TargetMask>(~scaledWritten)) != 0) {
                 endScene();
                 clearScaled(sp.targetsRead);
             }
         }
         if (!sceneOpen && !runsOwnPass(cmd))
-            beginSceneRP(/*withClears=*/false, k);
-        if (cmd.target > 0 && isPassEffect(cmd.op)) {
+            beginScene(/*withClears=*/false, k);
+        if (cmd.target > 0 && cmd.target != kNoTarget && Recorder::isPassEffect(cmd.op)) {
             targetEffect(cmd, k);
             continue;
         }
-        if (cmd.op == DrawOp::EffectKernel) {
-            // Separable Gaussian blur, ROI-walked: V (last) outputs the
-            // final region R, so H must output R padded by V's VERTICAL
-            // apron; H's own horizontal apron reads the true scene (always
-            // valid). Two swaps land `cur` back on the starting half, so
-            // pixels outside R keep the original scene untouched.
-            if (postProcess_) {
-                auto& bp = arena_.read<BlurParams>(cmd.dataOffset);
+
+        switch (cmd.op)
+        {
+            case DrawOp::EffectKernel: {
+                // Separable Gaussian blur, ROI-walked: V (last) outputs the final
+                // region R, so H must output R padded by V's VERTICAL apron; H's
+                // own horizontal apron reads the true scene (always valid). Two
+                // swaps land `cur` back on the starting half, so pixels outside
+                // R keep the original scene untouched.
+                const auto& bp = arena.read<BlurParams>(cmd.dataOffset);
                 const auto R = roiFinal(bp.region, cmd.clipBounds);
-                if (R.isEmpty()) continue;
+                if (R.isEmpty()) break;
                 const float m = std::ceil(bp.radius * std::max(1.0f, bp.scale)) + 2.0f;
-                const VkRect2D scH = roiScissor(R, 0.0f, m);
-                const VkRect2D scV = roiScissor(R, 0.0f, 0.0f);
-
+                const gpu::IRect scH = roiScissor(R, 0.0f, m);
+                const gpu::IRect scV = roiScissor(R, 0.0f, 0.0f);
                 endScene();
-                // Seed the intermediate half's outside-clip pixels within
-                // H's scissor (V's taps cross the clip edge and read them).
-                preCopyIfClipped(cmd.stencilDepth, &scH);
-                effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                    postProcess_->applyPass(frame.cmd, src, dst,
-                        target_.effectRenderPass(), frame.extent,
-                        1.0f, 0.0f, bp.radius,
-                        static_cast<uint32_t>(cmd.stencilDepth), &scH);
+                // Seed the intermediate half's outside-clip pixels within H's
+                // scissor (V's taps cross the clip edge and read them).
+                preCopyIfClipped(cmd.stencilDepth, scH);
+                effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) {
+                    fullscreenPass("blur H", programs.blur, dst, kSceneFormat, StencilTest::Inside,
+                                   { bind(src) }, {}, effectConstants(fe, 1.0f, 0.0f, bp.radius), scH, cmd.stencilDepth);
                 });
-                effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                    postProcess_->applyPass(frame.cmd, src, dst,
-                        target_.effectRenderPass(), frame.extent,
-                        0.0f, 1.0f, bp.radius,
-                        static_cast<uint32_t>(cmd.stencilDepth), &scV);
+                effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) {
+                    fullscreenPass("blur V", programs.blur, dst, kSceneFormat, StencilTest::Inside,
+                                   { bind(src) }, {}, effectConstants(fe, 0.0f, 1.0f, bp.radius), scV, cmd.stencilDepth);
                 });
+                break;
             }
-            continue;
-        }
-        if (cmd.op == DrawOp::PushClipRect) {
-            // cmd.clipBounds is already the pixel-space intersection of the
-            // new rect and the existing clip stack (computed at record
-            // time in Graphics::clipToRectangle). State tracks this as the
-            // current scissor bounds.
-            state_.pushClipRect(cmd.clipBounds);
-            continue;
-        }
-        if (cmd.op == DrawOp::PopClipRect) {
-            state_.popClipRect();
-            continue;
-        }
-        if (cmd.op == DrawOp::PushClipPath) {
-            // Analytical-SDF clip push — fragment shader discards outside the
-            // clip shape, stencil INCR_WRAP where inside at stencil == parentDepth.
-            // An image-alpha clip (shape 3) runs ClipPipeline's mask pair.
-            if (clipPipeline_ && pathPipeline_) {
-                auto& p = arena_.read<ClipShapeParams>(cmd.dataOffset);
-                ClipPipeline::PushConstants pc {};
-                pc.shapeType    = p.shapeType;
-                pc.centerX      = p.centerX;
-                pc.centerY      = p.centerY;
-                pc.halfW        = p.halfW;
-                pc.halfH        = p.halfH;
-                pc.cornerRadius = p.cornerRadius;
-                pc.segmentStart = p.segmentStart;
-                pc.segmentCount = p.segmentCount;
-                pc.fillRule     = p.fillRule;
-                pc.stripCount   = p.stripCount;
-                pc.stripMinY    = p.stripMinY;
-                pc.invStripH    = p.invStripH;
-                if (p.shapeType == 3u)
-                    clipPipeline_->pushMask(state_, frame.cmd, cmd, p,
-                        static_cast<uint32_t>(cmd.stencilDepth),
-                        static_cast<float>(frame.extent.width),
-                        static_cast<float>(frame.extent.height));
-                else
-                    clipPipeline_->pushClip(state_, frame.cmd, *this, cmd,
-                        pc, p.coverRect,
-                        pathPipeline_->ssboDescriptorSet(),
-                        static_cast<uint32_t>(cmd.stencilDepth),
-                        static_cast<float>(frame.extent.width),
-                        static_cast<float>(frame.extent.height));
-            }
-            state_.pushStencilDepth();
-            continue;
-        }
-        if (cmd.op == DrawOp::PopClipPath) {
-            // Analytical-SDF clip pop — DECR_WRAP at stencil == currentDepth
-            // (before the CPU decrement). cmd.stencilDepth here is the depth
-            // one level DEEPER than parent (i.e. the push's target depth),
-            // so stencil == that value is exactly what the INCR produced.
-            if (clipPipeline_ && pathPipeline_) {
-                auto& p = arena_.read<ClipShapeParams>(cmd.dataOffset);
-                ClipPipeline::PushConstants pc {};
-                pc.shapeType    = p.shapeType;
-                pc.centerX      = p.centerX;
-                pc.centerY      = p.centerY;
-                pc.halfW        = p.halfW;
-                pc.halfH        = p.halfH;
-                pc.cornerRadius = p.cornerRadius;
-                pc.segmentStart = p.segmentStart;
-                pc.segmentCount = p.segmentCount;
-                pc.fillRule     = p.fillRule;
-                pc.stripCount   = p.stripCount;
-                pc.stripMinY    = p.stripMinY;
-                pc.invStripH    = p.invStripH;
-                if (p.shapeType == 3u)
-                    clipPipeline_->popMask(state_, frame.cmd, cmd, p,
-                        static_cast<uint32_t>(cmd.stencilDepth),
-                        static_cast<float>(frame.extent.width),
-                        static_cast<float>(frame.extent.height));
-                else
-                    clipPipeline_->popClip(state_, frame.cmd, *this, cmd,
-                        pc, p.coverRect,
-                        pathPipeline_->ssboDescriptorSet(),
-                        static_cast<uint32_t>(cmd.stencilDepth),
-                        static_cast<float>(frame.extent.width),
-                        static_cast<float>(frame.extent.height));
-            }
-            state_.popStencilDepth();
-            continue;
-        }
-        if (cmd.op == DrawOp::ExcludeClipRect
-            || cmd.op == DrawOp::RestoreClipExclude) {
-            // excludeClipRectangle: stencil-park the rect's drawable pixels
-            // out of the current depth (see ClipPipeline's exclusion
-            // variant). Park ref = 192 + depth, un-park ref = depth; the
-            // CPU-side stencilDepth is untouched — draws keep testing
-            // EQUAL(depth) and simply fail inside the parked rect.
-            if (clipPipeline_ && pathPipeline_) {
-                auto& p = arena_.read<ExcludeRectParams>(cmd.dataOffset);
-                ClipPipeline::PushConstants pc {};
-                pc.shapeType    = 1;   // rect = rrect with radius 0
-                pc.centerX      = p.rect.getCentreX();
-                pc.centerY      = p.rect.getCentreY();
-                pc.halfW        = p.rect.getWidth()  * 0.5f;
-                pc.halfH        = p.rect.getHeight() * 0.5f;
-                pc.cornerRadius = 0.0f;
-                const uint32_t depth = static_cast<uint32_t>(cmd.stencilDepth);
-                const uint32_t ref   = cmd.op == DrawOp::ExcludeClipRect
-                                           ? 192u + depth : depth;
-                clipPipeline_->excludeRect(state_, frame.cmd, *this, cmd,
-                    pc, p.rect,
-                    pathPipeline_->ssboDescriptorSet(),
-                    ref,
-                    static_cast<float>(frame.extent.width),
-                    static_cast<float>(frame.extent.height));
-            }
-            continue;
-        }
-        if (cmd.op == DrawOp::FillPath) {
-            // Analytical SDF path fill — dispatched via PathPipeline which
-            // owns the segment storage buffer + the SDF fragment shader.
-            // Stays inside the scene render pass (no RP transitions).
-            if (pathPipeline_) {
-                auto& p    = arena_.read<FillPathParams>(cmd.dataOffset);
-                auto& fill = getFill(p.fillIndex);
-                // The per-tile UIVertex span sits right after the params in
-                // the arena, 4-byte aligned (Graphics::fillPath pushed it).
-                uint32_t vertsOff =
-                    (cmd.dataOffset + static_cast<uint32_t>(sizeof(FillPathParams)) + 3u) & ~3u;
-                auto verts = arena_.readSpan<UIVertex>(vertsOff, p.vertexCount);
-                // Colour source descriptor — matches the ColorPipeline pattern
-                // (a tiled image fill's texture, the gradient atlas row for
-                // gradient fills, 1x1 default for solids). path_sdf.frag
-                // samples it iff gradientInfo.z > 0.
-                const auto& texture = getFillTexture(p.fillIndex);
-                VkDescriptorSet colorDesc =
-                    texture.desc != VK_NULL_HANDLE ? texture.desc
-                    : (fill.isGradient() && fill.gradient)
-                        ? gradientDescriptor()
-                        : caches().defaultDescriptor();
-                pathPipeline_->dispatch(state_, frame.cmd, *this, cmd,
-                    verts.data(), p.vertexCount,
-                    p.segmentStart, p.fillRule,
-                    colorDesc,
-                    static_cast<float>(frame.extent.width),
-                    static_cast<float>(frame.extent.height),
-                    p.tileSize);
-            }
-            continue;
-        }
-        if (cmd.op == DrawOp::DrawShader) {
-            // Inside the scene pass when it can be (DrawShaderParams::inScene): one fullscreen
-            // triangle against the current scene framebuffer, no pass boundary. Otherwise a
-            // pass of its own attached to what it writes (the graph's passes above): targets
-            // alone, the main colour with targets, or the main colour alone — a scene reader
-            // (it REPLACES its region, ping-ponged like EffectHSV) or a target reader (blended
-            // Over the current half in place). One whose writes nothing reads is skipped.
-            if (shaderPipeline_) {
-                auto& sp = arena_.read<DrawShaderParams>(cmd.dataOffset);
-                auto* shader = static_cast<Shader*>(sp.shader);
-                const float fw = static_cast<float>(frame.extent.width);
-                const float fh = static_cast<float>(frame.extent.height);
-                if (shader == nullptr)
-                    continue;
-                if (sp.inScene) {
-                    if (sp.writesMain || (sp.targetsWritten & replayLive_) != 0)
-                        shaderPipeline_->dispatch(state_, frame.cmd, *shader,
-                            sp.region, fw, fh,
-                            cmd.clipBounds,
-                            cmd.stencilDepth,
-                            frameTime,
-                            frame.frameSlot,
-                            { sp.constants, sp.constantCount }, { sp.images, sp.imageCount });
-                }
-                else if (!sp.writesMain) {
-                    if ((sp.targetsWritten & liveTargets(k + 1)) != 0)
-                        targetPass(cmd, sp, *shader);
-                }
-                else if (sp.targetsWritten != 0) {
-                    mainPass(cmd, sp, *shader);
-                }
-                else if (shader->readsScene()) {
-                    // A SCENE READER (it may read targets too): a non-separable
-                    // effect, ROI-walked like EffectHSV. One region pass samples
-                    // the current half as its `scene` and REPLACES the region in
-                    // the other; a partial region is copied back so the chain
-                    // ends on the starting half.
-                    const auto R = roiFinal(sp.region, cmd.clipBounds);
-                    if (R.isEmpty()) continue;
-                    const VkRect2D sc = roiScissor(R, 0.0f, 0.0f);
-                    if (!coversFrame(sc) && hsvPipeline_ == nullptr) continue;   // no copy back possible
-                    auto pass = [&](VkDescriptorSet src, VkFramebuffer dst) {
-                        VkRenderPassBeginInfo rpbi {};
-                        rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-                        rpbi.renderPass = target_.effectRenderPass();
-                        rpbi.framebuffer = dst;
-                        rpbi.renderArea.extent = frame.extent;
-                        vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-                        shaderPipeline_->dispatchPass(frame.cmd, *shader, sp.region, fw, fh,
-                            cmd.clipBounds, cmd.stencilDepth, frameTime, frame.frameSlot,
-                            { sp.constants, sp.constantCount }, { sp.images, sp.imageCount }, src);
-                        vkCmdEndRenderPass(frame.cmd);
-                    };
-                    endScene();
-                    clearScaled(sp.targetsRead);
-                    if (coversFrame(sc)) {
-                        preCopyIfClipped(cmd.stencilDepth, &sc);
-                        effectPassAndSwap(pass);
-                    } else {
-                        effectPassAndSwap(pass);
-                        copyBackAndSwap(sc, cmd.stencilDepth);
-                    }
-                }
-                else {
-                    // A TARGET READER writing the main colour alone, blended Over
-                    // the current half in place.
-                    endScene();
-                    clearScaled(sp.targetsRead);
-                    VkRenderPassBeginInfo rpbi {};
-                    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-                    rpbi.renderPass = target_.effectRenderPass();
-                    rpbi.framebuffer = pp[cur].effectFB;
-                    rpbi.renderArea.extent = frame.extent;
-                    vkCmdBeginRenderPass(frame.cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-                    shaderPipeline_->dispatchPass(frame.cmd, *shader, sp.region, fw, fh,
-                        cmd.clipBounds, cmd.stencilDepth, frameTime, frame.frameSlot,
-                        { sp.constants, sp.constantCount }, { sp.images, sp.imageCount });
-                    vkCmdEndRenderPass(frame.cmd);
-                }
-            }
-            continue;
-        }
-        if (cmd.op == DrawOp::EffectHSV) {
-            // Non-separable HSV, ROI-walked: one region-bounded transform
-            // pass + one region-bounded identity copy-back so the chain ends
-            // on the starting half. No pre-copy at all — outside-clip and
-            // outside-region pixels of the original half are simply never
-            // written (the old path paid a FULL-SCREEN pre-copy + full-
-            // screen transform for a saturate on one strip).
-            if (hsvPipeline_) {
-                auto& hp = arena_.read<HSVParams>(cmd.dataOffset);
-                const auto R = roiFinal(hp.region, cmd.clipBounds);
-                if (R.isEmpty()) continue;
-                const VkRect2D sc = roiScissor(R, 0.0f, 0.0f);
 
-                HSVPipeline::PushConstants pc {};
+            case DrawOp::EffectHSV: {
+                // Non-separable HSV, ROI-walked: one region-bounded transform pass
+                // + one region-bounded identity copy-back so the chain ends on the
+                // starting half. No pre-copy: outside-clip and outside-region
+                // pixels of the original half are simply never written.
+                const auto& hp = arena.read<HSVParams>(cmd.dataOffset);
+                const auto R = roiFinal(hp.region, cmd.clipBounds);
+                if (R.isEmpty()) break;
+                const gpu::IRect sc = roiScissor(R, 0.0f, 0.0f);
+                HSVConstants pc;
+                pc.viewportW = fw; pc.viewportH = fh;
                 pc.scaleH = hp.scaleH; pc.scaleS = hp.scaleS; pc.scaleV = hp.scaleV;
                 pc.deltaH = hp.deltaH; pc.deltaS = hp.deltaS; pc.deltaV = hp.deltaV;
-
+                const auto constants = builder_.pushConstants(pc);
                 endScene();
                 if (coversFrame(sc)) {
-                    // Full-window transform: ONE pass, single swap (the old
-                    // cost). Pre-copy seeds outside-clip pixels when clipped.
-                    preCopyIfClipped(cmd.stencilDepth, &sc);
-                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        hsvPipeline_->applyPass(frame.cmd, src, dst,
-                            target_.effectRenderPass(), frame.extent, pc,
-                            static_cast<uint32_t>(cmd.stencilDepth), &sc);
+                    // Full-window transform: ONE pass, single swap. Pre-copy
+                    // seeds outside-clip pixels when clipped.
+                    preCopyIfClipped(cmd.stencilDepth, sc);
+                    effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) {
+                        fullscreenPass("hsv", programs.hsv, dst, kSceneFormat, StencilTest::Inside,
+                                       { bind(src) }, {}, constants, sc, cmd.stencilDepth);
                     });
                 } else {
-                    // Partial region: region pass + region copy-back — still
-                    // far cheaper than the old full-screen passes.
-                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        hsvPipeline_->applyPass(frame.cmd, src, dst,
-                            target_.effectRenderPass(), frame.extent, pc,
-                            static_cast<uint32_t>(cmd.stencilDepth), &sc);
+                    // Partial region: region pass + region copy-back.
+                    effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) {
+                        fullscreenPass("hsv", programs.hsv, dst, kSceneFormat, StencilTest::Inside,
+                                       { bind(src) }, {}, constants, sc, cmd.stencilDepth);
                     });
                     copyBackAndSwap(sc, cmd.stencilDepth);
                 }
+                break;
             }
-            continue;
-        }
-        if (cmd.op == DrawOp::BlurShape) {
-            if (shapeBlur_ && hsvPipeline_) {
-                auto& sp = arena_.read<BlurShapeParams>(cmd.dataOffset);
 
-                ShapeBlurPipeline::PushConstants pc {};
+            case DrawOp::BlurShape: {
+                const auto& sp = arena.read<BlurShapeParams>(cmd.dataOffset);
+                ShapeBlurConstants pc;
+                pc.viewportW = fw; pc.viewportH = fh;
                 pc.invCol0X = sp.invXform[0]; pc.invCol0Y = sp.invXform[1];
                 pc.invCol1X = sp.invXform[2]; pc.invCol1Y = sp.invXform[3];
                 pc.invCol2X = sp.invXform[4]; pc.invCol2Y = sp.invXform[5];
@@ -1383,81 +1237,58 @@ void Renderer::execute()
                 pc.shapeType     = static_cast<int>(sp.shapeType);
                 pc.edgePlacement = static_cast<int>(sp.edgePlacement);
                 pc.inverted      = static_cast<int>(sp.inverted);
-
-                VkRenderPass rp = target_.effectRenderPass();
-                // mode: 0 (Low)    → 2 separable passes (H, V). The V pass
-                //                    gates each tap by the TAP's own radius
-                //                    (see shape_blur.frag) so low-radius
-                //                    falloff rows can't streak sharp content
-                //                    into the interior — the classic
-                //                    variable-radius separability error.
-                //       1 (Medium) → 1 pass, 32-tap Poisson-disc blue-noise
-                //                    kernel. Constant cost regardless of
-                //                    radius. No streaks — anisotropic noise
-                //                    reads as stochastic texture, not a
-                //                    directional smear.
-                //       2 (High)   → 1 pass, true 2D Gaussian using the 2D
-                //                    Linear Sampling Trick (¼ the taps of a
-                //                    naïve N² loop, mathematically exact).
-                //                    No streaks.
-                //
-                // Medium + High both read the scene source directly; only
-                // one tile-resolve. For small-N blurs this can beat Low.
-                const int32_t kt = (sp.mode == 0) ? 0
-                                 : (sp.mode == 1) ? 1 : 2;
+                // mode: 0 (Low)    → 2 separable passes (H, V). The V pass gates
+                //                    each tap by the TAP's own radius (see
+                //                    shape_blur.frag) so low-radius falloff rows
+                //                    can't streak sharp content into the interior.
+                //       1 (Medium) → 1 pass, 32-tap Poisson-disc kernel.
+                //       2 (High)   → 1 pass, true 2D Gaussian (Linear Sampling
+                //                    Trick: ¼ the taps of a naïve N² loop).
+                // Medium + High both read the scene source directly.
+                const int32_t kt = (sp.mode == 0) ? 0 : (sp.mode == 1) ? 1 : 2;
                 pc.kernelType = kt;
 
                 // ROI: record side computed the shape's blur AABB (empty for
                 // inverted = whole clip). Kernel apron in physical px.
                 const auto R = roiFinal(sp.region, cmd.clipBounds);
-                if (R.isEmpty()) continue;
+                if (R.isEmpty()) break;
                 const float m = std::ceil(sp.maxRadius * sp.blurStep) + 2.0f;
-                const VkRect2D scR = roiScissor(R, 0.0f, 0.0f);
+                const gpu::IRect scR = roiScissor(R, 0.0f, 0.0f);
 
                 endScene();
+                auto blurPass = [&](const char* label, float dirX, float dirY, const gpu::IRect& sc) {
+                    pc.dirX = dirX; pc.dirY = dirY;
+                    const auto constants = builder_.pushConstants(pc);
+                    effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) {
+                        fullscreenPass(label, programs.shapeBlur, dst, kSceneFormat, StencilTest::Inside,
+                                       { bind(src) }, {}, constants, sc, cmd.stencilDepth);
+                    });
+                };
                 if (kt == 0) {
-                    // Separable H then V — V's vertical apron dictates H's
-                    // output rect; two swaps land back on the start half.
-                    const VkRect2D scH = roiScissor(R, 0.0f, m);
-                    preCopyIfClipped(cmd.stencilDepth, &scH);
-                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        shapeBlur_->applyPass(frame.cmd, src, dst, rp,
-                            frame.extent, scH, 1.0f, 0.0f, pc,
-                            static_cast<uint32_t>(cmd.stencilDepth));
-                    });
-                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        shapeBlur_->applyPass(frame.cmd, src, dst, rp,
-                            frame.extent, scR, 0.0f, 1.0f, pc,
-                            static_cast<uint32_t>(cmd.stencilDepth));
-                    });
+                    // Separable H then V — V's vertical apron dictates H's output
+                    // rect; two swaps land back on the start half.
+                    const gpu::IRect scH = roiScissor(R, 0.0f, m);
+                    preCopyIfClipped(cmd.stencilDepth, scH);
+                    blurPass("shape blur H", 1.0f, 0.0f, scH);
+                    blurPass("shape blur V", 0.0f, 1.0f, scR);
                 } else if (coversFrame(scR)) {
-                    // Full-window 2D kernel (inverted blurs land here): one
-                    // pass, single swap — the old cost.
-                    preCopyIfClipped(cmd.stencilDepth, &scR);
-                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        shapeBlur_->applyPass(frame.cmd, src, dst, rp,
-                            frame.extent, scR, 1.0f, 0.0f, pc,
-                            static_cast<uint32_t>(cmd.stencilDepth));
-                    });
+                    // Full-window 2D kernel (inverted blurs land here): one pass,
+                    // single swap.
+                    preCopyIfClipped(cmd.stencilDepth, scR);
+                    blurPass("shape blur", 1.0f, 0.0f, scR);
                 } else {
-                    // 2D kernel, partial region: one region pass reading the
-                    // true scene (taps beyond R are always valid) + region
-                    // copy-back.
-                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        shapeBlur_->applyPass(frame.cmd, src, dst, rp,
-                            frame.extent, scR, 1.0f, 0.0f, pc,
-                            static_cast<uint32_t>(cmd.stencilDepth));
-                    });
+                    // 2D kernel, partial region: one region pass reading the true
+                    // scene (taps beyond R are always valid) + region copy-back.
+                    blurPass("shape blur", 1.0f, 0.0f, scR);
                     copyBackAndSwap(scR, cmd.stencilDepth);
                 }
+                break;
             }
-            continue;
-        }
-        if (cmd.op == DrawOp::BlurPath) {
-            if (pathBlur_ && pathPipeline_ && hsvPipeline_) {
-                auto& bp = arena_.read<BlurPathParams>(cmd.dataOffset);
 
-                PathBlurPipeline::PushConstants pc {};
+            case DrawOp::BlurPath: {
+                const auto& bp = arena.read<BlurPathParams>(cmd.dataOffset);
+                PathBlurConstants pc;
+                pc.viewportW = fw; pc.viewportH = fh;
                 pc.maxRadius       = bp.maxRadius;
                 pc.falloff         = bp.falloff;
                 pc.strokeHalfWidth = bp.strokeHalfWidth;
@@ -1469,378 +1300,204 @@ void Renderer::execute()
                 pc.stripCount      = bp.stripCount;
                 pc.stripMinY       = bp.stripMinY;
                 pc.invStripH       = bp.invStripH;
-
-                // PathPipeline::ssboDescriptorSet() returns the descriptor
-                // for the CURRENT frame slot (set by the most recent
-                // flushToGPU in execute's prologue). That's the slot whose
-                // SSBO holds this frame's segments — including those we
-                // uploaded in Graphics::{draw,fill}BlurredPath.
-                VkDescriptorSet pathDesc = pathPipeline_->ssboDescriptorSet();
-
-                VkRenderPass rp = target_.effectRenderPass();
-                // Same mode layout + ROI walk as BlurShape above. Distances
-                // here are already physical px.
-                const int32_t kt = (bp.mode == 0) ? 0
-                                 : (bp.mode == 1) ? 1 : 2;
+                // Same mode layout + ROI walk as BlurShape above. Distances here
+                // are already physical px.
+                const int32_t kt = (bp.mode == 0) ? 0 : (bp.mode == 1) ? 1 : 2;
                 pc.kernelType = kt;
 
                 const auto R = roiFinal(bp.region, cmd.clipBounds);
-                if (R.isEmpty()) continue;
+                if (R.isEmpty()) break;
                 const float m = std::ceil(bp.maxRadius) + 2.0f;
-                const VkRect2D scR = roiScissor(R, 0.0f, 0.0f);
+                const gpu::IRect scR = roiScissor(R, 0.0f, 0.0f);
 
                 endScene();
+                auto blurPass = [&](const char* label, float dirX, float dirY, const gpu::IRect& sc) {
+                    pc.dirX = dirX; pc.dirY = dirY;
+                    const auto constants = builder_.pushConstants(pc);
+                    effectPassAndSwap([&](gpu::TextureId src, gpu::TextureId dst) {
+                        fullscreenPass(label, programs.pathBlur, dst, kSceneFormat, StencilTest::Inside,
+                                       { bind(src) }, { segments }, constants, sc, cmd.stencilDepth);
+                    });
+                };
                 if (kt == 0) {
-                    const VkRect2D scH = roiScissor(R, 0.0f, m);
-                    preCopyIfClipped(cmd.stencilDepth, &scH);
-                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        pathBlur_->applyPass(frame.cmd, src, pathDesc, dst, rp,
-                            frame.extent, scH, 1.0f, 0.0f, pc,
-                            static_cast<uint32_t>(cmd.stencilDepth));
-                    });
-                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        pathBlur_->applyPass(frame.cmd, src, pathDesc, dst, rp,
-                            frame.extent, scR, 0.0f, 1.0f, pc,
-                            static_cast<uint32_t>(cmd.stencilDepth));
-                    });
+                    const gpu::IRect scH = roiScissor(R, 0.0f, m);
+                    preCopyIfClipped(cmd.stencilDepth, scH);
+                    blurPass("path blur H", 1.0f, 0.0f, scH);
+                    blurPass("path blur V", 0.0f, 1.0f, scR);
                 } else if (coversFrame(scR)) {
-                    preCopyIfClipped(cmd.stencilDepth, &scR);
-                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        pathBlur_->applyPass(frame.cmd, src, pathDesc, dst, rp,
-                            frame.extent, scR, 1.0f, 0.0f, pc,
-                            static_cast<uint32_t>(cmd.stencilDepth));
-                    });
+                    preCopyIfClipped(cmd.stencilDepth, scR);
+                    blurPass("path blur", 1.0f, 0.0f, scR);
                 } else {
-                    effectPassAndSwap([&](VkDescriptorSet src, VkFramebuffer dst) {
-                        pathBlur_->applyPass(frame.cmd, src, pathDesc, dst, rp,
-                            frame.extent, scR, 1.0f, 0.0f, pc,
-                            static_cast<uint32_t>(cmd.stencilDepth));
-                    });
+                    blurPass("path blur", 1.0f, 0.0f, scR);
                     copyBackAndSwap(scR, cmd.stencilDepth);
                 }
+                break;
             }
-            continue;
+
+            case DrawOp::PushClipRect:
+                // cmd.clipBounds is already the pixel-space intersection of the
+                // new rect and the existing clip stack (computed at record time
+                // in Graphics::clipToRectangle): the emitter's scissor bounds.
+                emitter_.pushClipRect(cmd.clipBounds);
+                break;
+
+            case DrawOp::PopClipRect:
+                emitter_.popClipRect();
+                break;
+
+            case DrawOp::PushClipPath:
+                // Analytical-SDF clip push — the fragment shader discards outside
+                // the clip shape, stencil INCR_WRAP where inside at stencil ==
+                // parentDepth. An image-alpha clip (shape 3) runs the mask program.
+                clipShape(cmd, true);
+                emitter_.pushStencilDepth();
+                break;
+
+            case DrawOp::PopClipPath:
+                // Analytical-SDF clip pop — DECR_WRAP at stencil == currentDepth
+                // (before the decrement). cmd.stencilDepth here is the depth one
+                // level DEEPER than parent (i.e. the push's target depth), so
+                // stencil == that value is exactly what the INCR produced.
+                clipShape(cmd, false);
+                emitter_.popStencilDepth();
+                break;
+
+            case DrawOp::ExcludeClipRect:
+            case DrawOp::RestoreClipExclude: {
+                // excludeClipRectangle: stencil-park the rect's drawable pixels
+                // out of the current depth. REPLACE with the low six bits masked
+                // out of the COMPARE. Park: reference = 192 + depth matches pixels
+                // whose (value & 0x3F) == depth — exactly the pixels drawable at
+                // that depth — and REPLACE writes the full 192 + depth, making
+                // them fail the draws' EQUAL(depth) test. Un-park: reference =
+                // depth matches the same low bits, REPLACE writes depth back.
+                // Nested clips can't touch parked pixels (their EQUAL refs never
+                // match 192 + d), so exclusions survive any push/pop ordering.
+                // Requires clip depth < 64 — depths that deep are pathological.
+                const auto& p = arena.read<ExcludeRectParams>(cmd.dataOffset);
+                const auto depth = static_cast<uint8_t>(cmd.stencilDepth);
+                const auto ref = static_cast<uint8_t>(cmd.op == DrawOp::ExcludeClipRect ? 192u + depth : depth);
+                emitter_.invalidate();
+                emitter_.setPipeline(clipPipeline(programs.clip, gpu::StencilOp::Replace, 0x3F));
+                emitter_.setTextureCount(0);
+                emitter_.setStorage({ segments });
+                ClipConstants k;
+                k.viewportW = fw; k.viewportH = fh;
+                k.shapeType    = 1;   // rect = rrect with radius 0
+                k.centerX      = p.rect.getCentreX();
+                k.centerY      = p.rect.getCentreY();
+                k.halfW        = p.rect.getWidth()  * 0.5f;
+                k.halfH        = p.rect.getHeight() * 0.5f;
+                emitter_.setConstants(builder_.pushConstants(k));
+                coverQuad(cmd, p.rect, ref);
+                emitter_.invalidate();
+                break;
+            }
+
+            case DrawOp::FillPath: {
+                // Analytical SDF path fill — tile quads into the scene pass.
+                const auto* v = paintPipeline(Paint::Path, cmd.target, emitter_.stencilDepth() > 0, live);
+                if (v == nullptr) break;
+                const auto& p = arena.read<FillPathParams>(cmd.dataOffset);
+                const auto& fill = recorder_.getFill(p.fillIndex);
+                // The per-tile UIVertex span sits right after the params in the
+                // arena, 4-byte aligned (Graphics::fillPath pushed it).
+                const uint32_t vertsOff =
+                    (cmd.dataOffset + static_cast<uint32_t>(sizeof(FillPathParams)) + 3u) & ~3u;
+                const auto verts = arena.readSpan<UIVertex>(vertsOff, p.vertexCount);
+                // Colour source — a tiled image fill's texture, the gradient
+                // atlas for gradient fills, the default for solids.
+                // path_sdf.frag samples it iff gradientInfo.z > 0.
+                const auto& fillTexture = recorder_.getFillTexture(p.fillIndex);
+                const gpu::TextureId colour =
+                    fillTexture.texture ? fillTexture.texture
+                    : (fill.isGradient() && fill.gradient) ? gradientAtlas_.texture()
+                    : ctx.defaultTexture();
+                emitter_.invalidate();
+                emitter_.setPipeline(v->id);
+                emitter_.setResources(bind(colour), defaultBinding);
+                emitter_.setTextureCount(1);
+                emitter_.setStorage({ segments, frameData });
+                PathConstants k;
+                k.viewportW    = fw;
+                k.viewportH    = fh;
+                k.segmentStart = p.segmentStart;
+                k.fillRule     = p.fillRule;
+                k.tileW        = p.tileSize;
+                k.paintsMain   = v->paintsMain ? 1 : 0;
+                emitter_.setConstants(builder_.pushConstants(k));
+                emitter_.draw(cmd, verts.data(), p.vertexCount);
+                emitter_.invalidate();
+                break;
+            }
+
+            case DrawOp::DrawShader: {
+                // Inside the scene pass when it can be (DrawShaderParams::inScene):
+                // one region triangle against the current scene attachments, no
+                // pass boundary. Otherwise a pass of its own attached to what it
+                // writes: targets alone, the main colour with targets, or the
+                // main colour alone — a scene reader (it REPLACES its region,
+                // ping-ponged like EffectHSV) or a target reader (blended Over
+                // the current half in place). One whose writes nothing reads is
+                // skipped.
+                const auto& sp = arena.read<DrawShaderParams>(cmd.dataOffset);
+                if (sp.shaderIndex == ~0u || sp.shaderIndex >= shaderCaptures_.size()) break;
+                const auto& sc = shaderCaptures_[sp.shaderIndex];
+                if (sp.inScene) {
+                    if (sp.writesMain || (sp.targetsWritten & live) != 0)
+                    {
+                        const auto pipeline = shaderPipeline(sc, sceneFormats(),
+                            [&](uint32_t l) { return l >= 1 && l - 1 < targets_.size() ? static_cast<int>(l - 1) : -1; },
+                            emitter_.stencilDepth() > 0);
+                        shaderDraw(sc, sp, pipeline, sp.region, fe, cmd.clipBounds,
+                                   emitter_.stencilDepth(), {});
+                        emitter_.invalidate();
+                    }
+                }
+                else if (!sp.writesMain) {
+                    if ((sp.targetsWritten & recorder_.liveTargets(k + 1)) != 0)
+                        targetPass(cmd, sp, sc);
+                }
+                else if (sp.targetsWritten != 0) {
+                    mainPass(cmd, sp, sc);
+                }
+                else {
+                    shaderMainOnly(cmd, sp, sc);
+                }
+                break;
+            }
+
+            case DrawOp::EffectBlend:
+                if (setPaint(Paint::Blend, cmd)) lowerBlend(*this, emitter_, cmd);
+                break;
+
+            case DrawOp::EffectNoise:
+                if (setPaint(Paint::Noise, cmd)) lowerNoise(*this, emitter_, cmd);
+                break;
+
+            case DrawOp::FillRect: case DrawOp::FillRectList: case DrawOp::FillRoundedRect:
+            case DrawOp::FillEllipse: case DrawOp::StrokeRoundedRect: case DrawOp::StrokeEllipse:
+            case DrawOp::DrawImage: case DrawOp::DrawGlyphs: case DrawOp::DrawLine:
+            case DrawOp::FillTiledImage:
+                if (setPaint(Paint::Color, cmd)) lowerColor(*this, emitter_, cmd);
+                break;
+
+            case DrawOp::COUNT:
+                break;
         }
-        auto* pipeline = pipelineForOp_[static_cast<size_t>(cmd.op)];
-        if (!pipeline) continue;
-        if (!pipeline->isBuilt())
-            pipeline->build(sceneBuildRP, target_.targets());
-        if (!pipeline->isBuilt()) continue;   // build failed — never bind null
-        if (!state_.setPipeline(pipeline, cmd.target, replayLive_)) continue;
-        pipeline->execute(*this, arena_, cmd);
     }
 
     endScene();
 
-    // After the command stream, `cur` is the index of whichever ping-pong
-    // half holds the final composited frame (full-window single-pass effects
-    // leave it flipped; everything else returns to the starting half). The
-    // blit reads pp[cur] either way.
-    VkImage currentImage = pp[cur].image;
-
-    if (frame.swapImage == VK_NULL_HANDLE) {
-        // Offscreen target — no swap image to blit to. Scene content remains
-        // in currentImage (SHADER_READ_ONLY_OPTIMAL) for the caller to sample.
-        // Serialize queue submit against other editors sharing the Device's
-        // VkQueue (Vulkan external sync requirement).
-        {
-            const juce::ScopedLock queueSync(queueLock());
-            target_.endFrame(frame);
-        }
-        {
-            const juce::ScopedLock lk(uploadLock_);
-            frameSlots_[activeRetireSlot_].pins.swap(recordingRetains_);
-        }
-        return;
-    }
-
-    // Blit currentImage → swap image. currentImage is in SHADER_READ_ONLY
-    // (finalLayout of the last scene RP). Transition both images and copy.
-    VkImageMemoryBarrier barriers[2] {};
-    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    // Cover both possible last-use types of colorA: it was either last
-    // written as a color attachment (final scene RP's writes → finalLayout
-    // transition) or last sampled in a shader (if an effect pass ran and
-    // then we re-entered scene RP LOAD). Including both bits eliminates
-    // a subtle write-after-read hazard on tile renderers at slow frame
-    // rates that caused post-effect draws to flicker every other frame.
-    barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT
-                              | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[0].image = currentImage;
-    barriers[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-    barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barriers[1].srcAccessMask = 0;
-    barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[1].image = frame.swapImage;
-    barriers[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-
-    // TRANSFER in the source stages chains the swap image's layout
-    // transition after the acquire semaphore, which endFrame waits on at
-    // TRANSFER. Without it the transition (a write) is ordered after
-    // nothing the presentation engine signals and can land while the image
-    // is still being read for the previous present (SYNC-HAZARD-WRITE-AFTER-READ).
-    vkCmdPipelineBarrier(frame.cmd,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
-            | VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 2, barriers);
-
-    VkImageBlit region {};
-    region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.srcOffsets[1] = { (int32_t)frame.extent.width, (int32_t)frame.extent.height, 1 };
-    region.dstOffsets[1] = { (int32_t)frame.extent.width, (int32_t)frame.extent.height, 1 };
-    vkCmdBlitImage(frame.cmd,
-        currentImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        frame.swapImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        1, &region, VK_FILTER_NEAREST);
-
-    // The swap image to present, and the half blitted from back to the layout every
-    // pass declares for it between passes (SHADER_READ_ONLY_OPTIMAL): a frame that ends
-    // flipped leaves colorB for a LOAD pass of a later frame, which declares that layout.
-    VkImageMemoryBarrier after[2] {};
-    after[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    after[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    after[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    after[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    after[0].dstAccessMask = 0;
-    after[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    after[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    after[0].image = frame.swapImage;
-    after[0].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    after[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    after[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    after[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    after[1].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    after[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
-                           | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    after[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    after[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    after[1].image = currentImage;
-    after[1].subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    vkCmdPipelineBarrier(frame.cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
-            | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-        0, 0, nullptr, 0, nullptr, 2, after);
-
-    // Serialize queue submit+present against other editors sharing the Device's
-    // VkQueue (Vulkan external sync requirement).
-    {
-        const juce::ScopedLock queueSync(queueLock());
-        target_.endFrame(frame);
-    }
-    // File this record's pins against the slot just submitted. Swap (not
-    // move) so recordingRetains_ keeps its capacity for the next record;
-    // the slot's pins vector was emptied by the drain at the top.
-    {
-        const juce::ScopedLock lk(uploadLock_);
-        frameSlots_[activeRetireSlot_].pins.swap(recordingRetains_);
-    }
-}
-
-// =============================================================================
-// State implementation
-// =============================================================================
-
-void State::begin(VkCommandBuffer cmd, Memory::V& vertices, float vpWidth, float vpHeight)
-{
-    cmd_ = cmd;
-    vertices_ = &vertices;
-    vpWidth_ = vpWidth;
-    vpHeight_ = vpHeight;
-    invalidate();
-    // Reset the CPU-side clip state every frame. The stencil buffer and
-    // scissor start each frame clean (CLEAR load op / full-extent scissor),
-    // so a stale stack from an unbalanced push last frame (exception unwind
-    // mid-paint, a component painting outside ScopedSaveState) must not
-    // survive: a leaked stencilDepth_ > 0 binds clip-variant pipelines whose
-    // reference can never match the cleared stencil — a permanently black
-    // window until the editor is recreated. With the reset it heals in one
-    // frame.
-    clipRectStack_.clear();
-    currentClipBounds_ = {};
-    stencilDepth_ = 0;
-}
-
-void State::invalidate()
-{
-    currentPipeline_ = nullptr;
-    boundPipeline_ = VK_NULL_HANDLE;
-    boundLayout_ = VK_NULL_HANDLE;
-    boundColorSet_ = VK_NULL_HANDLE;
-    boundShapeSet_ = VK_NULL_HANDLE;
-    boundStencilRef_ = 0;
-    boundScissor_ = { -1, -1, 0, 0 };
-    boundVertexBuffer_ = VK_NULL_HANDLE;
-}
-
-bool State::setPipeline(Pipeline* pipeline, uint8_t attachment, TargetMask live)
-{
-    if (!pipeline) return false;
-
-    // Clip variant of the pipeline has stencilTest on (cmp = EQUAL, ops =
-    // KEEP), reference pushed dynamically below. Non-clip variant has no
-    // stencil test at all — used whenever stencilDepth_ == 0. Each variant
-    // also exists per draw target (attachment) and per set of targets its
-    // paint still clears (live).
-    VkPipeline handle = (stencilDepth_ > 0) ? pipeline->clipHandle(attachment, live)
-                                            : pipeline->handle(attachment, live);
-    if (handle == VK_NULL_HANDLE) return false;   // failed build: never bind null
-
-    if (handle != boundPipeline_) {
-        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, handle);
-        boundPipeline_ = handle;
-
-        // Layout change invalidates descriptor set bindings in Vulkan
-        if (boundLayout_ != pipeline->layout()) {
-            boundColorSet_ = VK_NULL_HANDLE;
-            boundShapeSet_ = VK_NULL_HANDLE;
-            boundLayout_ = pipeline->layout();
-        }
-
-        // Push viewport size for pixel→NDC conversion in vertex shader
-        float vpSize[2] = { vpWidth_, vpHeight_ };
-        vkCmdPushConstants(cmd_, boundLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vpSize), vpSize);
-    }
-
-    // Stencil reference = clip depth. Every draw op passes only where
-    // stencil == depth (i.e. inside all active clips).
-    if (stencilDepth_ > 0 && stencilDepth_ != boundStencilRef_) {
-        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, stencilDepth_);
-        boundStencilRef_ = stencilDepth_;
-    }
-
-    currentPipeline_ = pipeline;
-    return true;
-}
-
-void State::setCustomPipeline(VkPipeline pipeline, VkPipelineLayout layout)
-{
-    if (pipeline != boundPipeline_) {
-        vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        boundPipeline_ = pipeline;
-    }
-    // Same rule as setPipeline: sets bound under another layout are not
-    // valid for this one (their push-constant ranges differ, so the layouts
-    // are not compatible for set 0). Without forgetting them, a caller's
-    // setColorResource with the set the last colour draw used is skipped,
-    // and the draw reads set 0 bound under an incompatible layout
-    // (VUID-vkCmdDraw-None-08600) — undefined, and only NVIDIA happens to
-    // keep the old binding.
-    if (layout != boundLayout_) {
-        boundColorSet_ = VK_NULL_HANDLE;
-        boundShapeSet_ = VK_NULL_HANDLE;
-        boundLayout_ = layout;
-    }
-    if (stencilDepth_ > 0)
-        vkCmdSetStencilReference(cmd_, VK_STENCIL_FACE_FRONT_AND_BACK, stencilDepth_);
-
-    currentPipeline_ = nullptr; // force rebind on next setPipeline
-}
-
-void State::setResources(VkDescriptorSet colorSet, VkDescriptorSet shapeSet)
-{
-    setColorResource(colorSet);
-    setShapeResource(shapeSet);
-}
-
-void State::setColorResource(VkDescriptorSet set)
-{
-    if (set != boundColorSet_) {
-        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            boundLayout_, 0, 1, &set, 0, nullptr);
-        boundColorSet_ = set;
-    }
-}
-
-void State::setShapeResource(VkDescriptorSet set)
-{
-    if (set != boundShapeSet_) {
-        vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            boundLayout_, 1, 1, &set, 0, nullptr);
-        boundShapeSet_ = set;
-    }
-}
-
-void State::draw(const DrawCommand& cmd, const UIVertex* verts, uint32_t count)
-{
-    if (count == 0) return;
-
-    // Set scissor from command clip bounds
-    juce::Rectangle<int> clip = cmd.clipBounds;
-    if (!currentClipBounds_.isEmpty())
-        clip = clip.getIntersection(currentClipBounds_);
-
-    if (clip != boundScissor_) {
-        // Clamp each edge to the framebuffer before computing the extent,
-        // so a clip starting off-screen (x<0) doesn't produce an offset of
-        // 0 with the un-clipped width and leak past the right edge.
-        int x0 = std::max(0, clip.getX());
-        int y0 = std::max(0, clip.getY());
-        int x1 = std::max(x0, clip.getRight());
-        int y1 = std::max(y0, clip.getBottom());
-        VkRect2D sc;
-        sc.offset = { x0, y0 };
-        sc.extent = { static_cast<uint32_t>(x1 - x0),
-                      static_cast<uint32_t>(y1 - y0) };
-        vkCmdSetScissor(cmd_, 0, 1, &sc);
-        boundScissor_ = clip;
-    }
-
-    // Ring buffer — bind it once at offset 0 and use firstVertex for the
-    // subrange. Each write() returns a vertex-aligned byte offset; we convert
-    // to a vertex index so the bind only changes when the slot grows.
-    VkDeviceSize byteCount  = count * sizeof(UIVertex);
-    VkDeviceSize byteOffset = vertices_->write(verts, byteCount);
-    VkBuffer     buf        = vertices_->getBuffer();
-    if (buf == VK_NULL_HANDLE) return;   // the slot failed to allocate: nothing to bind
-    uint32_t     firstVert  = static_cast<uint32_t>(byteOffset / sizeof(UIVertex));
-
-    if (buf != boundVertexBuffer_) {
-        VkDeviceSize zero = 0;
-        vkCmdBindVertexBuffers(cmd_, 0, 1, &buf, &zero);
-        boundVertexBuffer_ = buf;
-    }
-    vkCmdDraw(cmd_, count, 1, firstVert, 0);
-}
-
-void State::pushClipRect(const juce::Rectangle<int>& rect)
-{
-    auto clipped = currentClipBounds_.isEmpty()
-        ? rect
-        : currentClipBounds_.getIntersection(rect);
-    clipRectStack_.push_back(clipped);
-    currentClipBounds_ = clipped;
-}
-
-void State::popClipRect()
-{
-    if (clipRectStack_.empty()) return;
-    clipRectStack_.pop_back();
-    currentClipBounds_ = clipRectStack_.empty()
-        ? juce::Rectangle<int>{}
-        : clipRectStack_.back();
-}
-
-void State::pushStencilDepth()
-{
-    stencilDepth_++;
-}
-
-void State::popStencilDepth()
-{
-    if (stencilDepth_ > 0) stencilDepth_--;
+    // The frame's output: a copy of whichever half holds the composited scene
+    // (full-window single-pass effects leave it flipped; everything else
+    // returns to the starting half). A draw, not a blit: the output's format
+    // needn't match the scene's, and some APIs can't blit at all. It covers
+    // every pixel, so what the output held before is never loaded.
+    fullscreenPass("present copy", programs.copy, info.output, info.outputFormat, StencilTest::None,
+                   { bind(halves_[cur]) }, {}, effectConstants(info.extent, 0, 0, 0),
+                   { 0, 0, static_cast<int32_t>(info.extent.width), static_cast<int32_t>(info.extent.height) }, 0,
+                   LoadOp::DontCare);
 }
 
 } // namespace jvk

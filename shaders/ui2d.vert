@@ -1,7 +1,11 @@
 #version 450
+#include "jvk_portable.glsl"
 
-layout(push_constant) uniform PC {
+// Shared with ui2d.frag and noise.frag (byte-identical view).
+JVK_CONSTANTS {
     vec2 viewportSize;
+    int  paintsMain;   // read by ui2d.frag
+    int  _pad;
 } pc;
 
 layout(location = 0) in vec2 inPosition;

@@ -1,4 +1,5 @@
 #version 450
+#include "jvk_portable.glsl"
 
 // Shape-aware variable-radius Gaussian blur. Runs as a separable 2-pass
 // (horizontal, then vertical) just like blur.frag, but the per-pixel radius
@@ -21,7 +22,7 @@
 // the drawBlurred* (outline) API variants: the blur centre follows the ring
 // boundary instead of the filled interior.
 
-layout(push_constant) uniform PC {
+JVK_CONSTANTS {
     vec2  viewportSize;     // physical pixels of the src/dst image
     vec2  direction;        // (1,0) horizontal pass  |  (0,1) vertical
     vec2  invCol0;          // inverse affine: frag.xy (physical) → shape-local (logical)
@@ -54,7 +55,8 @@ layout(push_constant) uniform PC {
     float _pad0;            // pad block to 96 bytes (std140 multiple-of-16)
 } pc;
 
-layout(set = 0, binding = 0) uniform sampler2D srcTexture;
+JVK_TEXTURE(0, srcTexture);
+JVK_SAMPLER(0, srcSampler);
 
 layout(location = 0) in  vec2 fragUV;
 layout(location = 0) out vec4 outColor;
@@ -173,15 +175,17 @@ const int MAX_POISSON_TAPS = 1024;
 // locally continuous so edge pixels contribute naturally to the blur.
 vec4 sampleSrc(vec2 uv) {
     vec2 m = uv - 2.0 * floor(uv * 0.5 + 0.5);
-    return texture(srcTexture, abs(m));
+    return texture(sampler2D(srcTexture, srcSampler), abs(m));
 }
 
 void main() {
     vec2 fragCoord = fragUV * pc.viewportSize;
     float radius   = computeRadius(fragCoord);   // physical pixels
 
+    // TODO(WGSL uniformity): every sample below sits under branches on the
+    // per-pixel radius; sample with explicit LOD before a WGSL build.
     if (radius <= 0.5) {
-        outColor = texture(srcTexture, fragUV);
+        outColor = texture(sampler2D(srcTexture, srcSampler), fragUV);
         return;
     }
 
@@ -190,7 +194,7 @@ void main() {
     int   N     = int(ceil(radius));
 
     vec2  texelSize   = 1.0 / pc.viewportSize;
-    vec4  color       = texture(srcTexture, fragUV);
+    vec4  color       = texture(sampler2D(srcTexture, srcSampler), fragUV);
     float totalWeight = 1.0;
 
     if (pc.kernelType == 0) {

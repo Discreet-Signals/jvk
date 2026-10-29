@@ -1,4 +1,5 @@
 #version 450
+#include "jvk_portable.glsl"
 
 // Separable Gaussian blur pass. Run twice — once horizontal, once vertical —
 // with ping-pong framebuffers to get a 2D blur.
@@ -11,13 +12,14 @@
 // viewportSize: extent of the source image (pixels). Used to derive texel size.
 // direction:    (1,0) for horizontal pass, (0,1) for vertical.
 // radius:       kernel half-width in pixels. 0 = pass-through.
-layout(push_constant) uniform PC {
+JVK_CONSTANTS {
     vec2  viewportSize;
     vec2  direction;
     float radius;
 } pc;
 
-layout(set = 0, binding = 0) uniform sampler2D srcTexture;
+JVK_TEXTURE(0, srcTexture);
+JVK_SAMPLER(0, srcSampler);
 
 layout(location = 0) in  vec2 fragUV;
 layout(location = 0) out vec4 outColor;
@@ -30,7 +32,7 @@ void main() {
     vec2 texelSize = 1.0 / pc.viewportSize;
 
     if (pc.radius <= 0.5) {
-        outColor = texture(srcTexture, fragUV);
+        outColor = texture(sampler2D(srcTexture, srcSampler), fragUV);
         return;
     }
 
@@ -39,7 +41,7 @@ void main() {
     int   N     = int(ceil(pc.radius));
 
     // Center tap (weight = exp(0) = 1).
-    vec4  color       = texture(srcTexture, fragUV);
+    vec4  color       = texture(sampler2D(srcTexture, srcSampler), fragUV);
     float totalWeight = 1.0;
 
     // Walk integer texel offsets in pairs (1,2), (3,4), (5,6), ...
@@ -55,8 +57,8 @@ void main() {
         float o  = (float(i1) * w1 + float(i2) * w2) / w;
 
         vec2 off = pc.direction * o * texelSize;
-        color += texture(srcTexture, fragUV + off) * w;
-        color += texture(srcTexture, fragUV - off) * w;
+        color += texture(sampler2D(srcTexture, srcSampler), fragUV + off) * w;
+        color += texture(sampler2D(srcTexture, srcSampler), fragUV - off) * w;
         totalWeight += 2.0 * w;
     }
 

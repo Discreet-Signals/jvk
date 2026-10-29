@@ -18,12 +18,19 @@
 #define VOLK_IMPLEMENTATION
 #include "jvk.h"
 
-// Core implementations
-#include "include/jvk/core/Device.cpp"
+// Core
+#include "include/jvk/core/Context.cpp"
 #include "include/jvk/core/Renderer.cpp"
-#include "include/jvk/core/Pipeline.cpp"
-#include "include/jvk/core/RenderTarget.cpp"
-#include "include/jvk/offscreen/ShaderImage.cpp"
+#include "include/jvk/core/Shader.cpp"
+
+// Hosts
+#include "include/jvk/hosts/ShaderImage.cpp"
+
+// Vulkan backend
+#include "include/jvk/backends/vulkan/Device.cpp"
+#include "include/jvk/backends/vulkan/VulkanBackend.cpp"
+#include "include/jvk/backends/vulkan/VulkanSurface.cpp"
+#include "include/jvk/backends/vulkan/VulkanHost.cpp"
 
 // SPIRV-Reflect (C source)
 extern "C" {

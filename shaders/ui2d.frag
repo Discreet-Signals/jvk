@@ -1,10 +1,25 @@
 #version 450
+#include "jvk_portable.glsl"
 
-// Two descriptor sets, both combined image samplers:
-//   set 0 = color LUT   (1x1 default for solid, or 256x1 gradient LUT)
-//   set 1 = shape tex   (1x1 default, or MSDF atlas page, or image)
-layout(set = 0, binding = 0) uniform sampler2D colorLUT;
-layout(set = 1, binding = 0) uniform sampler2D shapeTex;
+// Two textures, each with its own sampler:
+//   texture 0 = color LUT   (1x1 default for solid, or 256x1 gradient LUT, or a tiled fill's image)
+//   texture 1 = shape tex   (1x1 default, or MSDF atlas page, or image)
+JVK_TEXTURE(0, colorLUT);
+JVK_SAMPLER(0, colorLUTSampler);
+JVK_TEXTURE(1, shapeTex);
+JVK_SAMPLER(1, shapeTexSampler);
+
+// Shared with ui2d.vert (byte-identical view).
+JVK_CONSTANTS {
+    vec2 viewportSize;
+    int  paintsMain;   // 1: a draw into the main colour that clears targets (writeTargets)
+    int  _pad;
+} pc;
+
+// The frame's render-target clear values (jvk::Target::clear), rgb used.
+JVK_STORAGE(0) FrameData {
+    vec4 targetClear[7];
+} frame;
 
 layout(location = 0) in vec4 fragColor;
 layout(location = 1) in vec2 fragUV;
@@ -66,12 +81,14 @@ float median(float r, float g, float b) {
 // (row-center, safe under linear filtering). Each row is one 256-sample LUT
 // rasterized from juce::ColourGradient::getColourAtPosition, so N-stop
 // gradients work natively. Opacity always comes from fragColor.a.
+// TODO(WGSL uniformity): texture() under the per-vertex mode branch; sample
+// with explicit LOD/gradients before a WGSL build.
 vec4 sampleColor() {
     int mode = int(fragGradientInfo.z + 0.5);
     if (mode == 0)
         return fragColor;
     if (mode == 3) {
-        // A tiled image fill: set 0 holds the image, gradientInfo.xy its UV
+        // A tiled image fill: texture 0 holds the image, gradientInfo.xy its UV
         // (unbounded: wrapped, as the tiled image quad wraps), .w the
         // point-sampling flag. Its texel is premultiplied, and this returns
         // straight alpha (main() premultiplies once): un-premultiplied here.
@@ -80,13 +97,13 @@ vec4 sampleColor() {
             vec2 sz = vec2(textureSize(colorLUT, 0));
             uv = (floor(uv * sz) + 0.5) / sz;
         }
-        vec4 px = texture(colorLUT, uv);
+        vec4 px = texture(sampler2D(colorLUT, colorLUTSampler), uv);
         return px.a > 0.0 ? vec4(px.rgb / px.a, px.a * fragColor.a) : vec4(0.0);
     }
 
     float t = (mode == 2) ? length(fragGradientInfo.xy) : fragGradientInfo.x;
     t = clamp(t, 0.0, 1.0);
-    vec4 col = texture(colorLUT, vec2(t, fragGradientInfo.w));
+    vec4 col = texture(sampler2D(colorLUT, colorLUTSampler), vec2(t, fragGradientInfo.w));
     return vec4(col.rgb, col.a * fragColor.a);
 }
 
@@ -115,9 +132,9 @@ vec4 sampleColor() {
 
 // ---- Image sampling ------------------------------------------------------
 // juce's setInterpolationQuality(lowResamplingQuality) means POINT sampling.
-// Every cached texture bakes ONE VkSampler into its descriptor set, so a
-// nearest sampler would mean a second sampler and a second descriptor per
-// image; instead the UV is snapped to the texel CENTRE. A linear sampler
+// The image is bound with a linear sampler whatever the quality, so a
+// nearest draw doesn't break a run of draws into another binding; instead
+// the UV is snapped to the texel CENTRE. A linear sampler
 // evaluated exactly at a texel centre returns that texel, and the textures
 // have a single mip level, so no LOD path can reintroduce a blend — this IS
 // nearest sampling, just carried per draw instead of per descriptor.
@@ -128,7 +145,7 @@ vec4 sampleImage(vec2 uv) {
         vec2 sz = vec2(textureSize(shapeTex, 0));
         uv = (floor(uv * sz) + 0.5) / sz;
     }
-    return texture(shapeTex, uv);
+    return texture(sampler2D(shapeTex, shapeTexSampler), uv);
 }
 
 // ---- Shape source --------------------------------------------------------
@@ -147,6 +164,7 @@ vec4 sampleImage(vec2 uv) {
 //       CLAMP so a repeat mode isn't available; the 1px seam blend this
 //       costs vs true REPEAT is invisible on UI patterns)
 // Image types (3/5/6) carry the point-sampling flag in shapeInfo.y.
+// TODO(WGSL uniformity): texture() under the per-vertex shape-type branch.
 vec4 sampleShape() {
     int type = int(fragShapeInfo.x + 0.5);
 
@@ -164,7 +182,7 @@ vec4 sampleShape() {
         return sampleImage(fract(fragUV));
 
     if (type == 4) {
-        vec3 msd = texture(shapeTex, fragUV).rgb;
+        vec3 msd = texture(sampler2D(shapeTex, shapeTexSampler), fragUV).rgb;
         float sd = median(msd.r, msd.g, msd.b);
         float screenPxRange = fragShapeInfo.y;
 
@@ -233,30 +251,21 @@ vec4 sampleShape() {
 }
 
 // PAINT INTO THE MAIN COLOUR also sets the render targets declared
-// Target::clearedByMain to their clear values, by the paint's alpha. The
-// main-colour pipeline specializes kPaintsMain = 1 and the values
-// (PaintSpecialization); a pipeline drawing INTO a target writes the colour
+// Target::clearedByMain to their clear values, by the paint's alpha. A draw
+// into the main colour that clears targets sets pc.paintsMain = 1 and the
+// frame's FrameData holds the values; a draw INTO a target writes the colour
 // at every location, and the target's own attachment takes it.
-layout(constant_id = 0) const int kPaintsMain = 0;
-layout(constant_id = 1)  const float kClear0r = 0.0; layout(constant_id = 2)  const float kClear0g = 0.0; layout(constant_id = 3)  const float kClear0b = 0.0;
-layout(constant_id = 4)  const float kClear1r = 0.0; layout(constant_id = 5)  const float kClear1g = 0.0; layout(constant_id = 6)  const float kClear1b = 0.0;
-layout(constant_id = 7)  const float kClear2r = 0.0; layout(constant_id = 8)  const float kClear2g = 0.0; layout(constant_id = 9)  const float kClear2b = 0.0;
-layout(constant_id = 10) const float kClear3r = 0.0; layout(constant_id = 11) const float kClear3g = 0.0; layout(constant_id = 12) const float kClear3b = 0.0;
-layout(constant_id = 13) const float kClear4r = 0.0; layout(constant_id = 14) const float kClear4g = 0.0; layout(constant_id = 15) const float kClear4b = 0.0;
-layout(constant_id = 16) const float kClear5r = 0.0; layout(constant_id = 17) const float kClear5g = 0.0; layout(constant_id = 18) const float kClear5b = 0.0;
-layout(constant_id = 19) const float kClear6r = 0.0; layout(constant_id = 20) const float kClear6g = 0.0; layout(constant_id = 21) const float kClear6b = 0.0;
-
 void writeTargets(vec4 colour)
 {
-    bool paint = kPaintsMain != 0;
+    bool paint = pc.paintsMain != 0;
     float a = colour.a;
-    outChannel0 = paint ? vec4(kClear0r, kClear0g, kClear0b, a) : colour;
-    outChannel1 = paint ? vec4(kClear1r, kClear1g, kClear1b, a) : colour;
-    outChannel2 = paint ? vec4(kClear2r, kClear2g, kClear2b, a) : colour;
-    outChannel3 = paint ? vec4(kClear3r, kClear3g, kClear3b, a) : colour;
-    outChannel4 = paint ? vec4(kClear4r, kClear4g, kClear4b, a) : colour;
-    outChannel5 = paint ? vec4(kClear5r, kClear5g, kClear5b, a) : colour;
-    outChannel6 = paint ? vec4(kClear6r, kClear6g, kClear6b, a) : colour;
+    outChannel0 = paint ? vec4(frame.targetClear[0].rgb, a) : colour;
+    outChannel1 = paint ? vec4(frame.targetClear[1].rgb, a) : colour;
+    outChannel2 = paint ? vec4(frame.targetClear[2].rgb, a) : colour;
+    outChannel3 = paint ? vec4(frame.targetClear[3].rgb, a) : colour;
+    outChannel4 = paint ? vec4(frame.targetClear[4].rgb, a) : colour;
+    outChannel5 = paint ? vec4(frame.targetClear[5].rgb, a) : colour;
+    outChannel6 = paint ? vec4(frame.targetClear[6].rgb, a) : colour;
 }
 
 void main() {

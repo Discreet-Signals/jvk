@@ -22,6 +22,6 @@
 #include "jvk.cpp"
 
 #if JUCE_MAC
-#include "include/jvk/core/macos/NSViewGenerator.mm"
-#include "include/jvk/core/macos/MetalCapabilities.mm"
+#include "include/jvk/backends/vulkan/macos/NSViewGenerator.mm"
+#include "include/jvk/backends/vulkan/macos/MetalCapabilities.mm"
 #endif

@@ -1,4 +1,5 @@
 #version 450
+#include "jvk_portable.glsl"
 
 // Clip-stencil fragment shader.
 //
@@ -14,7 +15,7 @@
 // Axis-aligned rect clips never hit this shader — they're routed to scissor
 // by Graphics::clipToRectangle.
 
-layout(push_constant) uniform PC {
+JVK_CONSTANTS {
     vec2  viewportSize;
     vec2  center;
     vec2  halfSize;
@@ -28,8 +29,8 @@ layout(push_constant) uniform PC {
     float invStripH;
 } pc;
 
-// Shared segment ring — owned by PathPipeline, bound here at clip dispatch.
-layout(std430, set = 0, binding = 0) readonly buffer Segments {
+// The frame's shared segment stream (storage 0), as path_sdf.frag reads it.
+JVK_STORAGE(0) Segments {
     vec4 data[];
 } segments;
 

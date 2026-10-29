@@ -3,6 +3,15 @@
 Translated from GAVINS_ARCHITECTURE.md — that file is the source of truth.
 This document adds Vulkan specifics, concrete interfaces, and implementation details.
 
+> **Note (translation-layer branch):** the file layout and the Vulkan-specific engine
+> below predate the split into a GPU-agnostic core and backends. The renderer they
+> describe (`Renderer::execute`, `RenderTarget`, the pipeline classes, `FrameRetained`)
+> has been replaced: the core lowers each frame into a `gpu::FramePacket` and a backend
+> executes it. Current paths, the core/backend boundary and the lifetimes model are in
+> TRANSLATION_LAYER.md. The render-graph semantics described here (ping-pong halves,
+> ROI walk, target liveness, clip stencil) are unchanged; they now live in
+> `core/Renderer.cpp`.
+
 ---
 
 ## Ownership Graph

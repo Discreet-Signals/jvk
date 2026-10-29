@@ -1,4 +1,5 @@
 #version 450
+#include "jvk_portable.glsl"
 
 // Analytical path-SDF vertex shader — TILE mode.
 //
@@ -16,7 +17,8 @@
 // All 6 vertices of a tile quad carry identical uv/shapeInfo, so `flat`
 // interpolation is exact.
 
-layout(push_constant) uniform PC {
+// Shared with path_sdf.frag (byte-identical view).
+JVK_CONSTANTS {
     vec2  viewportSize;  // physical pixel dimensions of the scene target
     uint  segmentStart;  // base of this path's tile-local segment data
     uint  segmentCount;  // unused in tile mode (kept for layout stability)
@@ -24,6 +26,10 @@ layout(push_constant) uniform PC {
     uint  _r0;
     float tileW;     // tile width in physical px (16, coarsened for huge paths)
     float _r2;
+    int   paintsMain;    // read by path_sdf.frag
+    int   _p0;
+    int   _p1;
+    int   _p2;
 } pc;
 
 // UIVertex layout, shared with the rest of jvk's 2D pipelines.

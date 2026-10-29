@@ -1,4 +1,5 @@
 #version 450
+#include "jvk_portable.glsl"
 
 // Image-alpha clip-stencil fragment shader (Graphics::clipToImageAlpha).
 //
@@ -12,7 +13,7 @@
 // `nearest` is the resampling quality the clip was made with (juce reads it at
 // clip time): point sampling snaps to the texel centre, as ui2d.frag does.
 
-layout(push_constant) uniform PC {
+JVK_CONSTANTS {
     vec2  viewportSize;
     vec2  toMaskX;        // physical px → mask texels: x = dot(toMaskX, p) + toMaskOffset.x
     vec2  toMaskY;        //                            y = dot(toMaskY, p) + toMaskOffset.y
@@ -22,7 +23,8 @@ layout(push_constant) uniform PC {
     uint  _pad;
 } pc;
 
-layout(set = 0, binding = 0) uniform sampler2D maskTex;
+JVK_TEXTURE(0, maskTex);
+JVK_SAMPLER(0, maskSampler);
 
 layout(location = 0) in vec2 fragPos;
 
@@ -30,6 +32,6 @@ void main() {
     vec2 p = vec2(dot(pc.toMaskX, fragPos), dot(pc.toMaskY, fragPos)) + pc.toMaskOffset;
     if (any(lessThan(p, vec2(0.0))) || any(greaterThanEqual(p, pc.maskSize))) discard;
     vec2 uv = (pc.nearest != 0u ? floor(p) + 0.5 : p) / pc.maskSize;
-    if (texture(maskTex, uv).a < 0.5) discard;
+    if (texture(sampler2D(maskTex, maskSampler), uv).a < 0.5) discard;
     // No color output — stencil INCR/DECR happens in fixed-function HW.
 }

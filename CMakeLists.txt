@@ -70,6 +70,24 @@ if (NOT TARGET jvk)
 endif()
 
 # ==============================================================================
+# Core invariant: nothing under include/jvk/core names a GPU API. core/ is the
+# translation layer every backend shares (TRANSLATION_LAYER.md); one Vulkan,
+# Metal, D3D12 or WebGPU name there and it belongs to that backend again.
+# Checked at configure time, so re-run CMake after editing core/.
+# ==============================================================================
+
+file(GLOB_RECURSE _JVK_CORE_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/jvk/core/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/jvk/core/*.cpp")
+foreach(_jvk_core_file ${_JVK_CORE_FILES})
+    file(STRINGS "${_jvk_core_file}" _jvk_api_hits
+         REGEX "(^|[^A-Za-z0-9_])(Vk[A-Z]|vk[A-Z]|VK_|MTL[A-Z]|ID3D12|WGPU|wgpu[A-Z])")
+    if (_jvk_api_hits)
+        message(FATAL_ERROR "jvk: ${_jvk_core_file} names a GPU API; core/ must stay backend-neutral:\n${_jvk_api_hits}")
+    endif()
+endforeach()
+
+# ==============================================================================
 # Vulkan SDK discovery
 # ==============================================================================
 
@@ -89,45 +107,63 @@ find_package(Vulkan REQUIRED)
 target_link_libraries(jvk INTERFACE Vulkan::Headers)
 
 # ==============================================================================
-# Shader compilation — auto-regenerate UI2DShaders.h whenever any .vert/.frag
-# changes. The custom command is wired into jvk's interface sources so every
-# consumer implicitly depends on the header being up-to-date before their
-# compile of jvk.mm / jvk.cpp (which #include UI2DShaders.h). No manual
-# `cd shaders && ./compile.sh` required.
+# Shader compilation — regenerate the shader bundle (core/shaders/Bundle.h:
+# Vulkan SPIR-V, MSL translated by SPIRV-Cross, reflected layouts) whenever a
+# shader changes. The custom command is wired into jvk's interface sources so
+# every consumer depends on the header being up to date before it compiles
+# jvk.mm / jvk.cpp. By hand: `cd shaders && ./compile.sh`.
 # ==============================================================================
 
 set(JVK_SHADER_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/jvk_portable.glsl"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ui2d.vert"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/ui2d.frag"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/clip.vert"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/clip.frag"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/copy.frag"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.vert"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.frag"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shape_blur.frag"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hsv.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/noise.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/path_sdf.vert"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/path_sdf.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/clip.vert"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/clip.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/clip_mask.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.vert"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/blur.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/copy.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/hsv.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shape_blur.frag"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shaders/path_blur.frag"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/shader_region.vert"
     "${CMAKE_CURRENT_SOURCE_DIR}/shaders/compile.sh"
 )
 
-set(JVK_SHADER_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/include/jvk/graphics/UI2DShaders.h")
+set(JVK_SHADER_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/include/jvk/core/shaders/Bundle.h")
 
-# Pass the CMake-discovered glslc to compile.sh so it doesn't depend on PATH
+# The tools, from the Vulkan SDK when CMake found one; compile.sh searches the
+# SDK and PATH itself for any left unset.
 if (Vulkan_GLSLC_EXECUTABLE)
-    set(_JVK_GLSLC_ENV "GLSLC=${Vulkan_GLSLC_EXECUTABLE}")
+    set(JVK_GLSLC "${Vulkan_GLSLC_EXECUTABLE}")
 else()
-    set(_JVK_GLSLC_ENV)
+    find_program(JVK_GLSLC glslc HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
+endif()
+find_program(JVK_SPIRV_CROSS spirv-cross HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
+find_program(JVK_SPIRV_VAL   spirv-val   HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
+
+set(_JVK_SHADER_ENV)
+if (JVK_GLSLC)
+    list(APPEND _JVK_SHADER_ENV "GLSLC=${JVK_GLSLC}")
+endif()
+if (JVK_SPIRV_CROSS)
+    list(APPEND _JVK_SHADER_ENV "SPIRV_CROSS=${JVK_SPIRV_CROSS}")
+endif()
+if (JVK_SPIRV_VAL)
+    list(APPEND _JVK_SHADER_ENV "SPIRV_VAL=${JVK_SPIRV_VAL}")
 endif()
 
 add_custom_command(
     OUTPUT  "${JVK_SHADER_HEADER}"
-    COMMAND ${CMAKE_COMMAND} -E env ${_JVK_GLSLC_ENV}
+    COMMAND ${CMAKE_COMMAND} -E env ${_JVK_SHADER_ENV}
             bash "${CMAKE_CURRENT_SOURCE_DIR}/shaders/compile.sh"
     DEPENDS ${JVK_SHADER_SOURCES}
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
-    COMMENT "jvk: Compiling shaders → UI2DShaders.h"
+    COMMENT "jvk: Compiling shaders → Bundle.h"
     VERBATIM
 )
 
@@ -136,7 +172,7 @@ add_custom_command(
 add_custom_target(jvk_shaders DEPENDS "${JVK_SHADER_HEADER}")
 
 # Attach the generated header as an interface source of jvk. Any consumer
-# that compiles jvk.mm / jvk.cpp (which #include UI2DShaders.h) inherits this
+# that compiles jvk.mm / jvk.cpp (which #include Bundle.h) inherits this
 # as a build-graph dependency, so CMake runs the custom command first.
 target_sources(jvk INTERFACE "${JVK_SHADER_HEADER}")
 
