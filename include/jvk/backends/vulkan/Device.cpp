@@ -244,7 +244,10 @@ struct PipelineCacheFileHeader {
     uint32_t driverVersion;
     uint8_t  uuid[VK_UUID_SIZE];
 };
-constexpr uint32_t kPipelineCacheMagic = 0x4A564B50u; // "JVKP"
+// "JVKQ". "JVKP" files were written while compute pipelines went in the cache
+// too, so they can hold every kernel a program ever made (hundreds of MB, read
+// at every start): a new magic drops them once.
+constexpr uint32_t kPipelineCacheMagic = 0x4A564B51u;
 } // namespace
 
 juce::File Device::pipelineCacheFile()

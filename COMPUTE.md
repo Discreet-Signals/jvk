@@ -74,6 +74,20 @@ jvk_compute_shaders(MyTarget HEADER MyKernels.h NAMESPACE mykernels SOURCES scal
   block, its workgroup size, its specialization constants.
   - Specialization constants are set when it is made.
   - Its workgroup size may be one of them (`local_size_x_id`).
+  - Its GPU memory goes with it, once nothing submitted still runs it. So a
+    program may make kernels as it runs (code it writes, specialized to its
+    data, as a `KernelSource` of its own) and drop them, and keep only the
+    memory of those it still has:
+    - Metal: kernels of one source share its library while any of them lives,
+      and the last one to go takes it out. A pipeline state needs no library
+      once made, and Metal's compiler cache makes a source made again cheap.
+      A `jvk::Shader`'s functions go the same way, with the last program
+      that uses them.
+    - Vulkan: kernels stay out of the device's pipeline cache. That cache keeps
+      everything put in it for the device's life and is saved to disk for every
+      later run to load. Drivers keep compiled shaders on disk themselves
+      (MoltenVK through Metal's compiler cache), so a kernel made again is
+      cheap anyway.
 - **Stream**: commands recorded, submitted, then waited for.
   - The commands are `dispatch`, `barrier`, `fill`, `copy`, `upload`,
     `download` and `time`.

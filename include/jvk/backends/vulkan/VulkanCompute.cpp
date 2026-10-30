@@ -300,7 +300,12 @@ gpu::KernelId Backend::createKernel(const gpu::KernelDesc& desc)
     ci.stage.pName               = desc.entry != nullptr ? desc.entry : "main";
     ci.stage.pSpecializationInfo = entries.empty() ? nullptr : &spec;
     ci.layout                    = k.layout;
-    const VkResult made = vkCreateComputePipelines(d, device_->pipelineCache(), 1, &ci, nullptr, &k.pipeline);
+    // Not in the device's pipeline cache: it keeps everything put in it for the
+    // device's life, and saves it all to disk for every later run to load, so a
+    // program that writes kernels as it runs and drops them would grow both
+    // without end. Drivers keep compiled shaders on disk themselves (MoltenVK
+    // through Metal's compiler cache), so a kernel made again is cheap anyway.
+    const VkResult made = vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &ci, nullptr, &k.pipeline);
     vkDestroyShaderModule(d, shader, nullptr);
     if (made != VK_SUCCESS)
     {

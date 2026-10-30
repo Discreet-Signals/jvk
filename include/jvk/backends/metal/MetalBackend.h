@@ -91,6 +91,9 @@ struct TextureSlot
 struct ProgramSlot
 {
     Strong<id<MTLFunction>> vertex, fragment;
+    // Its stages' entries in Backend::functions_, each holding one use (under tableMutex_).
+    const std::string* vertexKey = nullptr;
+    const std::string* fragmentKey = nullptr;
     std::string name;
     uint32_t    constantsBytes = 0;
     // Where slot i lives in Metal: the bundle's portable layout or a jvk::Shader's own.
@@ -115,6 +118,7 @@ struct KernelSlot
     uint32_t constantsBytes = 0;                   // at [[buffer(kConstantsIndex)]]
     MTLSize  groupSize { 1, 1, 1 };                // threadsPerThreadgroup at every dispatch
     bool     bufferSizes = false;                  // [[buffer(kBufferSizesIndex)]]: each binding's size
+    const std::string* library = nullptr;          // its entry in Backend::kernelLibraries_, holding one use (under tableMutex_)
 };
 
 struct PipelineSlot
@@ -217,7 +221,12 @@ private:
     id<MTLDepthStencilState> depthStencilState(const gpu::StencilState& stencil);   // under tableMutex_
     bool     stage(TextureSlot& t, uint32_t handle, uint32_t layer, uint32_t mip, gpu::IRect region,
                    const std::byte* data, size_t rowBytes, size_t imageBytes);      // under writeMutex_
-    Strong<id<MTLFunction>> function(const gpu::ProgramDesc& desc, bool vertex, juce::String& error);
+    // A stage's function, its entry in functions_ held once more (`key`: give it
+    // back with releaseFunction()); null, nothing held, when it can't be made.
+    Strong<id<MTLFunction>> function(const gpu::ProgramDesc& desc, bool vertex, const std::string*& key, juce::String& error);
+    // One use fewer of an entry; the last takes it out (under tableMutex_; null: nothing).
+    void releaseFunction(const std::string* key);
+    void releaseKernelLibrary(const std::string* key);
 
     id<MTLDevice>       device_ = nil;   // owned (+1)
     id<MTLCommandQueue> queue_  = nil;   // owned (+1)
@@ -234,15 +243,22 @@ private:
     backends::SlotTable<KernelSlot>   kernels_;
     std::string                       deviceName_;   // Caps::compute.deviceName's text
     // Kernels' libraries by source (with the macros a kernel's constants define
-    // ahead of it); jvk's fill and copy kernels.
-    std::unordered_map<std::string, Strong<id<MTLLibrary>>> kernelLibraries_;   // under tableMutex_
+    // ahead of it), and how many live kernels use each: kernels of one source
+    // share its library, and the last to go takes it out. A program that writes
+    // kernels as it runs and drops them keeps only the libraries of those it
+    // still has (a pipeline state needs no library once made; Metal's compiler
+    // cache makes a source made again cheap). Then jvk's fill and copy kernels.
+    struct SharedLibrary { Strong<id<MTLLibrary>> library; uint32_t users = 0; };
+    std::unordered_map<std::string, SharedLibrary> kernelLibraries_;   // under tableMutex_
     Strong<id<MTLComputePipelineState>> fillState_, copyState_;                 // under tableMutex_
     bool                                utilityTried_ = false;                  // under tableMutex_
     std::mutex tableMutex_;
     std::unordered_map<gpu::PipelineDesc, uint32_t, gpu::PipelineDescHash> pipelineIds_;
     std::vector<std::pair<gpu::StencilState, Strong<id<MTLDepthStencilState>>>> depthStencilStates_;   // under tableMutex_
-    // Compiled functions by source (the bundle's stages are shared between programs).
-    struct Function { Strong<id<MTLLibrary>> library; Strong<id<MTLFunction>> function; };
+    // Compiled functions by source, and how many live programs use each: the
+    // bundle's stages are shared between programs, and a function goes with the
+    // last program that uses it (as kernels' libraries do).
+    struct Function { Strong<id<MTLLibrary>> library; Strong<id<MTLFunction>> function; uint32_t users = 0; };
     std::unordered_map<std::string, Function> functions_;                                           // under tableMutex_
 
     Strong<id<MTLSamplerState>> samplers_[6];   // Filter x AddressMode

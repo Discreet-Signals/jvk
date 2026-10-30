@@ -625,8 +625,9 @@ bool Backend::readTexture(gpu::TextureId texture, gpu::IRect region, std::span<s
 
 // ---- Programs and pipelines ---------------------------------------------------------
 
-Strong<id<MTLFunction>> Backend::function(const gpu::ProgramDesc& desc, bool vertex, juce::String& error)
+Strong<id<MTLFunction>> Backend::function(const gpu::ProgramDesc& desc, bool vertex, const std::string*& held, juce::String& error)
 {
+    held = nullptr;
     if (desc.format != gpu::ShaderFormat::MSL) { error = "a shader format Metal can't take"; return {}; }
     const auto bytes = vertex ? desc.vertex : desc.fragment;
     const std::string source(reinterpret_cast<const char*>(bytes.data()), bytes.size());
@@ -635,7 +636,12 @@ Strong<id<MTLFunction>> Backend::function(const gpu::ProgramDesc& desc, bool ver
     const std::string key = entry + '\n' + source;
     {
         std::lock_guard<std::mutex> lk(tableMutex_);
-        if (auto it = functions_.find(key); it != functions_.end()) return it->second.function;
+        if (auto it = functions_.find(key); it != functions_.end())
+        {
+            ++it->second.users;
+            held = &it->first;
+            return it->second.function;
+        }
     }
 
     Function compiled;
@@ -655,9 +661,20 @@ Strong<id<MTLFunction>> Backend::function(const gpu::ProgramDesc& desc, bool ver
         compiled.function = Strong<id<MTLFunction>>::adopt(fn);
     }
 
+    // Another program may have made the same stage meanwhile: the first one in is shared.
     std::lock_guard<std::mutex> lk(tableMutex_);
     auto [it, inserted] = functions_.emplace(key, std::move(compiled));
+    ++it->second.users;
+    held = &it->first;
     return it->second.function;
+}
+
+void Backend::releaseFunction(const std::string* key)
+{
+    if (key == nullptr) return;
+    const auto it = functions_.find(*key);
+    jassert(it != functions_.end() && it->second.users > 0);
+    if (it != functions_.end() && --it->second.users == 0) functions_.erase(it);
 }
 
 gpu::ProgramId Backend::createProgram(const gpu::ProgramDesc& desc)
@@ -693,18 +710,26 @@ gpu::ProgramId Backend::createProgram(const gpu::ProgramDesc& desc)
     }
 
     juce::String error;
-    p.vertex = function(desc, true, error);
-    if (p.vertex) p.fragment = function(desc, false, error);
+    p.vertex = function(desc, true, p.vertexKey, error);
+    if (p.vertex) p.fragment = function(desc, false, p.fragmentKey, error);
     if (!p.vertex || !p.fragment)
     {
         diag::log("metal: program " + juce::String(p.name) + " could not be created: " + error);
+        std::lock_guard<std::mutex> lk(tableMutex_);
+        releaseFunction(p.vertexKey);
+        releaseFunction(p.fragmentKey);
         return {};
     }
 
     std::lock_guard<std::mutex> lk(tableMutex_);
     ProgramSlot* slot = nullptr;
     const uint32_t handle = programs_.allocate(slot);
-    if (handle == 0) return {};
+    if (handle == 0)
+    {
+        releaseFunction(p.vertexKey);
+        releaseFunction(p.fragmentKey);
+        return {};
+    }
     *slot = std::move(p);
     return { handle };
 }
@@ -720,6 +745,10 @@ void Backend::destroyProgram(gpu::ProgramId program)
             pipelineIds_.erase(ps->desc);
             pipelines_.release(ph);
         }
+    // Its stages' functions go with the last program that uses them (a pipeline
+    // a command buffer still draws with needs neither).
+    releaseFunction(p->vertexKey);
+    releaseFunction(p->fragmentKey);
     programs_.release(program.value);
 }
 
@@ -756,12 +785,19 @@ id<MTLDepthStencilState> Backend::depthStencilState(const gpu::StencilState& ste
 gpu::PipelineId Backend::createPipeline(const gpu::PipelineDesc& desc)
 {
     if (!usable()) return {};
+    // The program's functions held here, so building outside the lock never
+    // races its destruction (they go with the last program that uses them).
+    Strong<id<MTLFunction>> vertex, fragment;
+    std::string name;
     {
         std::lock_guard<std::mutex> lk(tableMutex_);
         if (auto it = pipelineIds_.find(desc); it != pipelineIds_.end()) return { it->second };
+        const ProgramSlot* prog = programs_.resolve(desc.program.value);
+        if (prog == nullptr) return {};
+        vertex   = prog->vertex;
+        fragment = prog->fragment;
+        name     = prog->name;
     }
-    ProgramSlot* prog = programs_.resolve(desc.program.value);
-    if (prog == nullptr) return {};
 
     PipelineSlot built;
     built.desc      = desc;
@@ -770,9 +806,9 @@ gpu::PipelineId Backend::createPipeline(const gpu::PipelineDesc& desc)
     @autoreleasepool
     {
         MTLRenderPipelineDescriptor* d = [[MTLRenderPipelineDescriptor alloc] init];
-        d.vertexFunction   = prog->vertex.get();
-        d.fragmentFunction = prog->fragment.get();
-        if (prog->name.size() > 0) d.label = [NSString stringWithUTF8String:prog->name.c_str()];
+        d.vertexFunction   = vertex.get();
+        d.fragmentFunction = fragment.get();
+        if (name.size() > 0) d.label = [NSString stringWithUTF8String:name.c_str()];
         const auto& att = desc.attachments;
         for (uint32_t i = 0; i < att.colorCount && i < gpu::kMaxColorAttachments; ++i)
         {
@@ -818,13 +854,13 @@ gpu::PipelineId Backend::createPipeline(const gpu::PipelineDesc& desc)
         else
         {
             static std::atomic<bool> logged { false };
-            logOnce(logged, "metal: pipeline " + juce::String(prog->name) + " could not be built: " + describe(err));
+            logOnce(logged, "metal: pipeline " + juce::String(name) + " could not be built: " + describe(err));
         }
     }
 
     std::lock_guard<std::mutex> lk(tableMutex_);
     if (auto it = pipelineIds_.find(desc); it != pipelineIds_.end()) return { it->second };
-    prog = programs_.resolve(desc.program.value);   // destroyed meanwhile?
+    ProgramSlot* prog = programs_.resolve(desc.program.value);   // destroyed meanwhile?
     if (prog == nullptr) return {};
     if (desc.attachments.depthStencil) built.depthStencil = Strong<id<MTLDepthStencilState>>::retain(depthStencilState(desc.stencil));
     PipelineSlot* slot = nullptr;

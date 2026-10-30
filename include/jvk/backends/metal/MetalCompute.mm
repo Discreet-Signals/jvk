@@ -158,8 +158,14 @@ void* Backend::bufferData(gpu::BufferId buffer)
 gpu::KernelId Backend::createKernel(const gpu::KernelDesc& desc)
 {
     const juce::String name = desc.name != nullptr ? desc.name : "?";
-    auto refused = [&name](const juce::String& why) -> gpu::KernelId
+    const std::string* held = nullptr;   // its library's entry in kernelLibraries_, one use of it held once found or made
+    auto refused = [&](const juce::String& why) -> gpu::KernelId
     {
+        if (held != nullptr)
+        {
+            std::lock_guard<std::mutex> lk(tableMutex_);
+            releaseKernelLibrary(std::exchange(held, nullptr));
+        }
         diag::log("metal: kernel " + name + ": " + why);
         return {};
     };
@@ -191,27 +197,39 @@ gpu::KernelId Backend::createKernel(const gpu::KernelDesc& desc)
     }
     if (!defines.empty()) source = defines + source;
 
+    // The library of a live kernel of the same source, or a new one.
     Strong<id<MTLLibrary>> library;
     {
         std::lock_guard<std::mutex> lk(tableMutex_);
-        if (auto it = kernelLibraries_.find(source); it != kernelLibraries_.end()) library = it->second;
+        if (auto it = kernelLibraries_.find(source); it != kernelLibraries_.end())
+        {
+            ++it->second.users;
+            held = &it->first;
+            library = it->second.library;
+        }
     }
     if (!library)
     {
+        Strong<id<MTLLibrary>> made;
         @autoreleasepool
         {
             NSString* text = [[NSString alloc] initWithBytes:source.data() length:source.size() encoding:NSUTF8StringEncoding];
             MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
             options.languageVersion = MTLLanguageVersion2_1;
             NSError* err = nil;
-            id<MTLLibrary> made = [device_ newLibraryWithSource:text options:options error:&err];
+            id<MTLLibrary> compiled = [device_ newLibraryWithSource:text options:options error:&err];
             [options release];
             [text release];
-            if (made == nil) return refused(describeError(err));
-            library = Strong<id<MTLLibrary>>::adopt(made);
+            if (compiled == nil) return refused(describeError(err));
+            made = Strong<id<MTLLibrary>>::adopt(compiled);
         }
+        // Another thread may have made the same source meanwhile: the first one in is shared.
         std::lock_guard<std::mutex> lk(tableMutex_);
-        kernelLibraries_.emplace(source, library);
+        auto [it, inserted] = kernelLibraries_.try_emplace(source);
+        if (inserted) it->second.library = std::move(made);
+        ++it->second.users;
+        held = &it->first;
+        library = it->second.library;
     }
 
     @autoreleasepool
@@ -259,15 +277,31 @@ gpu::KernelId Backend::createKernel(const gpu::KernelDesc& desc)
     std::lock_guard<std::mutex> lk(tableMutex_);
     KernelSlot* slot = nullptr;
     const uint32_t handle = kernels_.allocate(slot);
-    if (handle == 0) return {};
+    if (handle == 0)
+    {
+        releaseKernelLibrary(held);
+        return {};
+    }
+    k.library = held;
     *slot = std::move(k);
     return { handle };
 }
 
 void Backend::destroyKernel(gpu::KernelId kernel)
 {
+    // Its pipeline state and its use of its library go now: a command buffer
+    // still running it holds the pipeline state, which needs no library.
     std::lock_guard<std::mutex> lk(tableMutex_);
+    if (const KernelSlot* k = kernels_.resolve(kernel.value)) releaseKernelLibrary(k->library);
     kernels_.release(kernel.value);
+}
+
+void Backend::releaseKernelLibrary(const std::string* key)
+{
+    if (key == nullptr) return;
+    const auto it = kernelLibraries_.find(*key);
+    jassert(it != kernelLibraries_.end() && it->second.users > 0);
+    if (it != kernelLibraries_.end() && --it->second.users == 0) kernelLibraries_.erase(it);
 }
 
 void Backend::makeUtilityStates()
