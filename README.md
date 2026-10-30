@@ -254,13 +254,45 @@ Other things you can do:
 - **Per-draw images.** A sampler in `layout(set = 2, binding = 0)` takes a different image on each draw: `shader.setDrawImage ("albedo", jvk::ImageSource::of (image))`.
 - **Frame values.** `vk->values()` is a `juce::ValueTree` that is emptied every frame. Components use it to pass information, such as a light's position, to shaders painted later in the same frame.
 
+## Compute
+
+`jvk::compute` runs GLSL compute shaders (kernels) over GPU buffers, on Metal and on Vulkan. Write the kernels in GLSL, and `jvk_compute_shaders` builds them into one header for the backends your build has:
+
+```cmake
+jvk_compute_shaders(MyPlugin HEADER MyKernels.h NAMESPACE mykernels SOURCES Source/scale.comp)
+```
+
+Kernels run in two places:
+
+- **Beside the rendering**, on a stream: analysis, training, offline renders. Streams use a queue of their own where the GPU has one.
+
+  ```cpp
+  auto context = jvk::compute::Context::create (&why);   // nullptr: no GPU, and why
+  auto data = context->buffer (n * sizeof (float), jvk::compute::Usage::Shared);
+  auto scale = context->kernel (mykernels::scale);
+  auto stream = context->stream();
+  stream->dispatch (scale, jvk::compute::Groups::cover (n, 64, context->limits()), { data.range() }, Push { n, 2.0f });
+  stream->submit();
+  stream->wait();
+  ```
+
+- **In a frame**, in paint order. A kernel writes a buffer, and a shader draws from it in the same frame. The data never comes back to the CPU.
+
+  ```cpp
+  vk->dispatch (peaksKernel, groups, { peaks.range() }, Push { columns });
+  meter.set ("Peaks", peaks.range());   // the shader's storage block reads the buffer
+  vk->drawShader (meter, meterArea);
+  ```
+
+[COMPUTE.md](COMPUTE.md) covers the whole API, the GLSL library (`jvk/compute.glsl`, `jvk/scan.glsl`) and what each backend does. `examples/compute` tests every part of it on your machine.
+
 ## Examples
 
-`examples/` has four example plugins. To build one on its own:
+`examples/` has five example plugins. To build one on its own:
 
 ```bash
 cmake -B build -G Ninja
 cmake --build build --target VulkanCompressor_Standalone
 ```
 
-The targets are `VulkanCompressor_Standalone`, `ShaderBackground_Standalone`, `JVKCompliance_Standalone` and `JVKBenchmark_Standalone`.
+The targets are `VulkanCompressor_Standalone`, `ShaderBackground_Standalone`, `JVKCompliance_Standalone`, `JVKBenchmark_Standalone` and `JvkCompute_Standalone`.

@@ -372,4 +372,18 @@ struct BlurPathParams {
     float    invStripH  = 0.0f;
 };
 
+// A kernel run where paint is (Graphics::dispatch): no clip, no target, no
+// pixels. Its push constants travel with it, as many bytes as the kernel's
+// block (at most kDispatchConstants).
+inline constexpr uint32_t kDispatchConstants = 256;
+
+struct DispatchParams {
+    gpu::KernelId      kernel;
+    uint32_t           groups[3] { 1, 1, 1 };
+    uint32_t           bindingCount = 0;
+    gpu::BufferBinding bindings[gpu::kMaxKernelBindings] {};
+    uint32_t           constantsBytes = 0;
+    alignas(16) std::byte constants[kDispatchConstants] {};
+};
+
 } // namespace jvk

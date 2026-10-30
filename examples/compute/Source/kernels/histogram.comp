@@ -1,0 +1,27 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Counts values by value % bins. `bins` (constant 0) sizes the workgroup's
+// shared tally: a constant that sizes an array, which Metal takes as a macro
+// defined ahead of the source. values.length() is its buffer's size, which
+// Metal passes beside the buffers.
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint bins = 8u;
+#include "jvk/compute.glsl"
+
+layout(std430, binding = 0) readonly buffer Values { uint values[]; };
+layout(std430, binding = 1) buffer Counts { uint counts[]; };
+
+shared uint tally[bins];
+
+void main()
+{
+    for (uint b = gl_LocalInvocationIndex; b < bins; b += gl_WorkGroupSize.x)
+        tally[b] = 0u;
+    barrier();
+    const uint i = jvkThread();
+    if (i < uint(values.length()))
+        atomicAdd(tally[values[i] % bins], 1u);
+    barrier();
+    for (uint b = gl_LocalInvocationIndex; b < bins; b += gl_WorkGroupSize.x)
+        atomicAdd(counts[b], tally[b]);
+}

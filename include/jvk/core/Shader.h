@@ -34,8 +34,8 @@ namespace jvk {
 //       } pc;
 //
 //   - Set 0: its own bindings — sampler2D / sampler2DArray (set), uniform and
-//     storage blocks (set(name, value)). A sampler2D named after a render
-//     target reads that target.
+//     storage blocks (set(name, value), or a GPU buffer: set(name, range)). A
+//     sampler2D named after a render target reads that target.
 //   - Set 1, binding 0: `uniform sampler2D scene;` — the main colour as painted
 //     so far (the shader then runs as a pass of its own and REPLACES its
 //     region).
@@ -118,6 +118,25 @@ public:
             if (b.isBuffer() && (b.name == name || b.blockName == name)) {
                 if (b.offset + data.size_bytes() <= uniformData_.size())
                     std::memcpy(uniformData_.data() + b.offset, data.data(), data.size_bytes());
+                return;
+            }
+        }
+    }
+
+    // A GPU buffer a uniform or storage block reads in place of the bytes
+    // set() copies: what a kernel wrote (jvk::compute), with no copy back to
+    // the CPU. Its offset a multiple of Caps::storageAlignment, its size what
+    // the block reads, under 4 GB. The buffer must be of this Shader's backend
+    // (a compute::Context made with no backend shares the editors'), and live
+    // while frames may draw with it: a compute::Buffer that goes is kept for
+    // the frames that name it. An empty range goes back to the copied bytes.
+    // Seen by the draw: a dispatch in the same frame before it
+    // (Graphics::dispatch), or a stream's work that wait() said is done.
+    void set(const juce::String& name, const compute::Range& range)
+    {
+        for (auto& b : bindings_) {
+            if (b.isBuffer() && (b.name == name || b.blockName == name)) {
+                b.bound = range.bytes > 0 ? range.binding() : gpu::BufferBinding {};
                 return;
             }
         }
@@ -208,6 +227,7 @@ private:
         uint32_t         set = 0, binding = 0;
         gpu::BindingKind kind = gpu::BindingKind::CombinedTextureSampler;
         uint32_t         offset = 0, size = 0;   // a block's bytes in uniformData_
+        gpu::BufferBinding bound;                // a block's GPU buffer, when set(name, range) gave one
         uint8_t          slot = 0;               // its texture or storage slot
         bool             arrayed = false;        // an image binding declared as an array (sampler2DArray)
 

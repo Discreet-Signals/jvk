@@ -86,7 +86,24 @@ void PacketExecutor::encode(id<MTLCommandBuffer> cb, FrameSlot& slot, const gpu:
         std::memcpy([slot.storage.get() contents], packet.storageData.data(), packet.storageData.size());
 
     for (const auto& pass : packet.passes)
-        encodePass(cb, slot, packet, pass, serial);
+    {
+        if (pass.kind == gpu::PassKind::Compute) encodeComputePass(cb, packet, pass);
+        else                                     encodePass(cb, slot, packet, pass, serial);
+    }
+}
+
+void PacketExecutor::encodeComputePass(id<MTLCommandBuffer> cb, const gpu::FramePacket& packet, const gpu::Pass& pass)
+{
+    if (pass.firstDispatch > packet.dispatches.size() || pass.dispatchCount > packet.dispatches.size() - pass.firstDispatch)
+        return;
+    // A serial encoder in the frame's command buffer: each dispatch sees the
+    // writes of the one before, and hazard tracking orders the encoder against
+    // the render encoders around it.
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    if (enc == nil) return;
+    for (uint32_t k = 0; k < pass.dispatchCount; ++k)
+        backend_.encodeDispatch(enc, packet.dispatches[pass.firstDispatch + k], packet.constantData);
+    [enc endEncoding];
 }
 
 void PacketExecutor::encodePass(id<MTLCommandBuffer> cb, FrameSlot& slot, const gpu::FramePacket& packet,
@@ -163,9 +180,22 @@ void PacketExecutor::encodeDraw(id<MTLRenderCommandEncoder> enc, FrameSlot& slot
     const gpu::IRect scissor = intersect(draw.scissor, area);
     if (scissor.isEmpty()) return;
 
-    // Everything a draw reads must be valid before anything is bound.
+    // Everything a draw reads must be valid before anything is bound: each
+    // storage range inside the frame's storage, or the buffer it names.
+    id<MTLBuffer> storage[gpu::kMaxDrawStorage] {};
     for (uint32_t j = 0; j < draw.storageCount && j < gpu::kMaxDrawStorage; ++j)
-        if (uint64_t(draw.storage[j].offset) + draw.storage[j].size > packet.storageData.size()) return;
+    {
+        uint64_t limit = packet.storageData.size();
+        storage[j] = slot.storage.get();
+        if (draw.storageBuffer[j])
+        {
+            const BufferSlot* b = backend_.buffer(draw.storageBuffer[j]);
+            if (b == nullptr || !b->buffer) return;
+            storage[j] = b->buffer.get();
+            limit = b->size;
+        }
+        if (uint64_t(draw.storage[j].offset) + draw.storage[j].size > limit) return;
+    }
 
     if (ps != bound_.pipeline)
     {
@@ -215,10 +245,10 @@ void PacketExecutor::encodeDraw(id<MTLRenderCommandEncoder> enc, FrameSlot& slot
     {
         const uint8_t index = prog->storageIndex[j];
         const size_t offset = draw.storage[j].offset;
-        if (bound_.buffers[index] != slot.storage.get())
+        if (bound_.buffers[index] != storage[j])
         {
-            [enc setFragmentBuffer:slot.storage.get() offset:offset atIndex:index];
-            bound_.buffers[index] = slot.storage.get();
+            [enc setFragmentBuffer:storage[j] offset:offset atIndex:index];
+            bound_.buffers[index] = storage[j];
             bound_.offsets[index] = offset;
         }
         else if (bound_.offsets[index] != offset)

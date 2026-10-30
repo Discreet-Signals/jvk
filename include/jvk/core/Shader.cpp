@@ -286,7 +286,14 @@ bool Shader::capture(Renderer& r, ShaderCapture& c)
     for (auto& b : bindings_)
     {
         if (b.isBuffer()) {
-            c.storage[b.slot] = r.pushShaderData({ uniformData_.data() + b.offset, b.size });
+            if (b.bound.buffer) {
+                jassert(b.bound.offset + b.bound.size <= std::numeric_limits<uint32_t>::max());
+                c.storage[b.slot] = { static_cast<uint32_t>(b.bound.offset), static_cast<uint32_t>(b.bound.size) };
+                c.storageBuffer[b.slot] = b.bound.buffer;
+            } else {
+                c.storage[b.slot] = r.pushShaderData({ uniformData_.data() + b.offset, b.size });
+                c.storageBuffer[b.slot] = {};
+            }
             continue;
         }
         // A sampler named after a target reads that target (the lowering binds

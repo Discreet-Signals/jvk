@@ -223,9 +223,17 @@ target_sources(jvk INTERFACE "${JVK_SHADER_HEADER}")
 # Graphics::shader beside the SPIR-V. A build without Metal writes it empty.
 # ==============================================================================
 
+# The vendored SPIRV-Cross, compiled once for the build-machine tools (jvk_msl,
+# jvk_kernel); built only when one of them is.
+if (NOT TARGET jvk_spirv_cross)
+    add_library(jvk_spirv_cross STATIC EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/spirv_cross.cpp")
+    target_compile_features(jvk_spirv_cross PUBLIC cxx_std_17)
+    target_include_directories(jvk_spirv_cross PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/tools")
+endif()
+
 if (JVK_METAL AND NOT TARGET jvk_msl)
     add_executable(jvk_msl EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/jvk_msl.cpp")
-    target_compile_features(jvk_msl PRIVATE cxx_std_17)
+    target_link_libraries(jvk_msl PRIVATE jvk_spirv_cross)
 endif()
 
 function(jvk_msl SPIRV OUTPUT)
@@ -240,6 +248,107 @@ function(jvk_msl SPIRV OUTPUT)
             COMMAND ${CMAKE_COMMAND} -E touch "${OUTPUT}"
             DEPENDS "${SPIRV}"
             VERBATIM)
+    endif()
+endfunction()
+
+# ==============================================================================
+# jvk_compute_shaders — a project's compute kernels (GLSL, COMPUTE.md), built
+# for the backends the build has, in one header: each kernel's SPIR-V, its MSL
+# and its interface, reflected at build time by tools/jvk_kernel.cpp. It
+# rebuilds whenever a kernel or anything it includes changes. jvk's GLSL
+# library is on the include path: #include "jvk/compute.glsl", "jvk/scan.glsl".
+#
+#   jvk_compute_shaders(<target>
+#       HEADER     <MyKernels.h>          # the generated header's name
+#       NAMESPACE  <my::kernels>          # each kernel a jvk::compute::KernelSource named after its file
+#       SOURCES    <a.comp> ...           # a.comp -> my::kernels::a
+#       [INCLUDE_DIRS <dir> ...]          # for the kernels' own #includes
+#       [TARGET_ENV vulkan1.0|vulkan1.1|...])   # vulkan1.0 by default: loads on any Vulkan
+#
+# The header goes in the build tree, on <target>'s include path, and is one of
+# its sources (INTERFACE for an interface library), so it is made first.
+# ==============================================================================
+
+if (NOT TARGET jvk_kernel)
+    add_executable(jvk_kernel EXCLUDE_FROM_ALL "${CMAKE_CURRENT_SOURCE_DIR}/tools/jvk_kernel.cpp")
+    target_link_libraries(jvk_kernel PRIVATE jvk_spirv_cross)
+endif()
+
+function(jvk_compute_shaders TARGET)
+    cmake_parse_arguments(ARG "" "HEADER;NAMESPACE;TARGET_ENV" "SOURCES;INCLUDE_DIRS" ${ARGN})
+    if (NOT ARG_HEADER OR NOT ARG_NAMESPACE OR NOT ARG_SOURCES)
+        message(FATAL_ERROR "jvk_compute_shaders(${TARGET}): HEADER, NAMESPACE and SOURCES are required")
+    endif()
+    # glslc from the Vulkan SDK (find_package(Vulkan)'s, a cache variable, so
+    # seen from any directory), else wherever it is.
+    set(_glslc "${Vulkan_GLSLC_EXECUTABLE}")
+    if (NOT _glslc)
+        find_program(JVK_KERNEL_GLSLC glslc HINTS "$ENV{VULKAN_SDK}/bin" "$ENV{VULKAN_SDK}/Bin")
+        set(_glslc "${JVK_KERNEL_GLSLC}")
+    endif()
+    if (NOT _glslc)
+        message(FATAL_ERROR "jvk_compute_shaders(${TARGET}): glslc not found (it comes with the Vulkan SDK)")
+    endif()
+    if (NOT ARG_TARGET_ENV)
+        set(ARG_TARGET_ENV vulkan1.0)
+    endif()
+
+    set(_out "${CMAKE_CURRENT_BINARY_DIR}/jvk_compute/${TARGET}")
+    file(MAKE_DIRECTORY "${_out}")
+    set(_includes "-I${CMAKE_CURRENT_FUNCTION_LIST_DIR}/shaders/include")
+    foreach(_dir ${ARG_INCLUDE_DIRS})
+        list(APPEND _includes "-I${_dir}")
+    endforeach()
+
+    # glslc's dependency files rebuild a kernel when something it includes changes. Ninja and
+    # Makefiles take them from CMake 3.20, Xcode and Visual Studio from 3.21; before that, only
+    # the kernel's own source is watched.
+    set(_depfiles OFF)
+    if (CMAKE_GENERATOR MATCHES "Ninja|Makefiles" OR CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+        set(_depfiles ON)
+    endif()
+
+    set(_kernels)
+    set(_spvs)
+    foreach(_source ${ARG_SOURCES})
+        get_filename_component(_source "${_source}" ABSOLUTE)
+        get_filename_component(_name "${_source}" NAME_WE)
+        string(MAKE_C_IDENTIFIER "${_name}" _name)
+        set(_spv "${_out}/${_name}.spv")
+        set(_depfile)
+        if (_depfiles)
+            set(_depfile DEPFILE "${_spv}.d")
+        endif()
+        add_custom_command(
+            OUTPUT  "${_spv}"
+            COMMAND "${_glslc}" -fshader-stage=compute --target-env=${ARG_TARGET_ENV} -O
+                    ${_includes} -MD -MF "${_spv}.d" -o "${_spv}" "${_source}"
+            DEPENDS "${_source}"
+            ${_depfile}
+            COMMENT "jvk: compiling ${_name} (compute)"
+            VERBATIM
+        )
+        list(APPEND _kernels "${_name}=${_spv}")
+        list(APPEND _spvs "${_spv}")
+    endforeach()
+
+    set(_header "${_out}/${ARG_HEADER}")
+    add_custom_command(
+        OUTPUT  "${_header}"
+        COMMAND jvk_kernel "${_header}" "${ARG_NAMESPACE}" ${_kernels}
+        DEPENDS ${_spvs} jvk_kernel
+        COMMENT "jvk: reflecting and translating ${ARG_HEADER}"
+        VERBATIM
+    )
+    add_custom_target(${TARGET}_jvk_compute DEPENDS "${_header}")
+
+    get_target_property(_type ${TARGET} TYPE)
+    if (_type STREQUAL "INTERFACE_LIBRARY")
+        target_sources(${TARGET} INTERFACE "${_header}")
+        target_include_directories(${TARGET} INTERFACE "${_out}")
+    else()
+        target_sources(${TARGET} PRIVATE "${_header}")
+        target_include_directories(${TARGET} PRIVATE "${_out}")
     endif()
 endfunction()
 
@@ -335,6 +444,22 @@ function(jvk_bundle TARGET)
 endfunction()
 
 # ==============================================================================
+# jvk_runtime — Vulkan for a plain executable (a test runner, a command-line
+# tool: no bundle). macOS with the Vulkan backend: the shipped MoltenVK copied
+# beside the executable, where Device.cpp's loadVulkan looks after a bundle's
+# Frameworks. Metal alone, Windows, Linux: no-op (nothing to ship; the system
+# loader, as for plugins).
+# ==============================================================================
+function(jvk_runtime TARGET)
+    if (APPLE AND DS_VULKAN_MVK_LIB AND "Vulkan" IN_LIST JVK_BACKENDS)
+        add_custom_command(TARGET ${TARGET} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${DS_VULKAN_MVK_LIB}" "$<TARGET_FILE_DIR:${TARGET}>/libMoltenVK.dylib"
+            COMMENT "jvk: MoltenVK beside ${TARGET}"
+        )
+    endif()
+endfunction()
+
+# ==============================================================================
 # Examples — EXCLUDE_FROM_ALL: show up as IDE targets, don't build by default.
 # Build a specific one with: cmake --build build --target VulkanCompressor_Standalone
 # ==============================================================================
@@ -342,4 +467,5 @@ endfunction()
 add_subdirectory(examples/benchmark          EXCLUDE_FROM_ALL)
 add_subdirectory(examples/compliance        EXCLUDE_FROM_ALL)
 add_subdirectory(examples/compressor        EXCLUDE_FROM_ALL)
+add_subdirectory(examples/compute           EXCLUDE_FROM_ALL)
 add_subdirectory(examples/shader_background EXCLUDE_FROM_ALL)

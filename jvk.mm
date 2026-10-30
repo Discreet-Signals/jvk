@@ -37,6 +37,7 @@
 #include "include/jvk/backends/metal/MetalBackend.h"
 #include "include/jvk/backends/metal/MetalBackend.mm"
 #include "include/jvk/backends/metal/MetalSurface.mm"
+#include "include/jvk/backends/metal/MetalCompute.mm"
 #include "include/jvk/backends/metal/MetalHost.mm"
 #endif
 #endif

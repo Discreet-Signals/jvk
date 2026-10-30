@@ -29,8 +29,12 @@ namespace jvk::vulkan
 //                        a frame (Surface::submit records under it, so texture
 //                        layout tracking is single-threaded), the framebuffer
 //                        cache, collect(). Reentrant.
+//   Device::computeQueueLock()
+//                        a compute stream's vkQueueSubmit (the same lock as
+//                        the submit lock when compute shares the queue).
 //   tableMutex_          handle-table create/destroy, the pipeline intern map,
 //                        the retire list, samplers.
+//   computeMutex_        the compute submissions in flight (a leaf).
 //   writeMutex_          queued texture writes and their staging.
 //   renderPassMutex_     the VkRenderPass cache (pipelines are built on any
 //                        thread, frames under the submit lock).
@@ -108,6 +112,31 @@ struct PipelineSlot
     uint32_t          program  = 0;                // handle value
 };
 
+// Compute (COMPUTE.md): a buffer, shared between the graphics and compute
+// families when they differ, so frames and streams both use it as it is.
+struct BufferSlot
+{
+    VkBuffer          buffer     = VK_NULL_HANDLE;
+    VmaAllocation     allocation = nullptr;
+    void*             mapped     = nullptr;   // persistently, for every memory but Device
+    VkDeviceSize      size       = 0;
+    gpu::BufferMemory memory     = gpu::BufferMemory::Device;
+};
+
+struct KernelSlot
+{
+    VkPipeline            pipeline  = VK_NULL_HANDLE;
+    VkPipelineLayout      layout    = VK_NULL_HANDLE;
+    VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    // By binding number: its descriptor type, VK_DESCRIPTOR_TYPE_MAX_ENUM where
+    // none is declared (a dispatch's range there is skipped).
+    VkDescriptorType types[gpu::kMaxKernelBindings] {};
+    uint32_t         bindingCount  = 0;   // the highest declared + 1
+    uint32_t         storageCount  = 0, uniformCount = 0;
+    uint32_t         constantsBytes = 0;
+    uint32_t         groupSize[3] { 1, 1, 1 };
+};
+
 // ---- Render pass cache key ------------------------------------------------------
 
 struct RenderPassKey
@@ -181,10 +210,21 @@ public:
 
     std::unique_ptr<gpu::Surface> createOffscreenSurface(gpu::TextureId target) override;
 
+    gpu::BufferId createBuffer(const gpu::BufferDesc& desc) override;
+    void          destroyBuffer(gpu::BufferId buffer) override;
+    void*         bufferData(gpu::BufferId buffer) override;
+    void          flushBuffer(gpu::BufferId buffer, uint64_t offset, uint64_t size) override;
+    void          invalidateBuffer(gpu::BufferId buffer, uint64_t offset, uint64_t size) override;
+    gpu::KernelId createKernel(const gpu::KernelDesc& desc) override;
+    void          destroyKernel(gpu::KernelId kernel) override;
+    std::unique_ptr<gpu::ComputeStream> createComputeStream() override;
+
     // ---- For the surfaces (VulkanSurface.cpp) --------------------------------
     TextureSlot*  texture(gpu::TextureId t)   const { return textures_.resolve(t.value); }
     ProgramSlot*  program(uint32_t handle)    const { return programs_.resolve(handle); }
     PipelineSlot* pipeline(gpu::PipelineId p) const { return pipelines_.resolve(p.value); }
+    BufferSlot*   buffer(gpu::BufferId b)     const { return buffers_.resolve(b.value); }
+    KernelSlot*   kernel(gpu::KernelId k)     const { return kernels_.resolve(k.value); }
 
     // A swap image as a texture (a colour attachment the core draws into). The
     // image stays the swapchain's; the texture owns only its view.
@@ -219,6 +259,17 @@ public:
     // frame's passes.
     void     recordPendingWrites(VkCommandBuffer cmd, uint64_t serial);
 
+    // ---- Compute submissions (VulkanCompute.cpp) -------------------------------
+    // A stream's submission takes a serial from the frames' counter, so
+    // whatever is destroyed while it is recorded or in flight waits for it;
+    // it is done once the stream has seen its fence signal (or given up).
+    uint64_t beginComputeSubmission();
+    uint64_t timestampMask() const noexcept { return timestampMask_; }
+    void     endComputeSubmission(uint64_t serial);
+    // collect(), when the submit lock is free now (a compute-only process
+    // has no frames to collect for it).
+    void     tryCollect();
+
     // Adds the barrier that takes `t` from its tracked state to (layout, stage,
     // access); none when nothing needs ordering. `discard`: the old contents
     // don't matter (the old layout becomes UNDEFINED).
@@ -239,6 +290,9 @@ private:
     uint64_t completedSerial();   // under the submit lock
     void freeTexture(uint32_t handle);   // under the submit lock + tableMutex_
     void freeProgram(uint32_t handle);   // under the submit lock + tableMutex_
+    void freeBuffer(uint32_t handle);    // under the submit lock + tableMutex_
+    void freeKernel(uint32_t handle);    // under the submit lock + tableMutex_
+    void initComputeCaps();
     void destroyFramebuffersOf(uint32_t textureHandle);
     gpu::TextureId createTextureLocked(const gpu::TextureDesc& desc);
 
@@ -249,17 +303,23 @@ private:
     SlotTable<TextureSlot>  textures_;
     SlotTable<ProgramSlot>  programs_;
     SlotTable<PipelineSlot> pipelines_;
+    SlotTable<BufferSlot>   buffers_;
+    SlotTable<KernelSlot>   kernels_;
+    std::string             deviceName_;   // Caps::compute.deviceName's text
+    uint64_t                timestampMask_ = 0;   // the compute family's valid timestamp bits
     std::mutex tableMutex_;
     std::unordered_map<gpu::PipelineDesc, uint32_t, gpu::PipelineDescHash> pipelineIds_;
 
     // ---- Deferred destruction --------------------------------------------------
-    enum class RetiredKind : uint8_t { Texture, Program };
+    enum class RetiredKind : uint8_t { Texture, Program, Buffer, Kernel };
     struct Retired { RetiredKind kind; uint32_t handle; uint64_t serial; };
     std::vector<Retired>  retired_;
     std::vector<Retired>  retiredScratch_;
     std::atomic<uint64_t> startedSerial_ { 0 };
     struct InFlight { uint64_t serial; VkFence fence; };
     std::vector<InFlight> inFlight_;              // under the submit lock
+    std::mutex            computeMutex_;
+    std::vector<uint64_t> computeActive_;         // compute serials begun and not yet done (under computeMutex_)
 
     // ---- Texture writes ----------------------------------------------------------
     struct StagingChunk { HostBuffer buffer; VkDeviceSize head = 0; uint64_t serial = 0; };

@@ -34,7 +34,8 @@ struct ShaderCapture
     gpu::TextureBinding textures[gpu::kMaxDrawTextures] {};
     int8_t              slotTarget[gpu::kMaxDrawTextures] {};   // slot → the target it reads (-1: none)
     uint8_t             storageCount = 0;
-    gpu::Range          storage[gpu::kMaxDrawStorage] {};      // in Renderer::shaderData()
+    gpu::Range          storage[gpu::kMaxDrawStorage] {};      // in Renderer::shaderData(), or in storageBuffer[j]
+    gpu::BufferId       storageBuffer[gpu::kMaxDrawStorage] {};   // a buffer bound in place (Shader::set(name, range))
 };
 
 // =============================================================================

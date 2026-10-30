@@ -59,11 +59,9 @@ public:
 std::unique_ptr<WindowHost> createWindowHost();
 
 // The process's shared backend for this build: what the window hosts draw
-// with, and what offscreen hosts (ShaderImage) use. Null when it can't run.
-inline std::shared_ptr<gpu::Backend> defaultBackend()
-{
-    auto host = createWindowHost();
-    return host != nullptr ? host->backend() : nullptr;
-}
+// with, and what offscreen hosts (ShaderImage) and compute (jvk::compute) use.
+// Made or shared without a window, so any thread may ask. Null when it can't
+// run, and `whyNot` says why.
+std::shared_ptr<gpu::Backend> defaultBackend(juce::String* whyNot = nullptr);
 
 } // namespace jvk

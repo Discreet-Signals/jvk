@@ -251,6 +251,7 @@ void Backend::initCaps()
         { limits.minStorageBufferOffsetAlignment, limits.minUniformBufferOffsetAlignment, VkDeviceSize(4) }));
     caps_.independentBlend      = device_->supportsIndependentBlend();
     caps_.textureCompressionBC  = device_->supportsTextureCompressionBC();
+    initComputeCaps();
 
     // The 8-bit stencil clip stacks need: D32S8 (everywhere but some older
     // desktop parts), else D24S8 (missing on Apple silicon), else D16S8.
@@ -273,7 +274,7 @@ Backend::~Backend()
     if (d == VK_NULL_HANDLE) return;
 
     const juce::ScopedLock lk(device_->queueLock());
-    vkDeviceWaitIdle(d);
+    device_->waitIdle();
     inFlight_.clear();
 
     {
@@ -285,6 +286,12 @@ Backend::~Backend()
         live.clear();
         textures_.forEachLive([&](uint32_t h, TextureSlot&) { live.push_back(h); });
         for (uint32_t h : live) freeTexture(h);
+        live.clear();
+        buffers_.forEachLive([&](uint32_t h, BufferSlot&) { live.push_back(h); });
+        for (uint32_t h : live) freeBuffer(h);
+        live.clear();
+        kernels_.forEachLive([&](uint32_t h, KernelSlot&) { live.push_back(h); });
+        for (uint32_t h : live) freeKernel(h);
         for (auto& s : samplers_) vkDestroySampler(d, s.sampler, nullptr);
         samplers_.clear();
     }
@@ -313,7 +320,7 @@ void Backend::waitIdle()
 {
     if (!usable()) return;
     const juce::ScopedLock lk(device_->queueLock());
-    vkDeviceWaitIdle(device_->device());
+    device_->waitIdle();
     inFlight_.clear();
     collect();
 }
@@ -711,7 +718,7 @@ bool Backend::readTexture(gpu::TextureId texture, gpu::IRect region, std::span<s
                     // The copy may still be running: never free its command
                     // buffer or the buffer it writes before the GPU is done.
                     if (r == VK_ERROR_DEVICE_LOST || r == VK_TIMEOUT) device_->markLost();
-                    vkDeviceWaitIdle(d);
+                    device_->waitIdle();
                 }
             }
             else
@@ -1236,10 +1243,18 @@ uint64_t Backend::completedSerial()
         oldest = std::min(oldest, inFlight_[i].serial);
         ++i;
     }
+    // A compute stream's submission is listed from the moment its serial is
+    // taken until it has been waited for, under computeMutex_; the started
+    // serial is read there too, so none begun is missed.
+    uint64_t started = 0;
+    {
+        std::lock_guard<std::mutex> lk(computeMutex_);
+        for (uint64_t s : computeActive_) oldest = std::min(oldest, s);
+        started = startedSerial_.load(std::memory_order_acquire);
+    }
     // Nothing in flight: every serial handed out has finished (collect() runs
-    // before a new one is begun, so none is being recorded).
-    return oldest == std::numeric_limits<uint64_t>::max() ? startedSerial_.load(std::memory_order_acquire)
-                                                         : oldest - 1;
+    // before a new frame is begun, so none is being recorded).
+    return oldest == std::numeric_limits<uint64_t>::max() ? started : oldest - 1;
 }
 
 void Backend::collect()
@@ -1254,8 +1269,13 @@ void Backend::collect()
             for (const auto& r : retired_)
             {
                 if (r.serial > done) { retiredScratch_.push_back(r); continue; }
-                if (r.kind == RetiredKind::Texture) freeTexture(r.handle);
-                else                                freeProgram(r.handle);
+                switch (r.kind)
+                {
+                    case RetiredKind::Texture: freeTexture(r.handle); break;
+                    case RetiredKind::Program: freeProgram(r.handle); break;
+                    case RetiredKind::Buffer:  freeBuffer(r.handle);  break;
+                    case RetiredKind::Kernel:  freeKernel(r.handle);  break;
+                }
             }
             retired_.swap(retiredScratch_);
         }

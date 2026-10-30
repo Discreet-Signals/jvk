@@ -64,8 +64,9 @@
 // Layout (see TRANSLATION_LAYER.md)
 //
 //   core/              the translation layer: juce::Graphics semantics, CPU
-//                      geometry, caches, pass planning, the shaders. Never
-//                      names a GPU API (CMakeLists.txt checks this).
+//                      geometry, caches, pass planning, the shaders, and
+//                      jvk::compute. Never names a GPU API (CMakeLists.txt
+//                      checks this).
 //   hosts/             where frames go: the JUCE editor (a window), and the
 //                      offscreen ShaderImage.
 //   backends/vulkan/   the Vulkan backend: gpu::Backend and gpu::Surface on
@@ -91,6 +92,7 @@
 #include "include/jvk/core/Diagnostics.h"
 #include "include/jvk/core/gpu/Types.h"
 #include "include/jvk/core/gpu/PipelineState.h"
+#include "include/jvk/core/gpu/Compute.h"
 #include "include/jvk/core/gpu/FramePacket.h"
 #include "include/jvk/core/gpu/Backend.h"
 
@@ -107,6 +109,7 @@
 #include "include/jvk/core/GlyphAtlas.h"
 #include "include/jvk/core/Resources.h"
 #include "include/jvk/core/Context.h"
+#include "include/jvk/core/compute/Compute.h"   // jvk::compute: kernels over buffers (COMPUTE.md)
 #include "include/jvk/reflect/spirv_reflect.h"   // jvk::Shader and ShaderImage reflect user SPIR-V
 #include "include/jvk/core/Renderer.h"
 #include "include/jvk/core/ImageType.h"
@@ -158,6 +161,7 @@
  #include "include/jvk/backends/vulkan/windows/HWNDGenerator.h"
 #endif
 #include "include/jvk/backends/vulkan/VulkanBackend.h"
+#include "include/jvk/backends/vulkan/VulkanCompute.h"
 #include "include/jvk/backends/vulkan/VulkanSurface.h"
 #include "include/jvk/backends/vulkan/VulkanHost.h"
 #endif

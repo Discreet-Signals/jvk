@@ -1,0 +1,28 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// A moving waveform's peaks, a column at a time: each column's lowest and
+// highest value over the samples it covers. Dispatched in paint
+// (jvk::Graphics::dispatch); waveform.frag draws what it writes.
+layout(local_size_x = 64) in;
+#include "jvk/compute.glsl"
+
+layout(std430, binding = 0) writeonly buffer Peaks { vec2 peaks[]; };
+layout(push_constant) uniform Push { uint columns; float time; } pc;
+
+void main()
+{
+    const uint i = jvkThread();
+    if (i >= pc.columns)
+        return;
+    float lo = 1.0, hi = -1.0;
+    for (int s = 0; s < 16; ++s)
+    {
+        const float t = (float(i) + float(s) / 16.0) / float(pc.columns);
+        const float carrier = sin(6.2831853 * (40.0 * t + 0.3 * pc.time));
+        const float beat = 0.6 + 0.4 * sin(6.2831853 * (3.0 * t - 0.5 * pc.time));
+        const float v = 0.8 * carrier * beat;
+        lo = min(lo, v);
+        hi = max(hi, v);
+    }
+    peaks[i] = vec2(lo, hi);
+}

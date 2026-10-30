@@ -784,7 +784,13 @@ void Renderer::lower(const gpu::FrameInfo& info)
         }
         d.storageCount = sc.storageCount;
         for (uint32_t i = 0; i < sc.storageCount; ++i)
-            d.storage[i] = builder_.pushStorage(shaderData_.data() + sc.storage[i].offset, sc.storage[i].size);
+        {
+            // A buffer the shader was given (Shader::set(name, range)) is bound in
+            // place; the bytes set() copied go into the frame's storage.
+            d.storageBuffer[i] = sc.storageBuffer[i];
+            d.storage[i] = sc.storageBuffer[i] ? sc.storage[i]
+                                               : builder_.pushStorage(shaderData_.data() + sc.storage[i].offset, sc.storage[i].size);
+        }
         ShaderConstants k;
         k.resolutionX = region.getWidth();
         k.resolutionY = region.getHeight();
@@ -1164,6 +1170,7 @@ void Renderer::lower(const gpu::FrameInfo& info)
     auto runsOwnPass = [&](const DrawCommand& c) {
         switch (c.op) {
             case DrawOp::EffectKernel: case DrawOp::EffectHSV: case DrawOp::BlurShape: case DrawOp::BlurPath:
+            case DrawOp::Dispatch:
                 return true;
             case DrawOp::DrawShader: {
                 const auto& sp = arena.read<DrawShaderParams>(c.dataOffset);
@@ -1200,7 +1207,7 @@ void Renderer::lower(const gpu::FrameInfo& info)
         // one included, kNoTarget: tested before the shift; a shader draw
         // writes the locations its shader declares, judged below.)
         if (cmd.target > 0 && !Recorder::isClipOp(cmd.op) && cmd.op != DrawOp::DrawShader
-            && cmd.target != kNoTarget && (live & (1u << (cmd.target - 1))) == 0)
+            && cmd.op != DrawOp::Dispatch && cmd.target != kNoTarget && (live & (1u << (cmd.target - 1))) == 0)
             continue;
         // A shader inside the scene pass that reads a scaled target before its
         // first write this frame: that target is cleared first.
@@ -1571,6 +1578,26 @@ void Renderer::lower(const gpu::FrameInfo& info)
                 else {
                     shaderMainOnly(cmd, sp, sc);
                 }
+                break;
+            }
+
+            case DrawOp::Dispatch: {
+                // A compute pass of its own between scene passes, as an effect
+                // runs: it sees every draw before it and the draws after it see
+                // its writes (the backend orders them). It touches buffers alone,
+                // so the scene's textures and stencil carry on untouched; the
+                // next draw reopens the scene pass with Load.
+                const auto& dp = arena.read<DispatchParams>(cmd.dataOffset);
+                if (!dp.kernel || !ctx.caps().compute.frameDispatch) break;
+                endScene();
+                gpu::Dispatch d;
+                d.kernel = dp.kernel;
+                std::copy(std::begin(dp.groups), std::end(dp.groups), std::begin(d.groups));
+                d.bindingCount = static_cast<uint8_t>(std::min<uint32_t>(dp.bindingCount, gpu::kMaxKernelBindings));
+                std::copy_n(dp.bindings, d.bindingCount, d.bindings);
+                if (dp.constantsBytes > 0)
+                    d.constants = builder_.pushConstants(dp.constants, std::min<uint32_t>(dp.constantsBytes, kDispatchConstants));
+                builder_.dispatch(d);
                 break;
             }
 

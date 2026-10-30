@@ -1474,6 +1474,49 @@ public:
             renderer_.noteTargetsRead(params.targetsRead);
     }
 
+    // ===== Compute ===========================================================
+    //
+    // A kernel run where paint is (COMPUTE.md, "Kernels in frames"). The
+    // render graph runs it as a compute pass of its own between scene passes,
+    // on the frame's queue: it sees everything drawn and dispatched before it,
+    // and everything after it sees its writes (Shader::set(name, range) for a
+    // draw that reads them). Clips, transforms and targets don't apply: it
+    // draws nothing. The kernel and its buffers are of this window's backend
+    // (compute::Context::create() with no backend gives that); bindings in
+    // binding order, each offset a multiple of Caps::storageAlignment,
+    // `constants` exactly the kernel's push-constant block. Skipped on a
+    // backend without frame dispatches (Caps::compute.frameDispatch).
+    void dispatch(const compute::Kernel& kernel, compute::Groups groups,
+                  std::initializer_list<compute::Range> bindings,
+                  const void* constants = nullptr, uint32_t constantsBytes = 0)
+    {
+        jassert(kernel.valid() && kernel.owner() == &renderer_.context());
+        jassert(bindings.size() == kernel.bindings() && constantsBytes == kernel.pushBytes());
+        if (!kernel.valid() || kernel.owner() != &renderer_.context()
+            || bindings.size() > gpu::kMaxKernelBindings || constantsBytes > kDispatchConstants)
+            return;
+        DispatchParams p;
+        p.kernel = kernel.handle();
+        p.groups[0] = groups.x;
+        p.groups[1] = groups.y;
+        p.groups[2] = groups.z;
+        for (const auto& r : bindings)
+            p.bindings[p.bindingCount++] = r.binding();
+        if (constants != nullptr && constantsBytes > 0)
+        {
+            std::memcpy(p.constants, constants, constantsBytes);
+            p.constantsBytes = constantsBytes;
+        }
+        renderer_.push(DrawOp::Dispatch, state().clipBounds, 0, p);
+    }
+    template <typename Push>
+    void dispatch(const compute::Kernel& kernel, compute::Groups groups,
+                  std::initializer_list<compute::Range> bindings, const Push& push)
+    {
+        static_assert(std::is_trivially_copyable_v<Push>);
+        dispatch(kernel, groups, bindings, &push, static_cast<uint32_t>(sizeof(Push)));
+    }
+
     Renderer& getRenderer() { return renderer_; }
 
     // The Shader for `spirv` and its `msl` from this window's shader cache

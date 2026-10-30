@@ -23,6 +23,7 @@
 #include "include/jvk/core/Context.cpp"
 #include "include/jvk/core/Renderer.cpp"
 #include "include/jvk/core/Shader.cpp"
+#include "include/jvk/core/compute/Compute.cpp"
 
 // Hosts
 #include "include/jvk/hosts/WindowHost.cpp"
@@ -32,6 +33,7 @@
 #if JVK_VULKAN
 #include "include/jvk/backends/vulkan/Device.cpp"
 #include "include/jvk/backends/vulkan/VulkanBackend.cpp"
+#include "include/jvk/backends/vulkan/VulkanCompute.cpp"
 #include "include/jvk/backends/vulkan/VulkanSurface.cpp"
 #include "include/jvk/backends/vulkan/VulkanHost.cpp"
 #endif

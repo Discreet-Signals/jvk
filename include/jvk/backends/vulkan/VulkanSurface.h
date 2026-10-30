@@ -34,13 +34,15 @@ struct DescriptorKey
     uint8_t             textureCount = 0, storageCount = 0;
     gpu::TextureBinding textures[gpu::kMaxDrawTextures] {};
     gpu::Range          storage[gpu::kMaxDrawStorage] {};
+    gpu::BufferId       storageBuffer[gpu::kMaxDrawStorage] {};
 
     bool operator==(const DescriptorKey& o) const
     {
         if (program != o.program || set != o.set || textureCount != o.textureCount || storageCount != o.storageCount)
             return false;
         for (uint32_t i = 0; i < textureCount; ++i) if (!(textures[i] == o.textures[i])) return false;
-        for (uint32_t i = 0; i < storageCount; ++i) if (!(storage[i] == o.storage[i])) return false;
+        for (uint32_t i = 0; i < storageCount; ++i)
+            if (!(storage[i] == o.storage[i]) || storageBuffer[i] != o.storageBuffer[i]) return false;
         return true;
     }
 };
@@ -83,6 +85,7 @@ private:
 
     bool ensure(HostBuffer& buffer, VkDeviceSize size, VkBufferUsageFlags usage);
     void recordPass(VkCommandBuffer cmd, FrameSlot& slot, const gpu::FramePacket& packet, const gpu::Pass& pass);
+    void recordComputePass(VkCommandBuffer cmd, FrameSlot& slot, const gpu::FramePacket& packet, const gpu::Pass& pass);
     void recordDraw(VkCommandBuffer cmd, FrameSlot& slot, const gpu::FramePacket& packet,
                     const gpu::Draw& draw, const gpu::IRect& area);
     VkDescriptorSet descriptorSet(FrameSlot& slot, const ProgramSlot& program, uint32_t programHandle,
@@ -92,6 +95,7 @@ private:
     Backend& backend_;
     Bound    bound_;
     Backend::BarrierBatch batch_;
+    DispatchRecorder      dispatcher_;
     std::vector<VkWriteDescriptorSet>   writes_;
     std::vector<VkDescriptorImageInfo>  imageInfos_;
     std::vector<VkDescriptorBufferInfo> bufferInfos_;

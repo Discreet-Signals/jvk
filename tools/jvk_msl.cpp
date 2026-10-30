@@ -15,8 +15,8 @@
  (CMake: jvk_msl) from its fragment stage's SPIR-V, so no translator ships. Its
  bindings go where the backend binds them (MslBindings.h), its push constants
  to [[buffer(24)]], where jvk's vertex stage reads them too (shader_region.vert,
- in the bundle). The vendored SPIRV-Cross (spirv_cross/) is built here alone,
- for the build machine.
+ in the bundle). The vendored SPIRV-Cross (spirv_cross/, built by
+ spirv_cross.cpp) is the build machine's alone.
  ------------------------------------------------------------------------------
 */
 
@@ -24,12 +24,7 @@
  #pragma clang diagnostic push
  #pragma clang diagnostic ignored "-Weverything"
 #endif
-#include "spirv_cross/spirv_cross_parsed_ir.cpp"
-#include "spirv_cross/spirv_parser.cpp"
-#include "spirv_cross/spirv_cfg.cpp"
-#include "spirv_cross/spirv_cross.cpp"
-#include "spirv_cross/spirv_glsl.cpp"
-#include "spirv_cross/spirv_msl.cpp"
+#include "spirv_cross/spirv_msl.hpp"   // compiled once for the tools: spirv_cross.cpp
 #if defined(__clang__)
  #pragma clang diagnostic pop
 #endif

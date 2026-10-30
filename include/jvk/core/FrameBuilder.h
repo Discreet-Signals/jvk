@@ -18,8 +18,8 @@ namespace jvk
 // =============================================================================
 // FrameBuilder — the packet being lowered
 //
-// Owns the per-frame arenas a gpu::FramePacket points into: passes, draws and
-// the three data streams. Reset (capacity kept) at the start of every frame's
+// Owns the per-frame arenas a gpu::FramePacket points into: passes, draws,
+// dispatches and the three data streams. Reset (capacity kept) at the start of every frame's
 // lowering, read by Surface::submit, untouched until the next frame: the
 // zero-allocation steady state.
 // =============================================================================
@@ -32,6 +32,7 @@ public:
         frame_ = frame;
         passes_.clear();
         draws_.clear();
+        dispatches_.clear();
         vertexData_.clear();
         constantData_.clear();
         storageData_.clear();
@@ -103,12 +104,36 @@ public:
     {
         if (!open_) return;
         auto& p = passes_.back();
-        p.drawCount = static_cast<uint32_t>(draws_.size()) - p.firstDraw;
+        if (p.kind == gpu::PassKind::Compute)
+            p.dispatchCount = static_cast<uint32_t>(dispatches_.size()) - p.firstDispatch;
+        else
+            p.drawCount = static_cast<uint32_t>(draws_.size()) - p.firstDraw;
         open_ = false;
     }
 
     bool passOpen() const { return open_; }
-    bool passEmpty() const { return open_ && draws_.size() == passes_.back().firstDraw; }
+    bool passEmpty() const
+    {
+        return open_ && passes_.back().kind == gpu::PassKind::Render && draws_.size() == passes_.back().firstDraw;
+    }
+
+    // Appends a dispatch to the open compute pass, or to a new one (ending a
+    // render pass that's open): consecutive dispatches share a pass. The next
+    // beginPass ends it.
+    void dispatch(const gpu::Dispatch& d)
+    {
+        if (open_ && passes_.back().kind != gpu::PassKind::Compute) endPass();
+        if (!open_)
+        {
+            auto& p = passes_.emplace_back();
+            p.kind = gpu::PassKind::Compute;
+            p.firstDraw = static_cast<uint32_t>(draws_.size());
+            p.firstDispatch = static_cast<uint32_t>(dispatches_.size());
+            p.label = "compute";
+            open_ = true;
+        }
+        dispatches_.push_back(d);
+    }
     gpu::Pass& currentPass() { return passes_.back(); }
 
     // Takes back the open pass, which has no draws.
@@ -126,8 +151,8 @@ public:
     // quads of one fill become one draw.
     void draw(const gpu::Draw& d)
     {
-        jassert(open_);
-        if (!open_ || d.vertexCount == 0 || d.scissor.isEmpty()) return;
+        jassert(open_ && passes_.back().kind == gpu::PassKind::Render);
+        if (!open_ || passes_.back().kind != gpu::PassKind::Render || d.vertexCount == 0 || d.scissor.isEmpty()) return;
         const auto& p = passes_.back();
         if (draws_.size() > p.firstDraw)
         {
@@ -149,6 +174,7 @@ public:
         pk.frame        = frame_;
         pk.passes       = passes_;
         pk.draws        = draws_;
+        pk.dispatches   = dispatches_;
         pk.vertexData   = vertexData_;
         pk.constantData = constantData_;
         pk.storageData  = storageData_;
@@ -177,13 +203,14 @@ private:
         for (uint32_t i = 0; i < a.textureCount; ++i)
             if (a.textures[i] != b.textures[i]) return false;
         for (uint32_t i = 0; i < a.storageCount; ++i)
-            if (a.storage[i] != b.storage[i]) return false;
+            if (a.storage[i] != b.storage[i] || a.storageBuffer[i] != b.storageBuffer[i]) return false;
         return true;
     }
 
     uint64_t frame_ = 0;
     std::vector<gpu::Pass> passes_;
     std::vector<gpu::Draw> draws_;
+    std::vector<gpu::Dispatch> dispatches_;
     std::vector<std::byte> vertexData_, constantData_, storageData_;
     gpu::Range lastConstants_;
     uint32_t   constantsAlignment_ = 4, storageAlignment_ = 256;

@@ -29,9 +29,18 @@ namespace jvk::metal
 //
 // n is the binding's rank among the program's bindings of its kind, ordered by
 // (set, binding): a rule of what the SPIR-V declares alone.
+//
+// A compute kernel's (COMPUTE.md), the rule jvk_kernel (tools/jvk_kernel.cpp)
+// translates by:
+//
+//   buffer binding b, set 0              [[buffer(b)]]
+//   the constants (push constants)       [[buffer(kConstantsIndex)]]
+//   its buffers' sizes (a runtime array's
+//   length: SPIRV-Cross's spvBufferSizeConstants, a uint per binding, by b)
+//                                        [[buffer(kBufferSizesIndex)]]
 // =============================================================================
 
-inline constexpr uint32_t kBlockBase = 16, kConstantsIndex = 24;
+inline constexpr uint32_t kBlockBase = 16, kConstantsIndex = 24, kBufferSizesIndex = 25;
 
 struct MslBinding
 {

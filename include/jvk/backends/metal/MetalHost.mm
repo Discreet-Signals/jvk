@@ -18,6 +18,16 @@ std::unique_ptr<jvk::WindowHost> createWindowHost()
     return std::make_unique<WindowHost>();
 }
 
+std::shared_ptr<gpu::Backend> defaultBackend(juce::String* whyNot)
+{
+    auto b = Backend::acquire();
+    const juce::String why = !b->usable() ? b->unavailableReason()
+                           : b->isLost()  ? juce::String("the graphics device was lost") : juce::String();
+    if (why.isEmpty()) return b;
+    if (whyNot != nullptr) *whyNot = why;
+    return nullptr;
+}
+
 // =============================================================================
 // WindowHost — a CAMetalLayer in a native child view of a JUCE editor: the
 // same layer-backed NSView the Vulkan host surfaces through MoltenVK

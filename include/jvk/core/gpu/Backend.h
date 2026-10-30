@@ -39,11 +39,6 @@ namespace jvk::gpu
 // Surface come from one thread at a time.
 // =============================================================================
 
-// Which blob of the shader bundle a backend consumes (TRANSLATION_LAYER.md,
-// "Shaders"). SPIR-V is the bundle's canonical form; the others are
-// translated from it ahead of time.
-enum class ShaderFormat : uint8_t { SPIRV, MSL, HLSL, WGSL };
-
 struct Caps
 {
     ShaderFormat shaderFormat = ShaderFormat::SPIRV;
@@ -60,6 +55,8 @@ struct Caps
 
     bool independentBlend     = true;         // per-attachment blend state (render targets need it)
     bool textureCompressionBC = false;
+
+    ComputeCaps compute;                      // buffers, kernels, streams (Compute.h)
 };
 
 // =============================================================================
@@ -71,15 +68,6 @@ struct Caps
 // way (TRANSLATION_LAYER.md, "Binding convention"); a program from elsewhere (a
 // user's SPIR-V) can name its native bindings instead, slot by slot.
 // =============================================================================
-
-enum class BindingKind : uint8_t
-{
-    Texture,                 // a sampled texture; its sampler is a separate Sampler binding
-    Sampler,
-    CombinedTextureSampler,  // both in one binding (Vulkan's sampler2D)
-    StorageBuffer,           // read-only
-    UniformBuffer,
-};
 
 struct BindingDesc
 {
@@ -212,6 +200,28 @@ public:
     // An offscreen surface renders into `target` (TextureUsage::RenderTarget |
     // Sampled): FrameInfo::output is `target`. Null if the backend can't.
     virtual std::unique_ptr<Surface> createOffscreenSurface(TextureId target) = 0;
+
+    // ---- Compute (Compute.h; Caps::compute.supported) -----------------------
+    // Buffers: null on failure. destroyBuffer is always safe for a buffer a
+    // submitted stream or frame still uses: the backend frees it once the GPU
+    // is done (the core never destroys one an unsubmitted frame names).
+    virtual BufferId createBuffer(const BufferDesc& desc) { (void) desc; return {}; }
+    virtual void     destroyBuffer(BufferId buffer) { (void) buffer; }
+    // The CPU's view of an Upload, Readback or Shared buffer, valid while it
+    // lives; null for Device memory.
+    virtual void*    bufferData(BufferId buffer) { (void) buffer; return nullptr; }
+    // After the CPU writes mapped memory the GPU will read, and before it
+    // reads what the GPU wrote. No-ops on coherent memory.
+    virtual void     flushBuffer(BufferId buffer, uint64_t offset, uint64_t size)      { (void) buffer; (void) offset; (void) size; }
+    virtual void     invalidateBuffer(BufferId buffer, uint64_t offset, uint64_t size) { (void) buffer; (void) offset; (void) size; }
+
+    // Kernels: null when the code can't be built here (logged). destroyKernel
+    // is deferred like destroyBuffer.
+    virtual KernelId createKernel(const KernelDesc& desc) { (void) desc; return {}; }
+    virtual void     destroyKernel(KernelId kernel) { (void) kernel; }
+
+    // A stream of compute submissions on the compute queue. Null without compute.
+    virtual std::unique_ptr<ComputeStream> createComputeStream() { return nullptr; }
 };
 
 } // namespace jvk::gpu

@@ -36,6 +36,7 @@ enum class DrawOp : uint8_t {
     FillTiledImage,                 // tiled image fill (setTiledImageFill)
     ExcludeClipRect,                // stencil-park the rect out of the clip
     RestoreClipExclude,             // un-park it on restoreState
+    Dispatch,                       // a compute kernel in paint order (Graphics::dispatch)
     COUNT
 };
 
@@ -297,14 +298,15 @@ public:
 
 private:
     // Clip ops always record (they keep the stencil balanced whatever the
-    // target). Nothing else records into a missing target. Pass effects run
+    // target), and dispatches (they draw into no target). Nothing else
+    // records into a missing target. Pass effects run
     // on the main colour or any target; a shader writes what it declares,
     // whatever the target; the blend-mode draws land on the main colour; and
     // ordinary paint on the main colour or a target at scale 1 (a scaled one
     // isn't attached to the scene pass).
     bool recordsInTarget(DrawOp op) const
     {
-        if (isClipOp(op))
+        if (isClipOp(op) || op == DrawOp::Dispatch)
             return true;
         if (recordTarget_ == kNoTarget)
             return false;

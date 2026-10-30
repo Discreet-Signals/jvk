@@ -21,6 +21,7 @@ describes is in `include/jvk/core/gpu/` (namespace `jvk::gpu`).
 │   lower   — CPU geometry, pass planning, pipeline interning → gpu::FramePacket  │
 │   caches  — glyph / gradient / image policy and keys, atlas packing             │
 │   shaders — the bundle: sources, compiled forms, layouts                        │
+│   compute — jvk::compute: kernels over buffers, in streams and in frames        │
 └────────────────────┬────────────────────────────────────────────────────────────┘
                      │ jvk::gpu  (core/gpu/: Types, PipelineState, FramePacket, Backend)
 ┌────────────────────▼──────────────┐  ┌───────────────────────────────────────────┐
@@ -60,7 +61,8 @@ is validity or speed on one API.
 | Cache keys and eviction (`juce::Image` identity, `ColourGradient`, glyph keys) | Descriptor sets / bind groups / argument buffers, sampler objects |
 | Every shader, and pipeline state as data (`PipelineDesc`: blend, stencil, formats) | Native pipeline objects built from `PipelineDesc`, and their cache |
 | Pass planning: effect splits, ping-pong versioning, target liveness, region bounds, stencil reference per draw | Barriers, layout transitions, render passes / encoders, which thread submits |
-| The extended API: effects, `setTarget`, `drawShader`, frame values | Transient memory the packet's streams are copied into |
+| The extended API: effects, `setTarget`, `drawShader`, frame values, `dispatch` | Transient memory the packet's streams are copied into |
+| `jvk::compute`: buffers' and kernels' lifetimes, the stream's command list, a kernel's interface (reflected at build time) | Compute buffers and pipelines, the compute queue, stream submission, timestamps |
 
 Grey zones, decided:
 
@@ -118,6 +120,13 @@ The backend never reorders, merges or drops anything. It works out barriers and
 layout transitions from each texture's use in consecutive passes. The core guarantees
 that no texture is both sampled and attached in one pass.
 
+A pass of kind `Compute` is a run of dispatches (`FramePacket::dispatches`): kernels
+over buffers, recorded in paint order by `Graphics::dispatch`. Each sees every draw
+and dispatch before it, and everything after it sees its writes. The backend orders
+them: Vulkan with memory barriers around and inside the pass; Metal with hazard
+tracking. A draw's storage slot can name a buffer (`Draw::storageBuffer`) in place
+of the packet's storage stream. See `COMPUTE.md`.
+
 ---
 
 ## Pass planning (the core's render graph)
@@ -171,6 +180,25 @@ This is today's `Renderer::execute`, with every `vkCmd*` replaced by appending a
   ages, shared across editors through the `Context` of the shared `Backend`.
 
 ---
+
+## Compute
+
+`COMPUTE.md` is its spec. In brief:
+- **The interface** is `core/gpu/Compute.h`:
+  - buffers (`BufferId`, four memory kinds, persistent mappings);
+  - kernels (`KernelId`, made from a `KernelDesc`);
+  - `ComputeStream`, which runs a `ComputePacket` of dispatches, barriers, fills,
+    copies, uploads, downloads and timestamps on the compute queue;
+  - `Caps::compute`.
+- **The user API** is `jvk::compute` (`core/compute/`): the `compute-shaders`
+  branch's `Context`, `Buffer`, `Kernel` and `Stream`, now backend-neutral.
+  Buffers and kernels retire through the `Context`'s record serials, so a frame
+  can use them.
+- **Kernels** are GLSL compiled by `jvk_compute_shaders()`. `tools/jvk_kernel.cpp`
+  reflects each one at build time and translates it to MSL. Nothing reflects or
+  translates at run time.
+- **Queues**: Vulkan streams run on a compute queue of their own where the GPU has
+  one. Metal streams run on a second command queue.
 
 ## Shaders
 
@@ -276,7 +304,7 @@ land before any second backend:
 ```
 include/jvk/
   core/                the translation layer (no GPU API; CMake checks)
-    gpu/               the backend interface: Types, PipelineState, FramePacket, Backend
+    gpu/               the backend interface: Types, PipelineState, Compute, FramePacket, Backend
     shaders/           Program.h (the bundle's shape), Bundle.h (generated: SPIR-V + MSL,
                        each compiled by the builds whose backends take it)
     Recorder           P2: DrawOp, DrawCommand, Arena, captures, record target, liveness, segments
@@ -285,7 +313,8 @@ include/jvk/
                        the image cache, record serials and the retire list
     Resources          GradientAtlas, ImageSource, ImageCache
     GlyphAtlas, MSDF   text
-    FrameBuilder       the packet being lowered (draw merging) and the Emitter (2D draw state)
+    compute/           jvk::compute: Context, Buffer, Kernel, Stream (COMPUTE.md)
+    FrameBuilder       the packet being lowered (draw merging, compute passes) and the Emitter (2D draw state)
     Renderer           per surface: frame textures, the worker, lower() — the render graph
     ops/               lowering of the 2D draws (ColorDraw) and the programs' constants
     Graphics, Shader, ImageType
@@ -294,13 +323,18 @@ include/jvk/
                        macos/NSViewGenerator (the native view both macOS backends draw into)
   backends/SlotTable   the handle tables both backends share
   backends/vulkan/     VulkanBackend, VulkanSurface (packet executor, swapchain, offscreen),
-                       VulkanHost; Device, Memory, Resource, Formats, macos/, windows/, vendor/
+                       VulkanCompute (buffers, kernels, streams), VulkanHost; Device,
+                       Memory, Resource, Formats, macos/, windows/, vendor/
   backends/metal/      MetalBackend (textures, programs, pipelines, staged and in-place
                        writes), MetalSurface (packet executor, CAMetalLayer, offscreen),
-                       MetalHost; MslBindings (where a jvk::Shader binds, shared with jvk_msl)
+                       MetalCompute (buffers, kernels, streams), MetalHost; MslBindings
+                       (where a jvk::Shader and a kernel bind, shared with the tools)
   reflect/             spirv-reflect (jvk::Shader and ShaderImage reflect user SPIR-V)
-shaders/               GLSL sources, jvk_portable.glsl, compile.sh → core/shaders/Bundle.h
-tools/                 jvk_msl (a jvk::Shader's SPIR-V → MSL at build time) + spirv_cross/
+shaders/               GLSL sources, jvk_portable.glsl, compile.sh → core/shaders/Bundle.h;
+                       include/jvk/ (compute.glsl, scan.glsl: kernels' GLSL library)
+tools/                 jvk_msl (a jvk::Shader's SPIR-V → MSL at build time), jvk_kernel
+                       (kernels' SPIR-V → reflected interface + MSL), spirv_cross.cpp +
+                       spirv_cross/ (built once for both)
 ```
 
 ---
@@ -323,6 +357,7 @@ benchmark numbers from a `main` build).
 | **P6 Shaders** | Portable profile, build-time bundle (SPIR-V + MSL via SPIRV-Cross, reflected layouts). WGSL and HLSL not generated yet (no Tint/Naga in the toolchain) | done |
 | **P7 Hosts** | `WindowHost`, generic `AudioProcessorEditor`, Vulkan host, `ShaderImage` on an offscreen surface | done, unbuilt |
 | **P8 Second backend** | Metal (`backends/metal/`): the macOS default. Pixel-identical to Vulkan on 12 of the 13 compliance scenes (the 13th: 0.01% of pixels); draws the packet straight into Metal command buffers (no descriptor sets, no pipeline-cache file at start-up), unified-memory textures written and read in place | done |
+| **P9 Compute** | `core/gpu/Compute.h`, `jvk::compute` on it (the `compute-shaders` branch's API, backend-neutral), both backends' buffers, kernels and streams, compute passes in frames (`Graphics::dispatch`), draws that read a buffer (`Shader::set(name, range)`), `jvk_compute_shaders` + `jvk_kernel`; `examples/compute` self-tests it (COMPUTE.md) | done, unbuilt |
 
 ---
 

@@ -77,11 +77,7 @@ Context::~Context()
     images_.reset();
     {
         const std::lock_guard<std::mutex> lk(lock_);
-        for (auto& r : retired_)
-        {
-            if (r.program) backend_->destroyProgram(gpu::ProgramId { r.handle });
-            else           backend_->destroyTexture(gpu::TextureId { r.handle });
-        }
+        for (auto& r : retired_) destroy(r);
         retired_.clear();
     }
     for (auto id : { programs_.ui2d, programs_.noise, programs_.path, programs_.clip, programs_.clipMask,
@@ -155,11 +151,41 @@ uint64_t Context::safeSerial() const
     return safe;
 }
 
+void Context::destroy(const Retired& r)
+{
+    switch (r.kind)
+    {
+        case Kind::Texture: backend_->destroyTexture(gpu::TextureId { r.handle }); break;
+        case Kind::Program: backend_->destroyProgram(gpu::ProgramId { r.handle }); break;
+        case Kind::Buffer:  backend_->destroyBuffer(gpu::BufferId { r.handle });   break;
+        case Kind::Kernel:  backend_->destroyKernel(gpu::KernelId { r.handle });   break;
+    }
+}
+
 void Context::retire(gpu::TextureId texture, uint64_t lastUsed)
 {
     if (!texture) return;
     const std::lock_guard<std::mutex> lk(lock_);
-    retired_.push_back({ texture.value, lastUsed, false });
+    retired_.push_back({ texture.value, lastUsed, Kind::Texture });
+}
+
+void Context::retireOrDestroy(const Retired& r)
+{
+    {
+        const std::lock_guard<std::mutex> lk(lock_);
+        if (r.lastUsed > safeSerial()) { retired_.push_back(r); return; }
+    }
+    destroy(r);   // outside the lock, as collect: the backend defers past the GPU
+}
+
+void Context::retire(gpu::BufferId buffer, uint64_t lastUsed)
+{
+    if (buffer) retireOrDestroy({ buffer.value, lastUsed, Kind::Buffer });
+}
+
+void Context::retire(gpu::KernelId kernel, uint64_t lastUsed)
+{
+    if (kernel) retireOrDestroy({ kernel.value, lastUsed, Kind::Kernel });
 }
 
 void Context::retire(gpu::ProgramId program, uint64_t lastUsed)
@@ -167,7 +193,7 @@ void Context::retire(gpu::ProgramId program, uint64_t lastUsed)
     if (!program) return;
     {
         const std::lock_guard<std::mutex> lk(lock_);
-        retired_.push_back({ program.value, lastUsed, true });
+        retired_.push_back({ program.value, lastUsed, Kind::Program });
     }
     // Its pipelines go with it: forget them, so a later program reusing the
     // handle's slot never finds a stale one.
@@ -177,6 +203,7 @@ void Context::retire(gpu::ProgramId program, uint64_t lastUsed)
 
 void Context::collect()
 {
+    const std::lock_guard<std::mutex> one(collectLock_);
     {
         const std::lock_guard<std::mutex> lk(lock_);
         if (retired_.empty()) return;
@@ -194,11 +221,7 @@ void Context::collect()
     }
     // Outside the lock: the backend defers the native objects until the GPU
     // is done, which may take its own locks.
-    for (auto& r : collectScratch_)
-    {
-        if (r.program) backend_->destroyProgram(gpu::ProgramId { r.handle });
-        else           backend_->destroyTexture(gpu::TextureId { r.handle });
-    }
+    for (auto& r : collectScratch_) destroy(r);
     collectScratch_.clear();
 }
 

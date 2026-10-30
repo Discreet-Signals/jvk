@@ -1,0 +1,19 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// y = a x scale + y. Its workgroup size is constant 0 and `scale` constant 1,
+// both set when the kernel is made (jvk::compute::Constant): the self-test
+// sees each take effect.
+layout(local_size_x_id = 0) in;
+layout(constant_id = 1) const float scale = 1.0;
+#include "jvk/compute.glsl"
+
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) buffer Y { float y[]; };
+layout(push_constant) uniform Push { uint n; float a; } pc;
+
+void main()
+{
+    const uint i = jvkThread();
+    if (i < pc.n)
+        y[i] = pc.a * x[i] * scale + y[i];
+}

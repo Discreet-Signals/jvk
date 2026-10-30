@@ -56,10 +56,14 @@ struct Handle
 struct TextureTag;
 struct ProgramTag;
 struct PipelineTag;
+struct BufferTag;
+struct KernelTag;
 
 using TextureId  = Handle<TextureTag>;
 using ProgramId  = Handle<ProgramTag>;
 using PipelineId = Handle<PipelineTag>;
+using BufferId   = Handle<BufferTag>;   // GPU memory (Compute.h)
+using KernelId   = Handle<KernelTag>;   // a compute pipeline (Compute.h)
 
 // =============================================================================
 // Geometry
@@ -83,6 +87,15 @@ struct Extent
     uint32_t width = 0, height = 0;
 
     constexpr bool operator==(const Extent&) const = default;
+};
+
+// A byte range in one of a packet's data streams.
+struct Range
+{
+    uint32_t offset = 0, size = 0;
+
+    constexpr bool isEmpty() const { return size == 0; }
+    constexpr bool operator==(const Range&) const = default;
 };
 
 struct ClearColor
@@ -148,6 +161,25 @@ struct SamplerDesc
     AddressMode address = AddressMode::ClampToEdge;
 
     constexpr bool operator==(const SamplerDesc&) const = default;
+};
+
+// =============================================================================
+// Shaders
+// =============================================================================
+
+// Which blob of the shader bundle a backend consumes (TRANSLATION_LAYER.md,
+// "Shaders"). SPIR-V is the bundle's canonical form; the others are
+// translated from it ahead of time.
+enum class ShaderFormat : uint8_t { SPIRV, MSL, HLSL, WGSL };
+
+// What a program or kernel binds at one place.
+enum class BindingKind : uint8_t
+{
+    Texture,                 // a sampled texture; its sampler is a separate Sampler binding
+    Sampler,
+    CombinedTextureSampler,  // both in one binding (Vulkan's sampler2D)
+    StorageBuffer,           // read-only in a draw; read and written in a kernel
+    UniformBuffer,
 };
 
 } // namespace jvk::gpu

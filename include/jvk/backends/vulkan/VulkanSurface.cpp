@@ -145,8 +145,59 @@ void PacketExecutor::record(VkCommandBuffer cmd, FrameSlot& slot, const gpu::Fra
     if (!packet.storageData.empty())
         std::memcpy(slot.storage.mapped, packet.storageData.data(), packet.storageData.size());
 
+    // A buffer a compute stream wrote (its fence waited on by the host) is
+    // available; this makes it visible to the frame's shaders.
+    bool external = !packet.dispatches.empty();
+    for (size_t i = 0; i < packet.draws.size() && !external; ++i)
+        for (uint32_t j = 0; j < packet.draws[i].storageCount && j < gpu::kMaxDrawStorage; ++j)
+            external |= static_cast<bool>(packet.draws[i].storageBuffer[j]);
+    if (external)
+    {
+        VkMemoryBarrier mb {};
+        mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT;
+        VkPipelineStageFlags dst = kShaderStages;
+        if (backend_.caps().compute.frameDispatch) dst |= VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, dst, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    }
+
     for (const auto& pass : packet.passes)
-        recordPass(cmd, slot, packet, pass);
+    {
+        if (pass.kind == gpu::PassKind::Compute) recordComputePass(cmd, slot, packet, pass);
+        else                                     recordPass(cmd, slot, packet, pass);
+    }
+}
+
+void PacketExecutor::recordComputePass(VkCommandBuffer cmd, FrameSlot& slot, const gpu::FramePacket& packet,
+                                       const gpu::Pass& pass)
+{
+    if (!backend_.caps().compute.frameDispatch
+        || pass.firstDispatch > packet.dispatches.size() || pass.dispatchCount > packet.dispatches.size() - pass.firstDispatch)
+        return;
+
+    // Dispatches touch buffers alone, so one memory barrier each way orders
+    // them against the frame: every draw and dispatch before finishes (and
+    // what it wrote is seen) before the first runs; each sees the one before
+    // it; everything after sees the last.
+    auto barrier = [cmd](VkPipelineStageFlags src, VkPipelineStageFlags dst, VkAccessFlags dstAccess)
+    {
+        VkMemoryBarrier mb {};
+        mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        mb.dstAccessMask = dstAccess;
+        vkCmdPipelineBarrier(cmd, src, dst, 0, 1, &mb, 0, nullptr, 0, nullptr);
+    };
+    constexpr VkAccessFlags reads = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT;
+    const VkPipelineStageFlags all = kShaderStages | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    barrier(all, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, reads | VK_ACCESS_SHADER_WRITE_BIT);
+    for (uint32_t k = 0; k < pass.dispatchCount; ++k)
+    {
+        if (k > 0)
+            barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, reads | VK_ACCESS_SHADER_WRITE_BIT);
+        dispatcher_.record(backend_, cmd, packet.dispatches[pass.firstDispatch + k], packet.constantData,
+                           [this, &slot](const KernelSlot& kernel) { return allocateSet(slot, kernel.setLayout); });
+    }
+    barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, all, reads | VK_ACCESS_SHADER_WRITE_BIT);
 }
 
 void PacketExecutor::recordPass(VkCommandBuffer cmd, FrameSlot& slot, const gpu::FramePacket& packet,
@@ -396,7 +447,11 @@ VkDescriptorSet PacketExecutor::descriptorSet(FrameSlot& slot, const ProgramSlot
     key.textureCount = std::min<uint8_t>(draw.textureCount, uint8_t(gpu::kMaxDrawTextures));
     key.storageCount = std::min<uint8_t>(draw.storageCount, uint8_t(gpu::kMaxDrawStorage));
     for (uint32_t i = 0; i < key.textureCount; ++i) key.textures[i] = draw.textures[i];
-    for (uint32_t i = 0; i < key.storageCount; ++i) key.storage[i] = draw.storage[i];
+    for (uint32_t i = 0; i < key.storageCount; ++i)
+    {
+        key.storage[i]       = draw.storage[i];
+        key.storageBuffer[i] = draw.storageBuffer[i];
+    }
 
     // Newest first: consecutive draws mostly bind what the last one did.
     for (size_t i = slot.sets.size(); i-- > 0;)
@@ -426,9 +481,14 @@ VkDescriptorSet PacketExecutor::descriptorSet(FrameSlot& slot, const ProgramSlot
         {
             VkDescriptorBufferInfo bi {};
             bi.buffer = slot.storage.buffer;
+            // A compute buffer bound in place, else the frame's storage stream.
+            const BufferSlot* own = b.slot < key.storageCount ? backend_.buffer(key.storageBuffer[b.slot]) : nullptr;
+            const VkDeviceSize limit = own != nullptr ? own->size : slot.storage.size;
             if (b.slot < key.storageCount && !key.storage[b.slot].isEmpty()
-                && uint64_t(key.storage[b.slot].offset) + key.storage[b.slot].size <= slot.storage.size)
+                && (own != nullptr || !key.storageBuffer[b.slot])
+                && uint64_t(key.storage[b.slot].offset) + key.storage[b.slot].size <= limit)
             {
+                if (own != nullptr) bi.buffer = own->buffer;
                 bi.offset = key.storage[b.slot].offset;
                 bi.range  = key.storage[b.slot].size;
             }
@@ -502,7 +562,7 @@ SwapchainSurface::~SwapchainSurface()
     auto& device = backend_->device();
     VkDevice d = device.device();
     const juce::ScopedLock lk(device.queueLock());
-    vkDeviceWaitIdle(d);
+    device.waitIdle();
     for (auto& slot : slots_)
     {
         backend_->fenceDone(slot.fence);
@@ -543,7 +603,7 @@ void SwapchainSurface::rebuild(uint32_t width, uint32_t height)
 {
     // vkDeviceWaitIdle is queue use: the submit lock (held by the caller,
     // reentrant) keeps it from racing another surface's submit.
-    vkDeviceWaitIdle(backend_->device().device());
+    backend_->device().waitIdle();
     width_  = width;
     height_ = height;
     destroySwapchain();
@@ -854,7 +914,7 @@ OffscreenSurface::~OffscreenSurface()
         && vkWaitForFences(d, 1, &slot_.fence, VK_TRUE, 2'000'000'000ull) != VK_SUCCESS)
     {
         const juce::ScopedLock lk(device.queueLock());
-        vkDeviceWaitIdle(d);
+        device.waitIdle();
     }
     const juce::ScopedLock lk(device.queueLock());
     backend_->fenceDone(slot_.fence);

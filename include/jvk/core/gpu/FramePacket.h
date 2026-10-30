@@ -31,6 +31,12 @@ namespace jvk::gpu
 // the next frame submitted on ANY surface, which is what lets several surfaces
 // share one image cache safely.
 //
+// A pass of kind Compute is a run of dispatches instead (Compute.h): kernels
+// over buffers, in paint order. Each sees the writes of every draw and
+// dispatch before it, and everything after it sees its writes; the backend
+// orders them (barriers, hazard tracking). Dispatches touch buffers alone, so
+// no texture changes state across one.
+//
 // What the backend works out for itself: barriers and layout transitions
 // (from each texture's use in consecutive passes), native render passes or
 // framebuffers or encoders, descriptor sets or bind groups or argument
@@ -41,10 +47,12 @@ namespace jvk::gpu
 //     read and written together is versioned through a second texture);
 //   - every PipelineId was created by this backend, with attachment formats
 //     matching the pass its draws are in;
-//   - every Range lies inside its stream; a draw's vertex range starts at a
-//     multiple of its pipeline's vertex stride, its storage ranges at
-//     multiples of Caps::storageAlignment; constants fit the program's
-//     ProgramLayout::constantsBytes.
+//   - every Range lies inside its stream (a storage range naming a buffer,
+//     inside that buffer); a draw's vertex range starts at a multiple of its
+//     pipeline's vertex stride, its storage ranges at multiples of
+//     Caps::storageAlignment; constants fit the program's
+//     ProgramLayout::constantsBytes;
+//   - Compute passes only where Caps::compute.frameDispatch.
 //
 // Memory: every span points into the core's per-frame arenas, valid until
 // Surface::submit() returns. The backend copies what it needs into its own
@@ -58,15 +66,6 @@ namespace jvk::gpu
 inline constexpr uint32_t kMaxDrawTextures      = 16;
 inline constexpr uint32_t kPortableDrawTextures = 8;
 inline constexpr uint32_t kMaxDrawStorage       = 4;
-
-// A byte range in one of the packet's data streams.
-struct Range
-{
-    uint32_t offset = 0, size = 0;
-
-    constexpr bool isEmpty() const { return size == 0; }
-    constexpr bool operator==(const Range&) const = default;
-};
 
 enum class LoadOp : uint8_t
 {
@@ -118,7 +117,8 @@ struct Draw
     uint8_t        textureCount = 0;
     uint8_t        storageCount = 0;
     TextureBinding textures[kMaxDrawTextures] {};
-    Range          storage[kMaxDrawStorage] {};   // in storageData
+    Range          storage[kMaxDrawStorage] {};         // in storageData, or in storageBuffer[j]
+    BufferId       storageBuffer[kMaxDrawStorage] {};   // null: the packet's storageData
 
     Range    constants;                 // per-draw constants, in constantData
     Range    vertices;                  // in vertexData; empty when the program pulls its own
@@ -126,16 +126,24 @@ struct Draw
     uint32_t instanceCount = 1;
 };
 
+enum class PassKind : uint8_t
+{
+    Render,    // attachments and draws
+    Compute,   // dispatches alone: no attachments, no render area
+};
+
 // The viewport of every draw in a pass is the whole of its attachments
 // (gl_FragCoord is attachment pixels); the render area and scissors bound
 // what is touched.
 struct Pass
 {
+    PassKind               kind = PassKind::Render;
     uint8_t                colorCount = 0;
     ColorAttachment        color[kMaxColorAttachments] {};
     DepthStencilAttachment depthStencil;
     IRect                  renderArea;  // pixels outside it are neither loaded nor stored
     uint32_t               firstDraw = 0, drawCount = 0;   // into FramePacket::draws
+    uint32_t               firstDispatch = 0, dispatchCount = 0;   // Compute: into FramePacket::dispatches
     const char*            label = nullptr;
 };
 
@@ -143,8 +151,9 @@ struct FramePacket
 {
     uint64_t frame = 0;                 // monotonic per surface
 
-    std::span<const Pass> passes;
-    std::span<const Draw> draws;        // passes index into this
+    std::span<const Pass>     passes;
+    std::span<const Draw>     draws;        // render passes index into this
+    std::span<const Dispatch> dispatches;   // compute passes index into this (constants in constantData)
 
     std::span<const std::byte> vertexData;
     std::span<const std::byte> constantData;

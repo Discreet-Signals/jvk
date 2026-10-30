@@ -38,6 +38,10 @@ namespace jvk::metal
 // stay private (the GPU compresses them). Without unified memory every write is
 // staged.
 //
+// Compute (COMPUTE.md, MetalCompute.mm): buffers are MTLBuffers (Device
+// memory private, the rest shared and mapped), kernels compute pipeline
+// states. Streams run on a command queue of their own beside the frames'.
+//
 // Locks, in this order: submitMutex_ (a frame's encode and commit, and a direct
 // write's check-and-write), tableMutex_ (handle tables, the pipeline intern
 // map), writeMutex_ (staged writes). Resolving a handle takes none.
@@ -96,6 +100,23 @@ struct ProgramSlot
     std::vector<uint32_t> pipelines;   // built from it (under tableMutex_)
 };
 
+struct BufferSlot
+{
+    Strong<id<MTLBuffer>> buffer;
+    uint64_t              size   = 0;
+    void*                 mapped = nullptr;   // null for Device memory (private)
+};
+
+struct KernelSlot
+{
+    Strong<id<MTLComputePipelineState>> state;
+    uint32_t bindingCount = 0;                     // the highest declared + 1
+    bool     declared[gpu::kMaxKernelBindings] {};
+    uint32_t constantsBytes = 0;                   // at [[buffer(kConstantsIndex)]]
+    MTLSize  groupSize { 1, 1, 1 };                // threadsPerThreadgroup at every dispatch
+    bool     bufferSizes = false;                  // [[buffer(kBufferSizesIndex)]]: each binding's size
+};
+
 struct PipelineSlot
 {
     gpu::PipelineDesc desc;
@@ -139,6 +160,28 @@ public:
 
     std::unique_ptr<gpu::Surface> createOffscreenSurface(gpu::TextureId target) override;
 
+    gpu::BufferId createBuffer(const gpu::BufferDesc& desc) override;
+    void          destroyBuffer(gpu::BufferId buffer) override;
+    void*         bufferData(gpu::BufferId buffer) override;
+    gpu::KernelId createKernel(const gpu::KernelDesc& desc) override;
+    void          destroyKernel(gpu::KernelId kernel) override;
+    std::unique_ptr<gpu::ComputeStream> createComputeStream() override;
+
+    // ---- Compute (MetalCompute.mm) --------------------------------------------
+    BufferSlot* buffer(gpu::BufferId b) const { return buffers_.resolve(b.value); }
+    KernelSlot* kernel(gpu::KernelId k) const { return kernels_.resolve(k.value); }
+    id<MTLCommandQueue> computeQueue() const noexcept { return computeQueue_; }
+    // Binds and runs one dispatch into `enc` (a stream's or a frame's): false
+    // when it was skipped (a dead kernel or buffer, a range outside its
+    // buffer; logged once).
+    bool encodeDispatch(id<MTLComputeCommandEncoder> enc, const gpu::Dispatch& d, std::span<const std::byte> constants) const;
+    // jvk's own kernels for what a blit can't do on macOS (a fill of a word
+    // that isn't one byte repeated, a copy off a 4-byte boundary): made on
+    // first use, null if they couldn't be.
+    id<MTLComputePipelineState> fillState();
+    id<MTLComputePipelineState> copyState();
+    void markLost() noexcept { lost_.store(true, std::memory_order_release); }
+
     // ---- For the surfaces -----------------------------------------------------
     TextureSlot*  texture(gpu::TextureId t)   const { return textures_.resolve(t.value); }
     ProgramSlot*  program(uint32_t handle)    const { return programs_.resolve(handle); }
@@ -167,6 +210,8 @@ public:
 private:
     Backend();
     void initCaps();
+    void initComputeCaps();
+    void makeUtilityStates();   // under tableMutex_
     uint64_t completed() const noexcept { return completed_.load(std::memory_order_acquire); }
     void     flushAndWait();   // commits the staged writes, then waits for every submission
     id<MTLDepthStencilState> depthStencilState(const gpu::StencilState& stencil);   // under tableMutex_
@@ -176,6 +221,7 @@ private:
 
     id<MTLDevice>       device_ = nil;   // owned (+1)
     id<MTLCommandQueue> queue_  = nil;   // owned (+1)
+    id<MTLCommandQueue> computeQueue_ = nil;   // owned (+1): compute streams'
     juce::String        reason_;
     gpu::Caps           caps_;
     bool                unified_ = false;
@@ -184,6 +230,14 @@ private:
     backends::SlotTable<TextureSlot>  textures_;
     backends::SlotTable<ProgramSlot>  programs_;
     backends::SlotTable<PipelineSlot> pipelines_;
+    backends::SlotTable<BufferSlot>   buffers_;
+    backends::SlotTable<KernelSlot>   kernels_;
+    std::string                       deviceName_;   // Caps::compute.deviceName's text
+    // Kernels' libraries by source (with the macros a kernel's constants define
+    // ahead of it); jvk's fill and copy kernels.
+    std::unordered_map<std::string, Strong<id<MTLLibrary>>> kernelLibraries_;   // under tableMutex_
+    Strong<id<MTLComputePipelineState>> fillState_, copyState_;                 // under tableMutex_
+    bool                                utilityTried_ = false;                  // under tableMutex_
     std::mutex tableMutex_;
     std::unordered_map<gpu::PipelineDesc, uint32_t, gpu::PipelineDescHash> pipelineIds_;
     std::vector<std::pair<gpu::StencilState, Strong<id<MTLDepthStencilState>>>> depthStencilStates_;   // under tableMutex_
@@ -261,6 +315,7 @@ private:
     bool ensure(Strong<id<MTLBuffer>>& buffer, size_t size);
     void encodePass(id<MTLCommandBuffer> cb, FrameSlot& slot, const gpu::FramePacket& packet,
                     const gpu::Pass& pass, uint64_t serial);
+    void encodeComputePass(id<MTLCommandBuffer> cb, const gpu::FramePacket& packet, const gpu::Pass& pass);
     void encodeDraw(id<MTLRenderCommandEncoder> enc, FrameSlot& slot, const gpu::FramePacket& packet,
                     const gpu::Draw& draw, const gpu::IRect& area, uint64_t serial);
 
@@ -295,6 +350,37 @@ private:
     uint32_t width_ = 0, height_ = 0;
     uint32_t current_ = 0;
     bool     frameBegun_ = false;
+};
+
+// ---- A compute stream (MetalCompute.mm) ----------------------------------------------
+//
+// A command buffer per timed segment, on the compute queue: a Timestamp ends
+// one, and its GPUEndTime is the timestamp. Staging for uploads and
+// downloads grows and stays.
+class ComputeStream final : public gpu::ComputeStream
+{
+public:
+    explicit ComputeStream(std::shared_ptr<Backend> backend);
+    ~ComputeStream() override;
+
+    bool   submit(const gpu::ComputePacket& packet) override;
+    Status wait(double seconds) override;
+    std::span<const double> timestamps() const override { return times_; }
+
+private:
+    bool ensure(Strong<id<MTLBuffer>>& buffer, size_t size, MTLResourceOptions options);
+    void finish(bool delivered);
+
+    std::shared_ptr<Backend> backend_;
+    dispatch_semaphore_t     done_ = nullptr;   // signalled once by each command buffer as it completes
+    uint32_t                 unanswered_ = 0;   // committed command buffers not yet waited for
+    std::vector<Strong<id<MTLCommandBuffer>>> segments_;   // the submission's, in order
+    std::vector<uint32_t>    stampSegment_;     // Timestamp i: the last segment before it
+    Strong<id<MTLBuffer>>    upload_, readback_;
+    struct Download { size_t offset; size_t bytes; void* to; };
+    std::vector<Download>    downloads_;
+    std::vector<double>      times_;
+    bool                     lost_ = false;
 };
 
 // ---- An offscreen texture ---------------------------------------------------------

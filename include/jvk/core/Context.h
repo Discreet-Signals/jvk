@@ -94,6 +94,11 @@ public:
     // after `lastUsed` exists. Any thread.
     void retire(gpu::TextureId texture, uint64_t lastUsed);
     void retire(gpu::ProgramId program, uint64_t lastUsed);
+    // The same for compute's buffers and kernels (jvk::compute), destroyed at
+    // once when no such frame exists: a Context nothing renders with (a
+    // compute-only user) never collects.
+    void retire(gpu::BufferId buffer, uint64_t lastUsed);
+    void retire(gpu::KernelId kernel, uint64_t lastUsed);
 
     // Destroys everything retired that is now safe. Any thread.
     void collect();
@@ -110,11 +115,16 @@ private:
     std::mutex pipelineLock_;
     std::unordered_map<gpu::PipelineDesc, gpu::PipelineId, gpu::PipelineDescHash> pipelines_;
 
+    enum class Kind : uint8_t { Texture, Program, Buffer, Kernel };
+    struct Retired { uint32_t handle; uint64_t lastUsed; Kind kind; };
+    void destroy(const Retired& r);
+    void retireOrDestroy(const Retired& r);
+
     mutable std::mutex lock_;   // the serial bookkeeping and the retire lists
     std::atomic<uint64_t> serial_ { 0 };
     std::vector<std::atomic<uint64_t>*> renderers_;
-    struct Retired { uint32_t handle; uint64_t lastUsed; bool program; };
     std::vector<Retired> retired_;
+    std::mutex collectLock_;    // one collect at a time: collectScratch_ (taken before lock_)
     std::vector<Retired> collectScratch_;
 };
 

@@ -173,6 +173,10 @@ Backend::Backend()
         if (device_ == nil) { reason_ = "no Metal device"; diag::log("metal: " + reason_); return; }
         queue_ = [device_ newCommandQueue];
         if (queue_ == nil) { reason_ = "no Metal command queue"; diag::log("metal: " + reason_); return; }
+        // Compute streams' own: their kernels run beside the frames, not in
+        // their queue (COMPUTE.md, "The queues"). Nil leaves compute off.
+        computeQueue_ = [device_ newCommandQueue];
+        if (computeQueue_ != nil) computeQueue_.label = @"jvk compute";
 
         unified_ = [device_ hasUnifiedMemory];
         stats_   = std::getenv("JVK_METAL_STATS") != nullptr;
@@ -212,6 +216,11 @@ Backend::~Backend()
     textures_.forEachLive([](uint32_t, TextureSlot& t) { t = {}; });
     pipelines_.forEachLive([](uint32_t, PipelineSlot& p) { p = {}; });
     programs_.forEachLive([](uint32_t, ProgramSlot& p) { p = {}; });
+    buffers_.forEachLive([](uint32_t, BufferSlot& b) { b = {}; });
+    kernels_.forEachLive([](uint32_t, KernelSlot& k) { k = {}; });
+    kernelLibraries_.clear();
+    fillState_ = {};
+    copyState_ = {};
     functions_.clear();
     depthStencilStates_.clear();
     for (auto& s : samplers_) s = {};
@@ -219,6 +228,7 @@ Backend::~Backend()
     filling_ = {};
     waiting_.clear();
     free_.clear();
+    if (computeQueue_ != nil) [computeQueue_ release];
     if (queue_ != nil)  [queue_ release];
     if (device_ != nil) [device_ release];
 }
@@ -238,6 +248,7 @@ void Backend::initCaps()
     caps_.textureCompressionBC   = [device_ respondsToSelector:@selector(supportsBCTextureCompression)]
                                        ? (bool) [device_ supportsBCTextureCompression]
                                        : !unified_;
+    initComputeCaps();
 }
 
 // ---- Submissions ------------------------------------------------------------------

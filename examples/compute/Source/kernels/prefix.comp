@@ -1,0 +1,21 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// Each element replaced by the sum of those before it (an exclusive scan), in
+// place, by one workgroup: jvk/scan.glsl's jvkScanSequence.
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer Data { uint data[]; };
+layout(push_constant) uniform Push { uint count; } pc;
+
+#define JVK_SCAN_T                uint
+#define JVK_SCAN_COMBINE(a, b)    ((a) + (b))
+#define JVK_SCAN_IDENTITY         0u
+#define JVK_SCAN_SIZE             128u
+#define JVK_SCAN_LOAD(k)          data[k]
+#define JVK_SCAN_STORE(k, prefix) data[k] = (prefix)
+#include "jvk/scan.glsl"
+
+void main()
+{
+    jvkScanSequence(pc.count);
+}

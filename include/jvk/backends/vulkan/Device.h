@@ -18,15 +18,18 @@ namespace jvk {
 //         graphicsFamily(), presentQueue(), presentFamily(), commandPool()
 //         (commandPool is only used by submitImmediate and the backend's own
 //         one-off submissions, under queueLock; each surface has its own
-//         pool), time().
+//         pool), time(), apiVersion(), computeQueue(), computeFamily(),
+//         computeQueueShared().
 //
 //   (b) Internally synchronized — safe to call from any thread, including
 //       concurrently from multiple editors' workers:
 //         pool() (Memory::L1), bindings() (Memory::M).
 //
-//   (c) The queue: every vkQueueSubmit, vkQueuePresentKHR, vkQueueWaitIdle
-//       and vkDeviceWaitIdle in the process holds queueLock() (Vulkan
-//       requires external synchronisation of a VkQueue). Reentrant.
+//   (c) The queues: every vkQueueSubmit, vkQueuePresentKHR and
+//       vkQueueWaitIdle in the process holds queueLock() (Vulkan requires
+//       external synchronisation of a VkQueue), or computeQueueLock() for the
+//       compute queue. vkDeviceWaitIdle holds both (queueLock first). Both
+//       reentrant; one lock when compute shares the graphics queue.
 class Device {
 public:
     Device();
@@ -60,6 +63,34 @@ public:
 
     // The one lock around queue use (see (c) above).
     juce::CriticalSection& queueLock() const noexcept { return queueLock_; }
+
+    // The Vulkan version in use: the lower of the instance's (1.2 where the
+    // loader has 1.1 or later, else 1.0) and the GPU's. Rendering uses 1.0's
+    // calls whatever it is; compute reads subgroup properties from 1.1.
+    uint32_t apiVersion() const { return apiVersion_; }
+
+    // The queue compute streams submit to (COMPUTE.md, "The queues"): a
+    // compute family without graphics where the GPU has one (async compute:
+    // NVIDIA's and AMD's run it beside the editors' frames), else another
+    // family with compute (MoltenVK's), else a second queue of the graphics
+    // family, else the graphics queue itself (computeQueueShared()). Null when
+    // the GPU has no compute at all. Submit to it only under
+    // computeQueueLock(), which is queueLock() when the queue is shared.
+    VkQueue  computeQueue()       const { return computeQueue_; }
+    uint32_t computeFamily()      const { return computeFamily_; }
+    bool     computeQueueShared() const { return computeQueue_ != VK_NULL_HANDLE && computeQueue_ == graphicsQueue_; }
+    juce::CriticalSection& computeQueueLock() const noexcept { return computeQueueShared() ? queueLock_ : computeLock_; }
+    // Whether the graphics family runs compute too: frames can dispatch.
+    bool graphicsComputes() const { return graphicsComputes_; }
+
+    // vkDeviceWaitIdle under both queue locks (queueLock first): every
+    // queue is idle after. Any thread; reentrant with a lock already held.
+    void waitIdle() const
+    {
+        const juce::ScopedLock queueSync(queueLock_);
+        const juce::ScopedLock computeSync(computeLock_);
+        if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+    }
 
     // Whether this Device came up, and why not when it didn't (no Vulkan, no
     // driver, no GPU, ...). An unusable Device makes no Vulkan call; editors
@@ -117,6 +148,12 @@ private:
     VkQueue          presentQueue_   = VK_NULL_HANDLE;
     uint32_t         graphicsFamily_ = UINT32_MAX;
     uint32_t         presentFamily_  = UINT32_MAX;
+    VkQueue          computeQueue_   = VK_NULL_HANDLE;
+    uint32_t         computeFamily_  = UINT32_MAX;
+    uint32_t         computeIndex_   = 0;     // the queue's index in its family
+    bool             graphicsComputes_ = false;
+    uint32_t         instanceVersion_ = VK_API_VERSION_1_0;
+    uint32_t         apiVersion_      = VK_API_VERSION_1_0;
     VkCommandPool    commandPool_    = VK_NULL_HANDLE;
     VkPipelineCache  pipelineCache_  = VK_NULL_HANDLE;
     VmaAllocator     allocator_      = nullptr;
@@ -134,6 +171,7 @@ private:
     bool textureCompressionBC_ = false;
 
     mutable juce::CriticalSection queueLock_;
+    mutable juce::CriticalSection computeLock_;   // the compute queue's, when it is its own
 
     const double epoch_ = juce::Time::getMillisecondCounterHiRes() / 1000.0;
 };
