@@ -17,6 +17,7 @@
 #include <cstdio>
 #if JUCE_WINDOWS
  #include <io.h>
+ #include <process.h>   // _getpid: the CRT's, so core needs no <windows.h>
 #else
  #include <unistd.h>
 #endif
@@ -38,7 +39,7 @@ inline void log(const juce::String& line)
     static const juce::String host =
         juce::File::getSpecialLocation(juce::File::hostApplicationPath).getFileNameWithoutExtension();
 #if JUCE_WINDOWS
-    static const auto pid = (long long) GetCurrentProcessId();
+    static const auto pid = (long long) _getpid();
 #else
     static const auto pid = (long long) getpid();
 #endif

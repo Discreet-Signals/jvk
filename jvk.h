@@ -137,6 +137,11 @@
 #ifndef VK_NO_PROTOTYPES
  #define VK_NO_PROTOTYPES
 #endif
+// On Win32 vulkan.h includes <windows.h>, whose min/max macros would break
+// every std::min/std::max after it (the backend's and core's .cpp files).
+#if JUCE_WINDOWS && ! defined (NOMINMAX)
+ #define NOMINMAX
+#endif
 #include <vulkan/vulkan.h>
 #include "include/jvk/backends/vulkan/vendor/volk.h"
 // Vulkan Memory Allocator (vendored, v3.1.0). Declarations only here — the
