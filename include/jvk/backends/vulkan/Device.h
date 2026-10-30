@@ -91,6 +91,15 @@ public:
         const juce::ScopedLock computeSync(computeLock_);
         if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
     }
+    // The graphics (and present) queue idle, under queueLock: every frame
+    // done, a compute stream's own queue left running (a resize never waits
+    // for a long kernel). When compute shares the queue, it waits for it too.
+    void waitGraphicsIdle() const
+    {
+        const juce::ScopedLock queueSync(queueLock_);
+        if (graphicsQueue_ != VK_NULL_HANDLE) vkQueueWaitIdle(graphicsQueue_);
+        if (presentQueue_ != VK_NULL_HANDLE && presentQueue_ != graphicsQueue_) vkQueueWaitIdle(presentQueue_);
+    }
 
     // Whether this Device came up, and why not when it didn't (no Vulkan, no
     // driver, no GPU, ...). An unusable Device makes no Vulkan call; editors

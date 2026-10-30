@@ -260,11 +260,16 @@ public:
     void     recordPendingWrites(VkCommandBuffer cmd, uint64_t serial);
 
     // ---- Compute submissions (VulkanCompute.cpp) -------------------------------
-    // A stream's submission takes a serial from the frames' counter, so
-    // whatever is destroyed while it is recorded or in flight waits for it;
-    // it is done once the stream has seen its fence signal (or given up).
-    uint64_t beginComputeSubmission();
+    // A stream's submission takes a serial from the frames' counter, so a
+    // buffer or kernel destroyed while it is recorded or in flight waits for
+    // it (frame-only things never do: textures, programs, staging). It is
+    // done once its fence has signalled (collect polls it from
+    // computeSubmitted on) or the stream ends it, which it does before
+    // resetting the fence.
+    uint64_t beginComputeSubmission(VkFence fence);
+    void     computeSubmitted(uint64_t serial);
     uint64_t timestampMask() const noexcept { return timestampMask_; }
+    VkDeviceSize maxUniformRange() const noexcept { return maxUniformRange_; }
     void     endComputeSubmission(uint64_t serial);
     // collect(), when the submit lock is free now (a compute-only process
     // has no frames to collect for it).
@@ -287,11 +292,14 @@ private:
     Backend();
     void initCaps();
     void flushWritesLocked(VkCommandBuffer cmd, uint64_t serial);
-    uint64_t completedSerial();   // under the submit lock
+    // Under the submit lock: the newest serial every FRAME up to it has
+    // finished (textures, programs, staging), and every frame and stream.
+    struct Completed { uint64_t frames, all; };
+    Completed completedSerials();
     void freeTexture(uint32_t handle);   // under the submit lock + tableMutex_
     void freeProgram(uint32_t handle);   // under the submit lock + tableMutex_
-    void freeBuffer(uint32_t handle);    // under the submit lock + tableMutex_
-    void freeKernel(uint32_t handle);    // under the submit lock + tableMutex_
+    void freeBuffer(uint32_t handle);    // teardown: under tableMutex_
+    void freeKernel(uint32_t handle);    // teardown: under tableMutex_
     void initComputeCaps();
     void destroyFramebuffersOf(uint32_t textureHandle);
     gpu::TextureId createTextureLocked(const gpu::TextureDesc& desc);
@@ -311,7 +319,7 @@ private:
     std::unordered_map<gpu::PipelineDesc, uint32_t, gpu::PipelineDescHash> pipelineIds_;
 
     // ---- Deferred destruction --------------------------------------------------
-    enum class RetiredKind : uint8_t { Texture, Program, Buffer, Kernel };
+    enum class RetiredKind : uint8_t { Texture, Program };
     struct Retired { RetiredKind kind; uint32_t handle; uint64_t serial; };
     std::vector<Retired>  retired_;
     std::vector<Retired>  retiredScratch_;
@@ -319,7 +327,23 @@ private:
     struct InFlight { uint64_t serial; VkFence fence; };
     std::vector<InFlight> inFlight_;              // under the submit lock
     std::mutex            computeMutex_;
-    std::vector<uint64_t> computeActive_;         // compute serials begun and not yet done (under computeMutex_)
+    struct ComputeInFlight { uint64_t serial; VkFence fence; bool submitted; };
+    std::vector<ComputeInFlight> computeActive_;  // compute serials begun and not yet done (under computeMutex_)
+    // A destroyed buffer's or kernel's native objects, its handle gone at once
+    // (a stale one resolves to nothing); freed once every submission begun
+    // before it has finished. Under tableMutex_.
+    struct RetiredNative
+    {
+        uint64_t              serial = 0;
+        VkBuffer              buffer = VK_NULL_HANDLE;
+        VmaAllocation         allocation = nullptr;
+        VkPipeline            pipeline = VK_NULL_HANDLE;
+        VkPipelineLayout      layout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+    };
+    std::vector<RetiredNative> retiredNative_;
+    void freeNative(const RetiredNative& r);
+    VkDeviceSize maxUniformRange_ = 16384;   // a uniform binding's range at most (a dispatch's is clamped)
 
     // ---- Texture writes ----------------------------------------------------------
     struct StagingChunk { HostBuffer buffer; VkDeviceSize head = 0; uint64_t serial = 0; };

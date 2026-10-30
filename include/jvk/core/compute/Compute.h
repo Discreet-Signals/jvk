@@ -35,6 +35,9 @@
 // order, the Context included, and the GPU memory of a Buffer or Kernel still
 // in use by a submitted stream or frame stays until the GPU is done with it.
 //
+// A Buffer or Kernel may go while a stream has recorded commands that name
+// it, and while those commands run: its memory is kept until they're done.
+//
 // Order: a stream's commands start in order but may overlap. Put barrier()
 // between a command that writes memory and any later one that reads or
 // writes it: kernels, copies, fills, uploads and downloads alike.
@@ -259,6 +262,10 @@ private:
     friend class Context;
     Stream(std::shared_ptr<jvk::Context> context, std::unique_ptr<gpu::ComputeStream> stream);
     uint32_t pushUpload(const void* data, uint64_t bytes);
+    // From the first command recorded to submit: what it names is kept
+    // (jvk::Context::beginHold), whatever goes meanwhile.
+    void hold() { if (hold_ == 0) hold_ = context_->beginHold(); }
+    void release();
 
     std::shared_ptr<jvk::Context>       context_;
     std::unique_ptr<gpu::ComputeStream> stream_;
@@ -268,6 +275,7 @@ private:
     std::vector<std::byte>           constants_, uploads_;
     std::vector<const char*>         labels_, submittedLabels_;
     std::vector<Time>                times_;
+    uint64_t hold_ = 0;
     bool submitted_ = false;
     bool lost_ = false;   // a submit that never ran: the next wait() says lost
 };

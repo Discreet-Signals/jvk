@@ -454,6 +454,7 @@ bool ComputeStream::submit(const gpu::ComputePacket& packet)
         std::memcpy([upload_.get() contents], packet.uploadData.data(), packet.uploadData.size());
     downloads_.clear();
     stampSegment_.clear();
+    times_.clear();
 
     @autoreleasepool
     {
@@ -583,13 +584,20 @@ bool ComputeStream::submit(const gpu::ComputePacket& packet)
                 }
 
                 case gpu::ComputeOp::Timestamp:
-                    // The end of everything before: a segment ends here.
-                    stampSegment_.push_back(static_cast<uint32_t>(segments_.size()));
+                    // The end of everything before: a segment ends here. With
+                    // nothing encoded since the last one, that one's end is the
+                    // time (an empty command buffer reports no GPU times).
+                    if (cb == nil)
+                    {
+                        stampSegment_.push_back(static_cast<int32_t>(segments_.size()) - 1);
+                        break;
+                    }
+                    stampSegment_.push_back(static_cast<int32_t>(segments_.size()));
                     commitSegment();
                     break;
             }
         }
-        commitSegment();
+        if (cb != nil) commitSegment();
     }
     return true;
 }
@@ -636,14 +644,15 @@ void ComputeStream::finish(bool delivered)
             if (staged != nullptr) std::memcpy(d.to, staged + d.offset, d.bytes);
         if (!segments_.empty())
         {
-            // Timestamp i: when every segment up to the one it ends had finished.
+            // Timestamp i: when every segment up to the one it ends had
+            // finished; one before any segment, the start.
             const CFTimeInterval start = [segments_.front().get() GPUStartTime];
             CFTimeInterval end = start;
-            size_t through = 0;
-            for (const uint32_t segment : stampSegment_)
+            int32_t through = 0;
+            for (const int32_t segment : stampSegment_)
             {
-                for (; through <= segment && through < segments_.size(); ++through)
-                    end = std::max(end, [segments_[through].get() GPUEndTime]);
+                for (; through <= segment && through < static_cast<int32_t>(segments_.size()); ++through)
+                    end = std::max(end, [segments_[static_cast<size_t>(through)].get() GPUEndTime]);
                 times_.push_back((end - start) * 1000.0);
             }
         }

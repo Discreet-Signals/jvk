@@ -203,6 +203,8 @@ What a backend implements, beside `Backend.h`:
   Buffers are shared between the two families (`VK_SHARING_MODE_CONCURRENT`)
   when they differ.
 - **Metal.** Streams have a command queue of their own beside the frames' queue.
+- Frames never wait for a stream: a resize waits for the frames' queue alone, and
+  what frames retire (textures, staging) never waits for a stream's batch.
 - A kernel is not interrupted once it runs. Keep each submit short (a few
   milliseconds) when an editor is open.
 

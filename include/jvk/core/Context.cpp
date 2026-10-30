@@ -169,13 +169,40 @@ void Context::retire(gpu::TextureId texture, uint64_t lastUsed)
     retired_.push_back({ texture.value, lastUsed, Kind::Texture });
 }
 
-void Context::retireOrDestroy(const Retired& r)
+bool Context::safe(const Retired& r, uint64_t safeSerial) const
+{
+    if (r.lastUsed > safeSerial) return false;
+    if (r.kind != Kind::Buffer && r.kind != Kind::Kernel) return true;
+    // A stream that began recording before it was retired may have named it.
+    for (uint64_t h : holds_)
+        if (h <= r.hold) return false;
+    return true;
+}
+
+void Context::retireOrDestroy(Retired r)
 {
     {
         const std::lock_guard<std::mutex> lk(lock_);
-        if (r.lastUsed > safeSerial()) { retired_.push_back(r); return; }
+        r.hold = holdSerial_;
+        if (!safe(r, safeSerial())) { retired_.push_back(r); return; }
     }
     destroy(r);   // outside the lock, as collect: the backend defers past the GPU
+}
+
+uint64_t Context::beginHold()
+{
+    const std::lock_guard<std::mutex> lk(lock_);
+    holds_.push_back(++holdSerial_);
+    return holdSerial_;
+}
+
+void Context::endHold(uint64_t hold)
+{
+    {
+        const std::lock_guard<std::mutex> lk(lock_);
+        std::erase(holds_, hold);
+    }
+    collect();
 }
 
 void Context::retire(gpu::BufferId buffer, uint64_t lastUsed)
@@ -207,10 +234,10 @@ void Context::collect()
     {
         const std::lock_guard<std::mutex> lk(lock_);
         if (retired_.empty()) return;
-        const uint64_t safe = safeSerial();
+        const uint64_t done = safeSerial();
         for (size_t i = 0; i < retired_.size();)
         {
-            if (retired_[i].lastUsed <= safe)
+            if (safe(retired_[i], done))
             {
                 collectScratch_.push_back(retired_[i]);
                 retired_[i] = retired_.back();

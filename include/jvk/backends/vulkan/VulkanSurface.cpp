@@ -335,6 +335,10 @@ void PacketExecutor::recordDraw(VkCommandBuffer cmd, FrameSlot& slot, const gpu:
 
     const gpu::IRect scissor = intersect(draw.scissor, area);
     if (scissor.isEmpty()) return;
+    // A storage slot naming a buffer that is gone: the draw is skipped, as on
+    // Metal, rather than reading something else.
+    for (uint32_t j = 0; j < draw.storageCount && j < gpu::kMaxDrawStorage; ++j)
+        if (draw.storageBuffer[j] && backend_.buffer(draw.storageBuffer[j]) == nullptr) return;
 
     if (ps->pipeline != bound_.pipeline)
     {
@@ -562,7 +566,7 @@ SwapchainSurface::~SwapchainSurface()
     auto& device = backend_->device();
     VkDevice d = device.device();
     const juce::ScopedLock lk(device.queueLock());
-    device.waitIdle();
+    device.waitGraphicsIdle();
     for (auto& slot : slots_)
     {
         backend_->fenceDone(slot.fence);
@@ -603,7 +607,7 @@ void SwapchainSurface::rebuild(uint32_t width, uint32_t height)
 {
     // vkDeviceWaitIdle is queue use: the submit lock (held by the caller,
     // reentrant) keeps it from racing another surface's submit.
-    backend_->device().waitIdle();
+    backend_->device().waitGraphicsIdle();
     width_  = width;
     height_ = height;
     destroySwapchain();
@@ -914,7 +918,7 @@ OffscreenSurface::~OffscreenSurface()
         && vkWaitForFences(d, 1, &slot_.fence, VK_TRUE, 2'000'000'000ull) != VK_SUCCESS)
     {
         const juce::ScopedLock lk(device.queueLock());
-        device.waitIdle();
+        device.waitGraphicsIdle();
     }
     const juce::ScopedLock lk(device.queueLock());
     backend_->fenceDone(slot_.fence);

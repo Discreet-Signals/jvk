@@ -94,11 +94,19 @@ public:
     // after `lastUsed` exists. Any thread.
     void retire(gpu::TextureId texture, uint64_t lastUsed);
     void retire(gpu::ProgramId program, uint64_t lastUsed);
-    // The same for compute's buffers and kernels (jvk::compute), destroyed at
-    // once when no such frame exists: a Context nothing renders with (a
-    // compute-only user) never collects.
+    // The same for compute's buffers and kernels (jvk::compute), which also
+    // wait for every stream recording when they were retired (a hold, below).
+    // Destroyed at once when nothing can name them: a Context nothing renders
+    // with (a compute-only user) never collects.
     void retire(gpu::BufferId buffer, uint64_t lastUsed);
     void retire(gpu::KernelId kernel, uint64_t lastUsed);
+
+    // A compute stream's recording (jvk::compute::Stream: from its first
+    // command to its submit, which hands the backend the handles): buffers
+    // and kernels retired meanwhile wait for it, as for an unsubmitted frame.
+    // Its own counter, so streams don't age the image cache's frame serials.
+    uint64_t beginHold();
+    void     endHold(uint64_t hold);
 
     // Destroys everything retired that is now safe. Any thread.
     void collect();
@@ -116,14 +124,18 @@ private:
     std::unordered_map<gpu::PipelineDesc, gpu::PipelineId, gpu::PipelineDescHash> pipelines_;
 
     enum class Kind : uint8_t { Texture, Program, Buffer, Kernel };
-    struct Retired { uint32_t handle; uint64_t lastUsed; Kind kind; };
+    // hold: the newest hold begun when it was retired (buffers and kernels).
+    struct Retired { uint32_t handle; uint64_t lastUsed; Kind kind; uint64_t hold = 0; };
     void destroy(const Retired& r);
-    void retireOrDestroy(const Retired& r);
+    void retireOrDestroy(Retired r);
+    bool safe(const Retired& r, uint64_t safeSerial) const;   // under lock_
 
     mutable std::mutex lock_;   // the serial bookkeeping and the retire lists
     std::atomic<uint64_t> serial_ { 0 };
     std::vector<std::atomic<uint64_t>*> renderers_;
     std::vector<Retired> retired_;
+    uint64_t              holdSerial_ = 0;   // under lock_
+    std::vector<uint64_t> holds_;            // streams recording now (under lock_)
     std::mutex collectLock_;    // one collect at a time: collectScratch_ (taken before lock_)
     std::vector<Retired> collectScratch_;
 };

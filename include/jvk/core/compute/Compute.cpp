@@ -280,6 +280,13 @@ Stream::~Stream()
     if (submitted_)
         wait();
     stream_.reset();   // the backend's stream waits too, before freeing its memory
+    release();         // recorded and never submitted
+}
+
+void Stream::release()
+{
+    if (hold_ != 0)
+        context_->endHold(std::exchange(hold_, 0));
 }
 
 void Stream::dispatch(const Kernel& kernel, Groups groups, std::initializer_list<Range> bindings,
@@ -310,12 +317,14 @@ void Stream::dispatch(const Kernel& kernel, Groups groups, std::initializer_list
     gpu::ComputeCommand c;
     c.op = gpu::ComputeOp::Dispatch;
     c.dispatch = static_cast<uint32_t>(dispatches_.size());
+    hold();
     dispatches_.push_back(d);
     commands_.push_back(c);
 }
 
 void Stream::barrier()
 {
+    hold();
     gpu::ComputeCommand c;
     c.op = gpu::ComputeOp::Barrier;
     commands_.push_back(c);
@@ -324,6 +333,7 @@ void Stream::barrier()
 void Stream::fill(Range range, uint32_t word)
 {
     jassert(range.offset % 4 == 0 && range.bytes % 4 == 0);
+    hold();
     gpu::ComputeCommand c;
     c.op = gpu::ComputeOp::Fill;
     c.dst = range.binding();
@@ -334,6 +344,7 @@ void Stream::fill(Range range, uint32_t word)
 void Stream::copy(Range from, Range to)
 {
     jassert(to.bytes >= from.bytes);
+    hold();
     gpu::ComputeCommand c;
     c.op = gpu::ComputeOp::Copy;
     c.src = from.binding();
@@ -354,6 +365,7 @@ void Stream::upload(Range to, const void* from)
 {
     if (to.bytes == 0 || from == nullptr)
         return;
+    hold();
     gpu::ComputeCommand c;
     c.op = gpu::ComputeOp::Upload;
     c.dst = to.binding();
@@ -365,6 +377,7 @@ void Stream::download(Range from, void* to)
 {
     if (from.bytes == 0 || to == nullptr)
         return;
+    hold();
     gpu::ComputeCommand c;
     c.op = gpu::ComputeOp::Download;
     c.src = from.binding();
@@ -374,6 +387,7 @@ void Stream::download(Range from, void* to)
 
 void Stream::time(const char* label)
 {
+    hold();
     gpu::ComputeCommand c;
     c.op = gpu::ComputeOp::Timestamp;
     commands_.push_back(c);
@@ -403,6 +417,7 @@ void Stream::submit()
     dispatches_.clear();
     constants_.clear();
     uploads_.clear();
+    release();   // the backend has the handles now, and defers their memory itself
 }
 
 Stream::Result Stream::wait(double seconds)

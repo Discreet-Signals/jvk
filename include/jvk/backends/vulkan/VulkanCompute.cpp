@@ -63,6 +63,7 @@ void Backend::initComputeCaps()
     c.constantsBytes  = l.maxPushConstantsSize;
     c.maxBindings     = std::min<uint32_t>(gpu::kMaxKernelBindings, l.maxPerStageDescriptorStorageBuffers);
     c.maxBufferBytes  = l.maxStorageBufferRange;
+    maxUniformRange_  = l.maxUniformBufferRange;
 
     uint32_t familyCount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, nullptr);
@@ -161,12 +162,30 @@ void Backend::destroyBuffer(gpu::BufferId buffer)
 {
     if (!buffer) return;
     {
+        // The handle goes now: nothing records with it from here on (the core
+        // destroys a buffer only once no unsubmitted frame or stream names it),
+        // and a stale one resolves to nothing. Its memory waits for every
+        // submission started before now, frame or stream.
         std::lock_guard<std::mutex> lk(tableMutex_);
-        if (buffers_.resolve(buffer.value) == nullptr) return;
-        // Every submission started before now, frame or stream, may use it.
-        retired_.push_back({ RetiredKind::Buffer, buffer.value, startedSerial_.load(std::memory_order_acquire) });
+        BufferSlot* b = buffers_.resolve(buffer.value);
+        if (b == nullptr) return;
+        RetiredNative r;
+        r.serial     = startedSerial_.load(std::memory_order_acquire);
+        r.buffer     = b->buffer;
+        r.allocation = b->allocation;
+        retiredNative_.push_back(r);
+        buffers_.release(buffer.value);
     }
     tryCollect();
+}
+
+void Backend::freeNative(const RetiredNative& r)
+{
+    VkDevice d = device_->device();
+    if (r.buffer != VK_NULL_HANDLE)    vmaDestroyBuffer(device_->allocator(), r.buffer, r.allocation);
+    if (r.pipeline != VK_NULL_HANDLE)  vkDestroyPipeline(d, r.pipeline, nullptr);
+    if (r.layout != VK_NULL_HANDLE)    vkDestroyPipelineLayout(d, r.layout, nullptr);
+    if (r.setLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(d, r.setLayout, nullptr);
 }
 
 void Backend::freeBuffer(uint32_t handle)
@@ -330,9 +349,16 @@ void Backend::destroyKernel(gpu::KernelId kernel)
 {
     if (!kernel) return;
     {
-        std::lock_guard<std::mutex> lk(tableMutex_);
-        if (kernels_.resolve(kernel.value) == nullptr) return;
-        retired_.push_back({ RetiredKind::Kernel, kernel.value, startedSerial_.load(std::memory_order_acquire) });
+        std::lock_guard<std::mutex> lk(tableMutex_);   // as destroyBuffer
+        KernelSlot* k = kernels_.resolve(kernel.value);
+        if (k == nullptr) return;
+        RetiredNative r;
+        r.serial    = startedSerial_.load(std::memory_order_acquire);
+        r.pipeline  = k->pipeline;
+        r.layout    = k->layout;
+        r.setLayout = k->setLayout;
+        retiredNative_.push_back(r);
+        kernels_.release(kernel.value);
     }
     tryCollect();
 }
@@ -352,21 +378,28 @@ void Backend::freeKernel(uint32_t handle)
 // Submissions
 // =============================================================================
 
-uint64_t Backend::beginComputeSubmission()
+uint64_t Backend::beginComputeSubmission(VkFence fence)
 {
     // Taken and listed in one step, so collect() never sees a begun serial
     // that isn't listed yet.
     std::lock_guard<std::mutex> lk(computeMutex_);
     const uint64_t serial = startedSerial_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    computeActive_.push_back(serial);
+    computeActive_.push_back({ serial, fence, false });
     return serial;
+}
+
+void Backend::computeSubmitted(uint64_t serial)
+{
+    std::lock_guard<std::mutex> lk(computeMutex_);
+    for (auto& c : computeActive_)
+        if (c.serial == serial) c.submitted = true;
 }
 
 void Backend::endComputeSubmission(uint64_t serial)
 {
     {
         std::lock_guard<std::mutex> lk(computeMutex_);
-        std::erase(computeActive_, serial);
+        std::erase_if(computeActive_, [serial](const ComputeInFlight& c) { return c.serial == serial; });
     }
     tryCollect();
 }
@@ -513,7 +546,7 @@ bool ComputeStream::submit(const gpu::ComputePacket& packet)
 
     // From here on whatever is destroyed waits for this submission: the
     // handles below stay good while it is recorded and runs.
-    serial_ = backend_->beginComputeSubmission();
+    serial_ = backend_->beginComputeSubmission(fence_);
 
     // Staging: the packet's upload bytes as they are, and a slot per download.
     VkDeviceSize downloadBytes = 0;
@@ -540,6 +573,18 @@ bool ComputeStream::submit(const gpu::ComputePacket& packet)
     {
         vkCmdResetQueryPool(cmd_, queries_, 0, kQueries);
         vkCmdWriteTimestamp(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, queries_, queryCount_++);   // the start
+    }
+    {
+        // What earlier submissions wrote (this stream's, another's, a frame's
+        // dispatches) is available once their fences signalled; this makes it
+        // visible here. A submission makes only the host's writes visible.
+        VkMemoryBarrier mb {};
+        mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+        mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT
+                         | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mb, 0, nullptr, 0, nullptr);
     }
 
     auto rangeOk = [this](const gpu::BufferBinding& r) -> const BufferSlot*
@@ -633,7 +678,10 @@ bool ComputeStream::submit(const gpu::ComputePacket& packet)
         r = vkQueueSubmit(device.computeQueue(), 1, &si, fence_);
     }
     if (r == VK_SUCCESS)
+    {
+        backend_->computeSubmitted(serial_);   // collect may poll its fence from now on
         return true;
+    }
     if (r == VK_ERROR_DEVICE_LOST)
         device.markLost();
     lost_ = true;
@@ -682,6 +730,9 @@ void ComputeStream::finish(bool delivered)
         }
     }
     downloads_.clear();
+    // Ended before its fence is reset: collect never polls a fence being reset.
+    if (serial_ != 0)
+        backend_->endComputeSubmission(std::exchange(serial_, 0));
     vkResetFences(vk_, 1, &fence_);
     vkResetCommandPool(vk_, pool_, 0);
     for (auto& p : pools_)
@@ -691,8 +742,6 @@ void ComputeStream::finish(bool delivered)
     }
     poolInUse_ = 0;
     queryCount_ = 0;
-    if (serial_ != 0)
-        backend_->endComputeSubmission(std::exchange(serial_, 0));
 }
 
 } // namespace jvk::vulkan

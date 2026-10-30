@@ -391,7 +391,7 @@ private:
     dispatch_semaphore_t     done_ = nullptr;   // signalled once by each command buffer as it completes
     uint32_t                 unanswered_ = 0;   // committed command buffers not yet waited for
     std::vector<Strong<id<MTLCommandBuffer>>> segments_;   // the submission's, in order
-    std::vector<uint32_t>    stampSegment_;     // Timestamp i: the last segment before it
+    std::vector<int32_t>     stampSegment_;     // Timestamp i: the last segment before it (-1: none, the start)
     Strong<id<MTLBuffer>>    upload_, readback_;
     struct Download { size_t offset; size_t bytes; void* to; };
     std::vector<Download>    downloads_;

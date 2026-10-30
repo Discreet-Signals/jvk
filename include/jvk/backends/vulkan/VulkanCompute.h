@@ -54,7 +54,11 @@ public:
                 const BufferSlot* buffer = backend.buffer(r.buffer);
                 if (buffer == nullptr) return skipped("a buffer that no longer exists");
                 if (r.size == 0 || r.offset + r.size > buffer->size) return skipped("a range outside its buffer");
-                infos_[written] = { buffer->buffer, r.offset, r.size };
+                // A uniform block reads its own size: a whole-buffer range past the
+                // device's uniform limit is cut to it (Buffer::range() is the whole buffer).
+                const VkDeviceSize size = k->types[b] == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                                        ? std::min<VkDeviceSize>(r.size, backend.maxUniformRange()) : r.size;
+                infos_[written] = { buffer->buffer, r.offset, size };
                 auto& w = writes_[written];
                 w = {};
                 w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;

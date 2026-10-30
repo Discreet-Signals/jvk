@@ -292,6 +292,8 @@ Backend::~Backend()
         live.clear();
         kernels_.forEachLive([&](uint32_t h, KernelSlot&) { live.push_back(h); });
         for (uint32_t h : live) freeKernel(h);
+        for (const auto& r : retiredNative_) freeNative(r);
+        retiredNative_.clear();
         for (auto& s : samplers_) vkDestroySampler(d, s.sampler, nullptr);
         samplers_.clear();
     }
@@ -320,7 +322,7 @@ void Backend::waitIdle()
 {
     if (!usable()) return;
     const juce::ScopedLock lk(device_->queueLock());
-    device_->waitIdle();
+    device_->waitGraphicsIdle();   // every surface's frames (streams wait for themselves)
     inFlight_.clear();
     collect();
 }
@@ -718,7 +720,7 @@ bool Backend::readTexture(gpu::TextureId texture, gpu::IRect region, std::span<s
                     // The copy may still be running: never free its command
                     // buffer or the buffer it writes before the GPU is done.
                     if (r == VK_ERROR_DEVICE_LOST || r == VK_TIMEOUT) device_->markLost();
-                    device_->waitIdle();
+                    device_->waitGraphicsIdle();
                 }
             }
             else
@@ -1228,7 +1230,7 @@ void Backend::fenceDone(VkFence fence)
     }
 }
 
-uint64_t Backend::completedSerial()
+Backend::Completed Backend::completedSerials()
 {
     VkDevice d = device_->device();
     uint64_t oldest = std::numeric_limits<uint64_t>::max();
@@ -1244,38 +1246,57 @@ uint64_t Backend::completedSerial()
         ++i;
     }
     // A compute stream's submission is listed from the moment its serial is
-    // taken until it has been waited for, under computeMutex_; the started
-    // serial is read there too, so none begun is missed.
-    uint64_t started = 0;
+    // taken until its fence has signalled or the stream ends it, under
+    // computeMutex_; the started serial is read there too, so none begun is
+    // missed. A fence is polled only once submitted (vkQueueSubmit takes it
+    // externally synchronized) and the stream ends it before resetting it.
+    uint64_t started = 0, oldestCompute = std::numeric_limits<uint64_t>::max();
     {
         std::lock_guard<std::mutex> lk(computeMutex_);
-        for (uint64_t s : computeActive_) oldest = std::min(oldest, s);
+        for (size_t i = 0; i < computeActive_.size();)
+        {
+            const auto& c = computeActive_[i];
+            if (c.submitted && vkGetFenceStatus(d, c.fence) == VK_SUCCESS)
+            {
+                computeActive_[i] = computeActive_.back();
+                computeActive_.pop_back();
+                continue;
+            }
+            oldestCompute = std::min(oldestCompute, c.serial);
+            ++i;
+        }
         started = startedSerial_.load(std::memory_order_acquire);
     }
     // Nothing in flight: every serial handed out has finished (collect() runs
     // before a new frame is begun, so none is being recorded).
-    return oldest == std::numeric_limits<uint64_t>::max() ? started : oldest - 1;
+    Completed c;
+    c.frames = oldest == std::numeric_limits<uint64_t>::max() ? started : oldest - 1;
+    c.all    = oldestCompute == std::numeric_limits<uint64_t>::max() ? c.frames : std::min(c.frames, oldestCompute - 1);
+    return c;
 }
 
 void Backend::collect()
 {
     if (!usable()) return;
-    const uint64_t done = completedSerial();
+    const auto completed = completedSerials();
+    const uint64_t done = completed.frames;   // what frames alone use
     {
         std::lock_guard<std::mutex> lk(tableMutex_);
+        for (size_t i = 0; i < retiredNative_.size();)
+        {
+            if (retiredNative_[i].serial > completed.all) { ++i; continue; }
+            freeNative(retiredNative_[i]);
+            retiredNative_[i] = retiredNative_.back();
+            retiredNative_.pop_back();
+        }
         if (!retired_.empty())
         {
             retiredScratch_.clear();
             for (const auto& r : retired_)
             {
                 if (r.serial > done) { retiredScratch_.push_back(r); continue; }
-                switch (r.kind)
-                {
-                    case RetiredKind::Texture: freeTexture(r.handle); break;
-                    case RetiredKind::Program: freeProgram(r.handle); break;
-                    case RetiredKind::Buffer:  freeBuffer(r.handle);  break;
-                    case RetiredKind::Kernel:  freeKernel(r.handle);  break;
-                }
+                if (r.kind == RetiredKind::Texture) freeTexture(r.handle);
+                else                                freeProgram(r.handle);
             }
             retired_.swap(retiredScratch_);
         }
