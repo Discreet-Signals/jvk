@@ -126,9 +126,14 @@ void Renderer::runFrame()
         if (info.output)
             lower(info);
         else
+        {
             builder_.reset(++frameNumber_);
+            frameDropped_.store(true, std::memory_order_release);   // nothing drawn to present
+        }
         surface_.submit(builder_.packet());
     }
+    else
+        frameDropped_.store(true, std::memory_order_release);
     Context::endFrame(pending_);
 }
 

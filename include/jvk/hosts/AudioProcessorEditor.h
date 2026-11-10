@@ -77,6 +77,9 @@ public:
 
     bool isVulkanEnabled() const { return gpuEnabled_; }
 
+    // False (the default): render only on change. True: render every tick.
+    bool continuousRendering = false;
+
     // ===== Render targets ==================================================
     //
     // Extra per-pixel targets the frame draws into next to the main colour
@@ -203,7 +206,8 @@ private:
             fallBack(host_ != nullptr ? host_->reason() : juce::String("no GPU backend"));
             return;
         }
-        setCachedComponentImage(new NullCachedImage());
+        setCachedComponentImage(new NullCachedImage(*this));
+        dirty_ = true;
 
         // If we already have a size, stand up the surface now. Otherwise
         // componentMovedOrResized will do it on the first layout pass. On
@@ -329,6 +333,7 @@ private:
         // resize replaces. Brief wait (one frame) on this infrequent path.
         renderer_->waitForIdle();
         s->resize(want);
+        dirty_ = true;
     }
 
     void render()
@@ -340,6 +345,11 @@ private:
         // it frees up (catchUp_).
         if (renderer_->isBusy()) { missedTick_ = true; return; }
         missedTick_ = false;
+
+        // Render only after a repaint(), or after a dropped frame. Otherwise the
+        // screen keeps the last frame and the GPU does nothing.
+        if (renderer_->takeDroppedFrame()) dirty_ = true;
+        if (!dirty_ && !continuousRendering) return;
 
         // A lost device never renders again: fall back (the next editor gets a
         // fresh backend). Without a swapchain, a minimised window (no extent)
@@ -353,6 +363,7 @@ private:
             const auto extent = s->preferredExtent();
             if (extent.width == 0 || extent.height == 0) return;
             s->revive();   // the worker is idle: the swapchain is ours to rebuild
+            dirty_ = true;
             if (!s->canBegin()) {
                 if (++swapchainFailures_ >= 60) fallBack("the swapchain could not be created");
                 return;
@@ -375,6 +386,8 @@ private:
             paintContext_ = std::make_unique<jvk::Graphics>(*renderer_, scale);
         else
             paintContext_->beginFrame(scale);
+        // Clear before the paint, thus a repaint() during the paint asks for the next frame.
+        dirty_ = false;
         {
             juce::Graphics g(*paintContext_);
             inRenderTick_ = true;
@@ -386,6 +399,7 @@ private:
         // switches do this): apply it now that the paint stack has fully
         // unwound, and drop this frame's recording.
         if (pendingGpuToggle_.has_value()) {
+            dirty_ = true;
             const bool enable = *pendingGpuToggle_;
             pendingGpuToggle_.reset();
             if (renderer_) renderer_->abandonRecord();
@@ -427,12 +441,18 @@ private:
         void handleAsyncUpdate() override { if (callback) callback(); }
     };
 
+    // JUCE's repaint() climbs up to this cached image. It marks the next tick
+    // dirty and stops the climb. render() does the paint.
     struct NullCachedImage : public juce::CachedComponentImage {
+        explicit NullCachedImage(AudioProcessorEditor& e) : owner(e) {}
         void paint(juce::Graphics&) override {}
-        bool invalidateAll() override { return false; }
-        bool invalidate(const juce::Rectangle<int>&) override { return false; }
+        bool invalidateAll() override { owner.dirty_ = true; return false; }
+        bool invalidate(const juce::Rectangle<int>& r) override { if (!r.isEmpty()) owner.dirty_ = true; return false; }
         void releaseResources() override {}
+        AudioProcessorEditor& owner;
     };
+
+    bool dirty_ = true;   // message thread only: the next tick renders
 
     RenderCatchUp catchUp_;   // before renderer_: outlives the worker that posts to it
     bool          missedTick_ = false;   // message thread only
