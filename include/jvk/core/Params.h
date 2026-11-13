@@ -165,6 +165,8 @@ struct DrawGlyphsParams {
     uint32_t               fillIndex;
     float                  opacity;
     float                  scale;
+    const juce::Typeface*  typeface;       // the atlas's canonical typeface for the run (GlyphAtlas::canonicalTypeface)
+    uint32_t               colourGlyphs;   // non-zero: the run has colour glyphs (GlyphAtlas::colourGlyph)
     // followed in arena by: uint16_t[glyphCount] + Point<float>[glyphCount]
 };
 

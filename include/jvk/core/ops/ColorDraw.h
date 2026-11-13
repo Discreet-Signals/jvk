@@ -546,12 +546,10 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
             const bool  rotated = tx.mat01 != 0.0f || tx.mat10 != 0.0f;
             constexpr int PAD = GlyphAtlas::GLYPH_PADDING;
 
-            // Hoisted out of the loop: getTypefacePtr() is an atomic
-            // refcount bump — the old code paid it PER GLYPH. The key is
-            // likewise built ONCE and its glyphId mutated per iteration, so
-            // the loop does zero refcount traffic.
-            GlyphAtlas::GlyphKey key { font.getTypefacePtr(), 0,
-                                       static_cast<int>(font.getMetricsKind()) };
+            // The key is built ONCE, on the canonical typeface the record
+            // resolved (a raw pointer: no refcount traffic), and its glyphId
+            // mutated per iteration.
+            GlyphAtlas::GlyphKey key { p.typeface, 0, static_cast<int>(font.getMetricsKind()) };
 
             // Batch glyphs into as few draws as possible: every glyph of a
             // run shares the pipeline, color descriptor, and (usually) the
@@ -626,6 +624,46 @@ inline void lowerColor(Renderer& r, Emitter& state, const DrawCommand& cmd)
                 v[4] = { {p11.x, p11.y}, color, {entry->u1, entry->v1}, shape, gi(p11) };
                 v[5] = { {p01.x, p01.y}, color, {entry->u0, entry->v1}, shape, gi(p01) };
                 batched++;
+            }
+
+            // A run with colour glyphs (the record says so) draws them over
+            // its outline glyphs, so the loop above stays as it was. In the
+            // main colour a tile is its own picture (shape type 3), faded by
+            // the layer's opacity and, where the image renderer fades it, by
+            // the fill's alpha; in any other target its coverage takes the
+            // fill as an outline glyph's does (type 5), so a print's material
+            // or height never takes an emoji's colours.
+            if (p.colourGlyphs != 0 && !grad.invisible) {
+                const auto& fillColour = r.getFillColour(p.fillIndex).colour;
+                const auto colourRun = GlyphAtlas::colourRun(font, tx, fillColour);
+                const bool inTarget = cmd.target != 0;
+                for (uint32_t i = 0; i < p.glyphCount; i++) {
+                    key.glyphId = glyphIds[i];
+                    const auto* entry = atlas.colourGlyph(key);
+                    if (!entry) continue;
+                    const auto& e = *entry;
+                    const auto* tile = atlas.peekColourGlyph(GlyphAtlas::colourKey(e, key, colourRun, positions[i], tx));
+                    if (!tile || tile->w == 0) continue;
+                    const gpu::TextureId tileDesc = atlas.colourPageTexture(tile->page);
+                    if (!tileDesc) continue;
+                    if (tileDesc != batchDesc || batched == kMaxBatchGlyphs) {
+                        flushBatch();
+                        batchDesc = tileDesc;
+                    }
+                    const auto q = GlyphAtlas::colourQuad(colourRun, *tile, positions[i], tx);
+                    const float alpha = p.opacity * (e.fillAlpha && !e.fillColour ? fillColour.a : 1.0f);
+                    const glm::vec4 tileColor = inTarget ? color : glm::vec4(alpha);
+                    const glm::vec4 shape(inTarget ? 5.0f : 3.0f, 0, 0, 0);
+                    auto ti = [&](juce::Point<float> c) { return inTarget && grad.active() ? gradientAt(grad, c.x, c.y) : glm::vec4(0.0f); };
+                    UIVertex* v = batch + batched * 6;
+                    v[0] = { {q[0].x, q[0].y}, tileColor, {tile->u0, tile->v0}, shape, ti(q[0]) };
+                    v[1] = { {q[1].x, q[1].y}, tileColor, {tile->u1, tile->v0}, shape, ti(q[1]) };
+                    v[2] = { {q[2].x, q[2].y}, tileColor, {tile->u1, tile->v1}, shape, ti(q[2]) };
+                    v[3] = v[0];
+                    v[4] = v[2];
+                    v[5] = { {q[3].x, q[3].y}, tileColor, {tile->u0, tile->v1}, shape, ti(q[3]) };
+                    batched++;
+                }
             }
             flushBatch();
             break;

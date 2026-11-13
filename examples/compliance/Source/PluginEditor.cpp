@@ -317,17 +317,58 @@ void ComplianceEditor::scenePaths(juce::Graphics& g, juce::Rectangle<float> area
     g.strokePath(spiral, juce::PathStrokeType(2.5f));
 }
 
+static juce::String utf8(const char8_t* text) { return juce::String::fromUTF8(reinterpret_cast<const char*>(text)); }
+
+// Latin at four sizes, then Unicode: accents (precomposed and combining),
+// Greek, Cyrillic, CJK, Hangul, the right-to-left scripts, Devanagari's
+// conjuncts (each from the system font JUCE falls back to), then colour
+// emoji — a skin tone, a ZWJ family, a flag, emoji between letters, emoji at
+// three sizes, under a scale, faded by the colour's alpha, at eighth-pixel
+// steps — and the rotated and sheared runs with an emoji in each.
 void ComplianceEditor::sceneText(juce::Graphics& g, juce::Rectangle<float> area)
 {
     g.setColour(juce::Colours::white);
-    float y = 16.0f;
+    float y = 10.0f;
     for (float size : { 11.0f, 16.0f, 24.0f, 40.0f })
     {
         g.setFont(juce::FontOptions(size));
         g.drawText("The quick brown fox jumps over 0123456789 !@#$%",
                    juce::Rectangle<float>(10.0f, y, area.getWidth() - 20.0f, size * 1.3f),
                    juce::Justification::centredLeft);
-        y += size * 1.5f;
+        y += size * 1.4f;
+    }
+
+    auto line = [&](const juce::String& text, float size, float height) {
+        g.setFont(juce::FontOptions(size));
+        g.drawText(text, juce::Rectangle<float>(10.0f, y, area.getWidth() - 20.0f, height),
+                   juce::Justification::centredLeft, false);
+        y += height;
+    };
+    line(utf8(u8"café naïve Ελληνικά Кириллица"), 16.0f, 22.0f);
+    line(utf8(u8"日本語 中文 한국어 עברית العربية हिन्दी"), 16.0f, 24.0f);
+    line(utf8(u8"Emoji \U0001F600\U0001F44D\U0001F3FD\U0001F3B8\U0001F525❤️ \U0001F468‍\U0001F469‍\U0001F467 \U0001F1FA\U0001F1F8"), 16.0f, 24.0f);
+    line(utf8(u8"A\U0001F600B \U0001F3B8\U0001F525 ✨"), 28.0f, 38.0f);
+    g.setColour(juce::Colours::white.withAlpha(0.6f));
+    line(utf8(u8"60% \U0001F600\U0001F3B8 faded"), 13.0f, 20.0f);
+    g.setColour(juce::Colours::white);
+
+    // Eight emoji at eighth-pixel steps, placed by their glyph positions (the
+    // lines above go through drawText, which places by the run's transform).
+    for (int i = 0; i < 8; ++i)
+    {
+        juce::GlyphArrangement ga;
+        ga.addLineOfText(juce::Font(juce::FontOptions(13.0f)), utf8(u8"\U0001F600"),
+                         10.0f + (float) i * 30.0f + (float) i / 16.0f, area.getHeight() - 12.0f + (float) i / 16.0f);
+        ga.draw(g);
+    }
+
+    g.setFont(juce::FontOptions(48.0f));
+    g.drawSingleLineText(utf8(u8"\U0001F3B8"), (int) (area.getWidth() * 0.66f), (int) (area.getHeight() * 0.72f));
+    {
+        juce::Graphics::ScopedSaveState save(g);
+        g.addTransform(juce::AffineTransform::scale(1.3f).translated(area.getWidth() * 0.62f, area.getHeight() * 0.82f));
+        g.setFont(juce::FontOptions(16.0f));
+        g.drawSingleLineText(utf8(u8"1.3x \U0001F600"), 0, 0);
     }
 
     // Rotated + sheared runs — guardrail scene for the transformed-text fix.
@@ -337,14 +378,14 @@ void ComplianceEditor::sceneText(juce::Graphics& g, juce::Rectangle<float> area)
         g.addTransform(juce::AffineTransform::rotation(-0.5f,
                        area.getWidth() * 0.3f, area.getHeight() * 0.7f));
         g.setColour(juce::Colour(0xFFF4A261));
-        g.drawSingleLineText("ROTATED TEXT", (int) (area.getWidth() * 0.12f),
+        g.drawSingleLineText(utf8(u8"ROTATED \U0001F600 TEXT"), (int) (area.getWidth() * 0.12f),
                              (int) (area.getHeight() * 0.72f));
     }
     {
         juce::Graphics::ScopedSaveState save(g);
         g.addTransform(juce::AffineTransform::shear(0.35f, 0.0f));
         g.setColour(juce::Colour(0xFF2A9D8F));
-        g.drawSingleLineText("SHEARED TEXT", (int) (area.getWidth() * 0.35f),
+        g.drawSingleLineText(utf8(u8"SHEARED \U0001F525 TEXT"), (int) (area.getWidth() * 0.35f),
                              (int) (area.getHeight() * 0.9f));
     }
 }
@@ -737,7 +778,7 @@ const std::vector<ComplianceEditor::Scene>& ComplianceEditor::scenes()
         { "Deep clip stack (path->path->rect)", &sceneDeepClips,         nullptr },
         { "Blend effect inside path clip",      &sceneBlendInClip,       nullptr },   // the reference models the grain
         { "Paths (fill / gradient / stroke)",   &scenePaths,             nullptr },
-        { "Text (sizes + rotated/sheared)",     &sceneText,              nullptr },
+        { "Text (sizes, scripts, emoji, rotated/sheared)", &sceneText, nullptr },
         { "Gradients (linear / radial)",        &sceneGradients,         nullptr },
         { "Rect lists / shapes / lines",        &sceneRectsAndLists,     nullptr },
         { "Images (draw / transform / alpha / tiled)", &sceneImages,

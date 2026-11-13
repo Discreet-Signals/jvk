@@ -80,7 +80,8 @@ public:
     // this is true.
     bool isBusy() const { return workerBusy_.load(std::memory_order_acquire); }
     // True once after the worker drops a frame (minimised, resizing, swapchain
-    // out of date). Thus a caller that renders only on change must render again.
+    // out of date) or lowers one that left glyphs for the next (the atlas's
+    // per-frame budget). Thus a caller that renders only on change must render again.
     bool takeDroppedFrame() { return frameDropped_.exchange(false, std::memory_order_acq_rel); }
     // Block until the worker is idle (resize, teardown).
     void waitForIdle();

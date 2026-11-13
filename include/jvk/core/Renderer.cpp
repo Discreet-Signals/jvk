@@ -473,7 +473,8 @@ void Renderer::lower(const gpu::FrameInfo& info)
 
     builder_.reset(++frameNumber_);
     gradientAtlas_.stageUploads();
-    glyphAtlas_.stageDirtyPages();
+    if (glyphAtlas_.stageDirtyPages())
+        frameDropped_.store(true, std::memory_order_release);   // glyphs left for the next frame
 
     // The frame's storage: the path segments every path fill, clip and path
     // blur indexes into, and the targets' clear colours the paint reads.

@@ -48,6 +48,7 @@
 #include <functional>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <juce_core/juce_core.h>
 #include <juce_events/juce_events.h>

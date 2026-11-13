@@ -1085,17 +1085,32 @@ public:
         // arrive one frame late. (rasterizeBudget inside the atlas caps
         // worst-case first-paint hitches; over-budget glyphs simply appear
         // next frame.)
+        const juce::Typeface* face = nullptr;
+        bool colourGlyphs = false;
         {
             auto& atlas = renderer_.glyphAtlas();
-            // ONE key, glyphId mutated per iteration — constructing a key
-            // per glyph paid an atomic Typeface::Ptr refcount pair per
-            // glyph per frame (real cost on 10k+ glyph scenes).
-            GlyphAtlas::GlyphKey key { s.font.getTypefacePtr(), 0,
+            // ONE key per run, on the atlas's canonical typeface (the draw
+            // carries it to lowering), glyphId mutated per iteration.
+            GlyphAtlas::GlyphKey key { atlas.canonicalTypeface(s.font.getTypefacePtr()), 0,
                                        static_cast<int>(s.font.getMetricsKind()) };
+            face = key.typeface;
             for (auto gid : glyphs)
             {
                 key.glyphId = gid;
                 atlas.getGlyph(key, s.font);
+            }
+            // A run with colour glyphs gets their tiles, each painted at the
+            // size and phase it stands at.
+            if ((colourGlyphs = atlas.takeColourGlyphSeen()))
+            {
+                const auto tx = t.followedBy(s.transform).scaled(displayScale_);
+                const auto run = GlyphAtlas::colourRun(s.font, tx, s.colour);
+                for (size_t i = 0; i < glyphs.size(); ++i)
+                {
+                    key.glyphId = glyphs[i];
+                    if (const auto* e = atlas.colourGlyph(key))
+                        atlas.getColourGlyph(*e, GlyphAtlas::colourKey(*e, key, run, positions[i], tx), s.font);
+                }
             }
         }
 
@@ -1107,6 +1122,8 @@ public:
         params.fillIndex = captureFill();
         params.opacity = s.opacity;
         params.scale = displayScale_;
+        params.typeface = face;
+        params.colourGlyphs = colourGlyphs ? 1u : 0u;
         record(DrawOp::DrawGlyphs, s.clipBounds, params);
         // Append glyph POD data to arena (align before float data)
         renderer_.arena_pushSpan(std::span<const uint16_t>(glyphs.data(), glyphs.size()));
