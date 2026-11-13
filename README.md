@@ -67,6 +67,8 @@ You can use jvk at three levels. Each one builds on the one before it.
 
 Derive your editor from `jvk::AudioProcessorEditor` and change nothing else. Every `juce::Graphics` call made by the editor and its child components runs on the GPU. That includes fills, strokes, paths, gradients, text, images, clips and transforms, so JUCE's widgets and your LookAndFeels work as they are.
 
+Text is whatever JUCE lays out, in any script the system's fonts cover. Letters draw from a distance-field atlas, sharp at any size. Colour emoji are drawn once by JUCE's own image renderer (CoreGraphics on macOS, Direct2D on Windows), at the size and sub-pixel position they stand at, so they look as JUCE's CPU paint draws them.
+
 ```cpp
 #include <jvk/jvk.h>
 
@@ -97,7 +99,7 @@ private:
 };
 ```
 
-jvk repaints the whole editor every frame, at 60 Hz. `setVulkanEnabled (false)` switches to JUCE's own renderer at run time. If a machine can't run Vulkan, jvk switches to JUCE's renderer by itself.
+jvk paints the editor on a 60 Hz tick, but only when something has asked for it with `repaint()`. Otherwise the screen keeps the last frame and the GPU does nothing. `continuousRendering = true` paints every tick, for a benchmark or to find an animation that never asks for its frames. `setVulkanEnabled (false)` switches to JUCE's own renderer at run time. If a machine can't run Metal or Vulkan, jvk switches to JUCE's renderer by itself.
 
 ### Level 2: GPU effects and your own shaders
 
@@ -250,6 +252,7 @@ Other things you can do:
 - **Blend modes.** `Target::blend` sets how a shader's writes combine with what the target holds: `Over`, `Premultiplied`, `Replace`, `Add`, `Max` or `None`.
 - **Values a `juce::Colour` can't hold.** `jvk::Graphics::setColour (g, jvk::Colour { r, g, b, a })` sets the colour of the draws that follow as four floats, premultiplied. In a float target (`RGBA16F`, `RGBA32F`) they land whole: values past 1, negative ones, or rgb at alpha 0, which adds under the draw without covering it. An 8-bit target rounds and clamps them. Every `juce::Colour` converts to a `jvk::Colour` and back, so jvk functions that take one accept `juce::Colours::orange` too.
 - **Smaller targets.** `Target::scale` (for example 0.25), or a fixed `Target::height` in pixels, makes a target that is cheap to blur and to compute. Ordinary drawing doesn't land on it. A shader writes it through an output named after the target.
+- **Text in a target.** A glyph draws its shape in the draw's colour, as any fill does. That includes a colour emoji: its own colours only go into the main colour, so an emoji never writes its colours into, say, a material or height target.
 - **`Target::clearedByMain`.** Ordinary paint into the main colour resets the target to its `clear` value underneath it, so the target always describes whatever was painted on top at each pixel.
 - **Per-draw images.** A sampler in `layout(set = 2, binding = 0)` takes a different image on each draw: `shader.setDrawImage ("albedo", jvk::ImageSource::of (image))`.
 - **Frame values.** `vk->values()` is a `juce::ValueTree` that is emptied every frame. Components use it to pass information, such as a light's position, to shaders painted later in the same frame.

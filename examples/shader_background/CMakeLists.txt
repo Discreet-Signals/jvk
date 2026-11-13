@@ -95,7 +95,7 @@ endif()
 if (APPLE AND NOT CMAKE_GENERATOR MATCHES "Xcode")
     foreach(_fmt Standalone AU)
         if (TARGET ShaderBackground_${_fmt})
-            set(_ent "${CMAKE_BINARY_DIR}/ShaderBackground_artefacts/JuceLibraryCode/ShaderBackground_${_fmt}.entitlements")
+            set(_ent "${CMAKE_CURRENT_BINARY_DIR}/ShaderBackground_artefacts/JuceLibraryCode/ShaderBackground_${_fmt}.entitlements")
             add_custom_command(TARGET ShaderBackground_${_fmt} POST_BUILD
                 COMMAND codesign --force --sign - --options runtime
                     --entitlements "${_ent}"

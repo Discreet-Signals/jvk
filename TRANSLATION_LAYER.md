@@ -312,7 +312,8 @@ include/jvk/
     Context            per backend: built-in programs, interned pipelines, default textures,
                        the image cache, record serials and the retire list
     Resources          GradientAtlas, ImageSource, ImageCache
-    GlyphAtlas, MSDF   text
+    GlyphAtlas, MSDF   text: MSDF outline glyphs, and colour glyph tiles (emoji) painted by
+                       JUCE's image renderer; both made at record, written before lowering
     compute/           jvk::compute: Context, Buffer, Kernel, Stream (COMPUTE.md)
     FrameBuilder       the packet being lowered (draw merging, compute passes) and the Emitter (2D draw state)
     Renderer           per surface: frame textures, the worker, lower() — the render graph

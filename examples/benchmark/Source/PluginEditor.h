@@ -98,7 +98,6 @@ private:
     juce::String phase1Label, phase2Label;  // "Vulkan"/"JUCE" or "Effect ON"/"Effect OFF"
     std::vector<double> vulkanFrameTimes, juceFrameTimes;
     double lastPaintTime = 0;
-    VkPresentModeKHR savedPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     juce::String modeName;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(BenchmarkEditor)

@@ -223,7 +223,6 @@ void BenchmarkEditor::runBenchmark(Mode mode)
     benchFrame = 0;
     benchPhaseStart = juce::Time::getMillisecondCounterHiRes();
 
-    savedPresentMode = VK_PRESENT_MODE_FIFO_KHR;
     // TODO: present mode switching not yet exposed in new architecture
 }
 
