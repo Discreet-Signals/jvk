@@ -32,6 +32,9 @@ set(MSDFGEN_USE_SKIA OFF CACHE BOOL "" FORCE)
 set(MSDFGEN_USE_VCPKG OFF CACHE BOOL "" FORCE)
 set(MSDFGEN_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(msdfgen)
+# It is a static library that ends up inside plugins, which are shared
+# objects: on Linux that link fails unless it was compiled as PIC.
+set_target_properties(msdfgen-core PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # ==============================================================================
 # Backends — what this build compiles, and so what it ships. A list:
@@ -395,12 +398,12 @@ if (APPLE AND JVK_VULKAN)
 elseif (WIN32)
     target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_WIN32_KHR)
 
-elseif (UNIX AND NOT APPLE)
-    find_package(X11 QUIET)
-    if (X11_FOUND)
-        target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_XLIB_KHR)
-    endif()
 endif()
+# Linux defines no VK_USE_PLATFORM_*: VK_USE_PLATFORM_XLIB_KHR would make
+# volk.h pull <X11/Xlib.h> into every consumer, whose macros (None, Bool,
+# Status, Complex, KeyPress) break their code. jvk declares the little of
+# Xlib and of VK_KHR_xlib_surface it uses itself (linux/X11Window.h,
+# VulkanHost.cpp).
 
 # ==============================================================================
 # jvk_bundle — per plugin-format target runtime setup. Call from the consuming

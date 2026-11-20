@@ -160,6 +160,8 @@
  #include "include/jvk/backends/vulkan/macos/MetalCapabilities.h"
 #elif JUCE_WINDOWS
  #include "include/jvk/backends/vulkan/windows/HWNDGenerator.h"
+#elif JUCE_LINUX
+ #include "include/jvk/backends/vulkan/linux/X11Window.h"
 #endif
 #include "include/jvk/backends/vulkan/VulkanBackend.h"
 #include "include/jvk/backends/vulkan/VulkanCompute.h"
