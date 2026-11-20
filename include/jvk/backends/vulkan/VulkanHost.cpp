@@ -80,13 +80,50 @@ bool WindowHost::attach(juce::Component& editor, gpu::Extent sizeHint, juce::Str
     if (vkCreateWin32SurfaceKHR == nullptr
         || vkCreateWin32SurfaceKHR(instance, &ci, nullptr, &surface) != VK_SUCCESS)
         surface = VK_NULL_HANDLE;
+#elif JUCE_LINUX
+    // A child of the peer's X11 window, so there has to be a peer first.
+    auto* peer = editor.getPeer();
+    if (peer == nullptr) return false;
+    editor.addAndMakeVisible(view_);
+    view_.setInterceptsMouseClicks(false, false);
+    view_.setBounds(editor.getLocalBounds());
+    x11_ = std::make_unique<jvk::core::x11::Window>();
+    if (!x11_->create(peer->getNativeHandle(), editor.getWidth(), editor.getHeight()))
+    {
+        detach();
+        failure = "the Vulkan window could not be created";
+        return false;
+    }
+    view_.setWindow(x11_.get());   // sizes it: the first swapchain is built from the window's extent
+
+    // VkXlibSurfaceCreateInfoKHR and vkCreateXlibSurfaceKHR, spelled out:
+    // their declarations come with <X11/Xlib.h>, which jvk never includes
+    // (see X11Window.h).
+    struct XlibSurfaceCreateInfo
+    {
+        VkStructureType sType;
+        const void*     pNext;
+        VkFlags         flags;
+        void*           dpy;
+        unsigned long   window;
+    } ci {};
+    ci.sType  = static_cast<VkStructureType>(1000004000);   // VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR
+    ci.dpy    = x11_->display();
+    ci.window = x11_->id();
+    using CreateXlibSurface = VkResult (VKAPI_PTR*)(VkInstance, const XlibSurfaceCreateInfo*,
+                                                    const VkAllocationCallbacks*, VkSurfaceKHR*);
+    const auto createXlibSurface = reinterpret_cast<CreateXlibSurface>(
+        vkGetInstanceProcAddr(instance, "vkCreateXlibSurfaceKHR"));
+    if (createXlibSurface == nullptr
+        || createXlibSurface(instance, &ci, nullptr, &surface) != VK_SUCCESS)
+        surface = VK_NULL_HANDLE;
 #else
     juce::ignoreUnused(instance, sizeHint);
     failure = "Vulkan windows aren't supported on this platform yet";
     return false;
 #endif
 
-#if JUCE_MAC || JUCE_WINDOWS
+#if JUCE_MAC || JUCE_WINDOWS || JUCE_LINUX
     editor_ = &editor;
     if (surface == VK_NULL_HANDLE)
     {
@@ -102,6 +139,11 @@ bool WindowHost::attach(juce::Component& editor, gpu::Extent sizeHint, juce::Str
 #endif
 }
 
+void WindowHost::setBounds(juce::Rectangle<int> localBounds)
+{
+    view_.setBounds(localBounds);
+}
+
 void WindowHost::detach()
 {
     surface_.reset();   // waits for its frames on the GPU
@@ -111,6 +153,9 @@ void WindowHost::detach()
 #elif JUCE_WINDOWS
     view_.setHWND(nullptr);
     hwnd_.reset();
+#elif JUCE_LINUX
+    view_.setWindow(nullptr);
+    x11_.reset();
 #endif
     view_.setVisible(false);
     if (auto* parent = view_.getParentComponent()) parent->removeChildComponent(&view_);
@@ -127,6 +172,12 @@ bool WindowHost::needsReattach(juce::Component& editor) const
     if (auto* peer = editor.getPeer())
         if (hwnd_ != nullptr && hwnd_->get() != nullptr)
             return !jvk::core::windows::dpi::sameContext(hwnd_->get(), static_cast<HWND>(peer->getNativeHandle()));
+#elif JUCE_LINUX
+    // The window is a child of one peer's X11 window. A new peer (a host
+    // that re-opens or re-parents the editor) means a new one.
+    if (auto* peer = editor.getPeer())
+        if (x11_ != nullptr && x11_->id() != 0)
+            return x11_->parent() != (jvk::core::x11::Window::Id) reinterpret_cast<std::uintptr_t>(peer->getNativeHandle());
 #else
     juce::ignoreUnused(editor);
 #endif

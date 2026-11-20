@@ -21,7 +21,8 @@ namespace jvk::vulkan
 // macOS: a layer-backed NSView with a CAMetalLayer (NSViewGenerator), hosted
 // by a juce::NSViewComponent, surfaced through MoltenVK. Windows: a child
 // HWND made in the peer's DPI-awareness context (HWNDGenerator), hosted by a
-// juce::HWNDComponent. Neither takes mouse input: the editor's own components
+// juce::HWNDComponent. Linux: a child X11 window of the peer's (x11::Window),
+// kept in place by an x11::View. None takes mouse input: the editor's own components
 // sit on top of the pixels and get every event.
 // =============================================================================
 
@@ -38,7 +39,7 @@ public:
     void detach() override;
 
     gpu::Surface* surface() override { return surface_.get(); }
-    void setBounds(juce::Rectangle<int> localBounds) override { view_.setBounds(localBounds); }
+    void setBounds(juce::Rectangle<int> localBounds) override;
     bool needsReattach(juce::Component& editor) const override;
 
 private:
@@ -53,6 +54,9 @@ private:
 #elif JUCE_WINDOWS
     std::unique_ptr<jvk::core::windows::HWNDGenerator> hwnd_;
     juce::HWNDComponent view_;
+#elif JUCE_LINUX
+    std::unique_ptr<jvk::core::x11::Window> x11_;
+    jvk::core::x11::View view_;
 #else
     juce::Component view_;
 #endif
