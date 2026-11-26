@@ -96,26 +96,26 @@ bool WindowHost::attach(juce::Component& editor, gpu::Extent sizeHint, juce::Str
     }
     view_.setWindow(x11_.get());   // sizes it: the first swapchain is built from the window's extent
 
-    // VkXlibSurfaceCreateInfoKHR and vkCreateXlibSurfaceKHR, spelled out:
-    // their declarations come with <X11/Xlib.h>, which jvk never includes
-    // (see X11Window.h).
-    struct XlibSurfaceCreateInfo
+    // VkXcbSurfaceCreateInfoKHR and vkCreateXcbSurfaceKHR, spelled out:
+    // their declarations come with <xcb/xcb.h> through volk's platform
+    // define, which jvk never sets (see X11Window.h).
+    struct XcbSurfaceCreateInfo
     {
         VkStructureType sType;
         const void*     pNext;
         VkFlags         flags;
-        void*           dpy;
-        unsigned long   window;
+        void*           connection;
+        std::uint32_t   window;
     } ci {};
-    ci.sType  = static_cast<VkStructureType>(1000004000);   // VK_STRUCTURE_TYPE_XLIB_SURFACE_CREATE_INFO_KHR
-    ci.dpy    = x11_->display();
-    ci.window = x11_->id();
-    using CreateXlibSurface = VkResult (VKAPI_PTR*)(VkInstance, const XlibSurfaceCreateInfo*,
-                                                    const VkAllocationCallbacks*, VkSurfaceKHR*);
-    const auto createXlibSurface = reinterpret_cast<CreateXlibSurface>(
-        vkGetInstanceProcAddr(instance, "vkCreateXlibSurfaceKHR"));
-    if (createXlibSurface == nullptr
-        || createXlibSurface(instance, &ci, nullptr, &surface) != VK_SUCCESS)
+    ci.sType      = static_cast<VkStructureType>(1000005000);   // VK_STRUCTURE_TYPE_XCB_SURFACE_CREATE_INFO_KHR
+    ci.connection = x11_->connection();
+    ci.window     = x11_->id();
+    using CreateXcbSurface = VkResult (VKAPI_PTR*)(VkInstance, const XcbSurfaceCreateInfo*,
+                                                   const VkAllocationCallbacks*, VkSurfaceKHR*);
+    const auto createXcbSurface = reinterpret_cast<CreateXcbSurface>(
+        vkGetInstanceProcAddr(instance, "vkCreateXcbSurfaceKHR"));
+    if (createXcbSurface == nullptr
+        || createXcbSurface(instance, &ci, nullptr, &surface) != VK_SUCCESS)
         surface = VK_NULL_HANDLE;
 #else
     juce::ignoreUnused(instance, sizeHint);

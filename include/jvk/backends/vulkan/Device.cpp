@@ -427,7 +427,7 @@ bool Device::createInstance()
 #elif JUCE_WINDOWS
     extensions.push_back("VK_KHR_win32_surface");
 #elif JUCE_LINUX
-    extensions.push_back("VK_KHR_xlib_surface");
+    extensions.push_back("VK_KHR_xcb_surface");   // linux/X11Window.h: the window is made through xcb
 #endif
 
 #if JUCE_DEBUG

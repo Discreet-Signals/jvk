@@ -399,11 +399,11 @@ elseif (WIN32)
     target_compile_definitions(jvk INTERFACE VK_USE_PLATFORM_WIN32_KHR)
 
 endif()
-# Linux defines no VK_USE_PLATFORM_*: VK_USE_PLATFORM_XLIB_KHR would make
-# volk.h pull <X11/Xlib.h> into every consumer, whose macros (None, Bool,
-# Status, Complex, KeyPress) break their code. jvk declares the little of
-# Xlib and of VK_KHR_xlib_surface it uses itself (linux/X11Window.h,
-# VulkanHost.cpp).
+# Linux defines no VK_USE_PLATFORM_*: a platform define would make volk.h
+# pull the window system's headers into every consumer (<X11/Xlib.h>'s macros
+# None, Bool, Status, Complex and KeyPress break their code). jvk declares the
+# little of xcb and of VK_KHR_xcb_surface it uses itself (linux/X11Window.h,
+# VulkanHost.cpp), and finds libxcb at run time.
 
 # ==============================================================================
 # jvk_bundle — per plugin-format target runtime setup. Call from the consuming

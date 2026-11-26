@@ -21,8 +21,8 @@ namespace jvk::vulkan
 // macOS: a layer-backed NSView with a CAMetalLayer (NSViewGenerator), hosted
 // by a juce::NSViewComponent, surfaced through MoltenVK. Windows: a child
 // HWND made in the peer's DPI-awareness context (HWNDGenerator), hosted by a
-// juce::HWNDComponent. Linux: a child X11 window of the peer's (x11::Window),
-// kept in place by an x11::View. None takes mouse input: the editor's own components
+// juce::HWNDComponent. Linux: a child X11 window of the peer's, made through
+// xcb (x11::Window), kept in place by an x11::View. None takes mouse input: the editor's own components
 // sit on top of the pixels and get every event.
 // =============================================================================
 

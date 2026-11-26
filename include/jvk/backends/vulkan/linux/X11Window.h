@@ -17,17 +17,25 @@ namespace jvk::core::x11
 // =============================================================================
 // Window — the child X11 window Vulkan renders into on Linux
 //
+// Made through xcb, the X protocol library Xlib itself sits on (libxcb), not
+// Xlib: xcb answers each request with its own error, where Xlib's error
+// handler is one per process (swapping it around our requests raced any
+// other thread's Xlib calls), and an xcb connection is thread-safe as it is,
+// where Xlib needs XInitThreads before any other call in the process (too
+// late for a plugin). The Vulkan driver presents from its own threads on
+// this connection (VK_KHR_xcb_surface).
+//
 // No X11 header is included, here or anywhere in jvk: <X11/Xlib.h> defines
 // None, Bool, Status, Complex and KeyPress as macros, and jvk.h is included
-// by every consumer. The handful of Xlib calls needed are declared below and
-// looked up in libX11 at run time, which is also how JUCE reaches it, so a
-// plugin still loads on a machine without X. Display is an opaque pointer,
-// a window is its XID.
+// by every consumer. The handful of xcb calls needed are declared below and
+// looked up in libxcb at run time, which is how JUCE reaches X too, so a
+// plugin still loads on a machine without X. A connection is an opaque
+// pointer, a window its XID.
 //
 // The window is made on a connection of its own, not JUCE's (which JUCE does
-// not expose without those headers). XIDs are the server's, so a child of
-// the peer's window can be made from any connection, and the Vulkan driver
-// only needs a connection and the XID.
+// not expose). XIDs are the server's, so a child of the peer's window can be
+// made from any connection, and the Vulkan driver only needs a connection
+// and the XID.
 //
 // It selects no events and blocks none from propagating, so the server
 // delivers every pointer event over it to the nearest ancestor that wants
@@ -37,7 +45,7 @@ namespace jvk::core::x11
 class Window
 {
 public:
-    using Id = unsigned long;
+    using Id = std::uint32_t;   // xcb_window_t
 
     Window() = default;
     ~Window() { release(); }
@@ -52,17 +60,23 @@ public:
         auto& x = Api::get();
         if (!x.usable() || parentWindow == nullptr) return false;
 
-        display_ = x.openDisplay(nullptr);
-        if (display_ == nullptr) return false;
+        connection_ = x.connect(nullptr, nullptr);   // $DISPLAY, as XOpenDisplay(nullptr)
+        if (connection_ == nullptr || x.hasError(connection_) != 0) { release(); return false; }
 
         parent_ = (Id) reinterpret_cast<std::uintptr_t>(parentWindow);
-        const IgnoreErrors ignore;
-        window_ = x.createSimpleWindow(display_, parent_, 0, 0,
-                                       (unsigned) std::max(1, width), (unsigned) std::max(1, height),
-                                       0, 0, 0);
-        if (window_ != 0) x.mapWindow(display_, window_);
-        x.sync(display_, 0);
-        if (window_ == 0) { release(); return false; }
+        const Id window = x.generateId(connection_);
+        // The parent's depth and visual, a black background: what XCreateSimpleWindow made.
+        const std::uint32_t black = 0;
+        if (failed(x.createWindow(connection_, copyFromParent, window, parent_, 0, 0,
+                                  size(width), size(height), 0, inputOutput, copyFromParent,
+                                  backPixel, &black)))
+        {
+            release();
+            return false;
+        }
+        window_ = window;
+        // Checked, thus waited for: the window is mapped before the surface is made on it.
+        if (failed(x.mapWindow(connection_, window_))) { release(); return false; }
         return true;
     }
 
@@ -71,55 +85,58 @@ public:
     void setBounds(int x, int y, int width, int height)
     {
         if (window_ == 0) return;
-        auto& api = Api::get();
-        const IgnoreErrors ignore;
-        api.moveResizeWindow(display_, window_, x, y,
-                             (unsigned) std::max(1, width), (unsigned) std::max(1, height));
-        api.sync(display_, 0);
+        const std::uint32_t values[] = { (std::uint32_t) x, (std::uint32_t) y, size(width), size(height) };
+        constexpr auto all = (std::uint16_t) (configX | configY | configWidth | configHeight);
+        failed(Api::get().configureWindow(connection_, window_, all, values));
     }
 
-    void* display() const { return display_; }
-    Id    id() const      { return window_; }
-    Id    parent() const  { return parent_; }
+    void* connection() const { return connection_; }
+    Id    id() const         { return window_; }
+    Id    parent() const     { return parent_; }
 
     void release()
     {
         auto& x = Api::get();
-        if (display_ != nullptr)
+        if (connection_ != nullptr)
         {
-            {
-                // The server has already destroyed it if the peer's window
-                // went first, and the BadWindow that answers is not an error.
-                const IgnoreErrors ignore;
-                if (window_ != 0) x.destroyWindow(display_, window_);
-                x.sync(display_, 0);
-            }
-            x.closeDisplay(display_);
+            // The server has already destroyed it if the peer's window went
+            // first, and the BadWindow that answers is not an error.
+            if (window_ != 0) failed(x.destroyWindow(connection_, window_));
+            x.disconnect(connection_);
         }
-        display_ = nullptr;
+        connection_ = nullptr;
         window_ = parent_ = 0;
     }
 
 private:
-    using ErrorHandler = int (*)(void*, void*);
+    struct Cookie { unsigned int sequence; };   // xcb_void_cookie_t
+
+    // xcb's values for what is used here (xproto.h).
+    static constexpr std::uint8_t  copyFromParent = 0;
+    static constexpr std::uint16_t inputOutput = 1;
+    static constexpr std::uint32_t backPixel = 2;
+    static constexpr std::uint16_t configX = 1, configY = 2, configWidth = 4, configHeight = 8;
+
+    static std::uint16_t size(int pixels) { return (std::uint16_t) std::clamp(pixels, 1, 32767); }
 
     struct Api
     {
-        int   (*initThreads)() = nullptr;
-        void* (*openDisplay)(const char*) = nullptr;
-        int   (*closeDisplay)(void*) = nullptr;
-        Id    (*createSimpleWindow)(void*, Id, int, int, unsigned, unsigned, unsigned,
-                                    unsigned long, unsigned long) = nullptr;
-        int   (*mapWindow)(void*, Id) = nullptr;
-        int   (*moveResizeWindow)(void*, Id, int, int, unsigned, unsigned) = nullptr;
-        int   (*destroyWindow)(void*, Id) = nullptr;
-        int   (*sync)(void*, int) = nullptr;
-        ErrorHandler (*setErrorHandler)(ErrorHandler) = nullptr;
+        void*         (*connect)(const char*, int*) = nullptr;
+        int           (*hasError)(void*) = nullptr;
+        void          (*disconnect)(void*) = nullptr;
+        std::uint32_t (*generateId)(void*) = nullptr;
+        Cookie        (*createWindow)(void*, std::uint8_t, Id, Id, std::int16_t, std::int16_t,
+                                      std::uint16_t, std::uint16_t, std::uint16_t, std::uint16_t,
+                                      std::uint32_t, std::uint32_t, const void*) = nullptr;
+        Cookie        (*mapWindow)(void*, Id) = nullptr;
+        Cookie        (*configureWindow)(void*, Id, std::uint16_t, const void*) = nullptr;
+        Cookie        (*destroyWindow)(void*, Id) = nullptr;
+        void*         (*requestCheck)(void*, Cookie) = nullptr;
 
         bool usable() const
         {
-            return openDisplay && closeDisplay && createSimpleWindow && mapWindow
-                && moveResizeWindow && destroyWindow && sync && setErrorHandler;
+            return connect && hasError && disconnect && generateId && createWindow
+                && mapWindow && configureWindow && destroyWindow && requestCheck;
         }
 
         static const Api& get()
@@ -128,42 +145,40 @@ private:
             {
                 Api a;
                 // Never closed, not even at exit (hence the leak): the Vulkan
-                // driver holds on to libX11 through the connection it was
+                // driver holds on to libxcb through the connection it was
                 // given, and outlives this object.
                 static auto& lib = *new juce::DynamicLibrary();
-                if (!lib.open("libX11.so.6")) return a;
+                if (!lib.open("libxcb.so.1")) return a;
                 auto load = [](auto& fn, const char* name)
                 {
                     fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(lib.getFunction(name));
                 };
-                load(a.initThreads, "XInitThreads");
-                load(a.openDisplay, "XOpenDisplay");
-                load(a.closeDisplay, "XCloseDisplay");
-                load(a.createSimpleWindow, "XCreateSimpleWindow");
-                load(a.mapWindow, "XMapWindow");
-                load(a.moveResizeWindow, "XMoveResizeWindow");
-                load(a.destroyWindow, "XDestroyWindow");
-                load(a.sync, "XSync");
-                load(a.setErrorHandler, "XSetErrorHandler");
-                // The driver presents from its own threads on this connection.
-                if (a.initThreads) a.initThreads();
+                load(a.connect, "xcb_connect");
+                load(a.hasError, "xcb_connection_has_error");
+                load(a.disconnect, "xcb_disconnect");
+                load(a.generateId, "xcb_generate_id");
+                load(a.createWindow, "xcb_create_window_checked");
+                load(a.mapWindow, "xcb_map_window_checked");
+                load(a.configureWindow, "xcb_configure_window_checked");
+                load(a.destroyWindow, "xcb_destroy_window_checked");
+                load(a.requestCheck, "xcb_request_check");
                 return a;
             }();
             return api;
         }
     };
 
-    // Xlib's error handler is one per process, and its default exits the
-    // process. Around our own requests it is swapped for one that does
-    // nothing, then put back: the host's (or JUCE's) is never left replaced.
-    struct IgnoreErrors
+    // Waits for a checked request's answer: true when it was an error, which
+    // is ours to free and reaches no handler anywhere else.
+    bool failed(Cookie cookie) const
     {
-        IgnoreErrors()  { old = Api::get().setErrorHandler([](void*, void*) -> int { return 0; }); }
-        ~IgnoreErrors() { Api::get().setErrorHandler(old); }
-        ErrorHandler old = nullptr;
-    };
+        void* error = Api::get().requestCheck(connection_, cookie);
+        const bool any = error != nullptr;
+        std::free(error);   // xcb hands the error over: freed with free()
+        return any;
+    }
 
-    void* display_ = nullptr;
+    void* connection_ = nullptr;
     Id    window_ = 0;
     Id    parent_ = 0;
 };
